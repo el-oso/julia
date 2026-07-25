@@ -2018,6 +2018,147 @@ static void extkey_build_tvars(jl_serializer_state *s) JL_NOTSAFEPOINT
 // marking an object that has no stable identity. Nothing reads this back yet beyond
 // checking that it round-trips; resolving through it is what would let a rebuilt
 // dependency be re-linked instead of invalidating every image above it.
+// REVIEW instrumentation for the identity-hash hazard, which is a precondition for any
+// re-linking scheme rather than a property of the keys. `jl_object_id` of a mutable object
+// is not derived from its content: the serializer bakes the id the object had in the
+// writing process into the header ahead of it (`object_id_expected`, below), and
+// `jl_object_id__cold` reads that back for anything tagged `GC_IN_IMAGE`
+// (src/builtins.c:377,490). A rebuilt dependency therefore hands out *different* ids for
+// content-identical objects.
+//
+// So any table this image serialized whose slot layout was computed from such an id -- an
+// `IdDict`, or a `Dict`/`Set` whose key type falls back to the generic `objectid` hash --
+// would silently mis-look-up after being re-linked against a rebuilt dependency, and there
+// is no rehash pass on the restore path to repair it (only the type cache rehashes,
+// `cache_rehash_set`). Lookups miss and entries duplicate: no crash, no error.
+//
+// This measures the exposure. `containers` is the population a conservative "refuse to
+// re-link an image that serializes one" rule would have to consider; `tainted` is the
+// subset that actually reaches a mutable owned by another image, which is the only part at
+// risk. If `tainted` is near zero across real packages, refusal is free and the hazard
+// costs nothing to close.
+// A mutable type whose `objectid` is nonetheless derived from content, and so survives a
+// rebuild. `jl_object_id__cold` (src/builtins.c) special-cases exactly these, and the
+// serializer's `object_id_expected` predicate excludes exactly the same set from having an
+// id baked ahead of it -- the two lists are the same fact seen from either side.
+static int idhash_content_hashed(jl_value_t *t) JL_NOTSAFEPOINT
+{
+    return t == (jl_value_t*)jl_string_type || t == (jl_value_t*)jl_symbol_type ||
+           t == (jl_value_t*)jl_simplevector_type || t == (jl_value_t*)jl_datatype_type ||
+           t == (jl_value_t*)jl_module_type || t == (jl_value_t*)jl_typename_type;
+}
+
+static int idhash_hit(jl_value_t *el) JL_NOTSAFEPOINT
+{
+    if (el == NULL)
+        return 0;
+    size_t blob = external_blob_index(el);
+    if (blob >= n_linkage_blobs())
+        return 0;
+    jl_value_t *t = jl_typeof(el);
+    return jl_is_datatype(t) && jl_is_mutable(t) && !idhash_content_hashed(t);
+}
+
+static size_t idhash_scan(jl_value_t *v, int depth) JL_NOTSAFEPOINT
+{
+    if (v == NULL || depth > 3)
+        return 0;
+    if (idhash_hit(v))
+        return 1;   // an external mutable: stop here, its contents are not ours
+    if (external_blob_index(v) < n_linkage_blobs())
+        return 0;
+    size_t hits = 0;
+    if (jl_is_genericmemory(v)) {
+        jl_genericmemory_t *m = (jl_genericmemory_t*)v;
+        const jl_datatype_layout_t *lo = ((jl_datatype_t*)jl_typeof(m))->layout;
+        if (lo != NULL && lo->flags.arrayelem_isboxed) {
+            jl_value_t **el = jl_genericmemory_ptr_data(m);
+            for (size_t i = 0; i < (size_t)m->length; i++)
+                hits += idhash_scan(el[i], depth + 1);
+        }
+        return hits;
+    }
+    jl_datatype_t *dt = (jl_datatype_t*)jl_typeof(v);
+    if (!jl_is_datatype(dt) || dt->layout == NULL)
+        return 0;
+    for (size_t f = 0; f < jl_datatype_nfields(dt); f++) {
+        if (!jl_field_isptr(dt, f))
+            continue;
+        jl_value_t *fv = *(jl_value_t**)((char*)v + jl_field_offset(dt, f));
+        hits += idhash_scan(fv, depth + 1);
+    }
+    return hits;
+}
+
+static void jl_report_idhash_taint(jl_serializer_state *s) JL_NOTSAFEPOINT
+{
+    (void)s;
+    size_t n_id = 0, n_hash = 0, n_id_tainted = 0, n_hash_tainted = 0, n_hits = 0;
+    // histogram by concrete container type: whether a rehash-on-relink pass is bounded
+    // work or open-ended depends on whether the tainted population is a handful of Base
+    // container types or an open set of user types.
+    enum { TTY_MAX = 128 };
+    void *tty[TTY_MAX]; size_t tcnt[TTY_MAX], ntty = 0, tdropped = 0;
+    for (size_t i = 0; i < serialization_queue.len; i++) {
+        jl_value_t *v = (jl_value_t*)serialization_queue.items[i];
+        if (v == NULL || v == (jl_value_t*)(uintptr_t)-1 || v == (jl_value_t*)(uintptr_t)-2)
+            continue;
+        jl_value_t *t = jl_typeof(v);
+        if (!jl_is_datatype(t))
+            continue;
+        const char *tn = jl_symbol_name(((jl_datatype_t*)t)->name->name);
+        // `IdDict`/`IdSet` hash by `objectid` unconditionally. `Dict`/`Set` hash by
+        // `hash(key)`, which falls back to `objectid` for any mutable key type with no
+        // method of its own -- undecidable here, so they are counted separately rather
+        // than merged into one alarming number.
+        int identity = !strcmp(tn, "IdDict") || !strcmp(tn, "IdSet") || !strcmp(tn, "WeakKeyIdDict");
+        int hashed = !identity && (!strcmp(tn, "Dict") || !strcmp(tn, "Set") || !strcmp(tn, "WeakKeyDict"));
+        if (!identity && !hashed)
+            continue;
+        // Only the *key* type decides the hazard. `Dict{Symbol,Any}` is not exposed however
+        // many external mutables sit on its value side: a Symbol is interned and hashes by
+        // its name. A key type that is abstract, or concrete and mutable, is the case where
+        // `hash` falls back to `objectid` and the slot layout depends on an address from
+        // the writing process.
+        jl_svec_t *par = ((jl_datatype_t*)t)->parameters;
+        jl_value_t *K = jl_svec_len(par) > 0 ? jl_svecref(par, 0) : NULL;
+        int keyed_by_id = identity ||
+            (K != NULL && (!jl_is_datatype(K) || !jl_is_concrete_type(K) ||
+                           (jl_is_mutable(K) && !idhash_content_hashed(K))));
+        if (!keyed_by_id)
+            continue;
+        size_t hits = idhash_scan(v, 0);
+        if (identity) {
+            n_id++;
+            if (hits) n_id_tainted++;
+        }
+        else {
+            n_hash++;
+            if (hits) n_hash_tainted++;
+        }
+        n_hits += hits;
+        if (hits) {
+            size_t q;
+            for (q = 0; q < ntty; q++)
+                if (tty[q] == (void*)t) break;
+            if (q == ntty) {
+                if (q == TTY_MAX) { tdropped++; continue; }
+                tty[q] = (void*)t; tcnt[q] = 0; ntty++;
+            }
+            tcnt[q]++;
+        }
+    }
+    for (size_t q = 0; q < ntty; q++) {
+        jl_safe_printf("IDHASH_TAINT %6zu ", tcnt[q]);
+        jl_static_show(JL_STDERR, (jl_value_t*)tty[q]);
+        jl_safe_printf("\n");
+    }
+    if (tdropped)
+        jl_safe_printf("IDHASH_TAINT <overflow> %zu\n", tdropped);
+    jl_safe_printf("IDHASH containers_id=%zu tainted_id=%zu containers_hash=%zu tainted_hash=%zu external_mutable_refs=%zu\n",
+                   n_id, n_id_tainted, n_hash, n_hash_tainted, n_hits);
+}
+
 static void jl_write_import_table(jl_serializer_state *s, ios_t *f) JL_NOTSAFEPOINT
 {
     size_t n = s->import_objs.len;
@@ -5039,6 +5180,8 @@ static void jl_save_system_image_to_stream(ios_t *f, jl_array_t *mod_array,
         jl_report_import_keys(&s);
     if (getenv("JULIA_SHADOW_RESOLVE"))
         jl_shadow_resolve_imports(&s, mod_array);
+    if (getenv("JULIA_IDHASH_TAINT"))
+        jl_report_idhash_taint(&s);
 
     assert(object_worklist.len == 0);
     arraylist_free(&object_worklist);
