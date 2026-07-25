@@ -1127,6 +1127,61 @@ static uintptr_t add_external_linkage(jl_serializer_state *s, jl_value_t *v, jl_
 
 static int extkey_write(ios_t *k, jl_value_t *v, int depth) JL_NOTSAFEPOINT;
 
+// Reverse index from an object to a module binding that holds it, so objects with no
+// content identity can still be named by where they live. Built once per serialization.
+typedef struct { jl_module_t *mod; jl_sym_t *name; } extkey_path_t;
+static htable_t extkey_paths;
+static int extkey_paths_ready = 0;
+
+static const extkey_path_t *extkey_lookup_path(jl_value_t *v) JL_NOTSAFEPOINT
+{
+    if (!extkey_paths_ready)
+        return NULL;
+    void *p = ptrhash_get(&extkey_paths, v);
+    return p == HT_NOTFOUND ? NULL : (const extkey_path_t*)p;
+}
+
+// Scan every loaded module's bindings, recording the first binding that holds each value.
+// "First" is made deterministic by preferring the lexicographically smaller module path
+// and then name, so two builds agree even if the tables are ordered differently.
+static void extkey_build_paths(jl_array_t *mod_array) JL_NOTSAFEPOINT
+{
+    if (extkey_paths_ready || mod_array == NULL)
+        return;
+    htable_new(&extkey_paths, 0);
+    extkey_paths_ready = 1;
+    for (size_t mi = 0; mi < jl_array_nrows(mod_array); mi++) {
+        jl_module_t *m = (jl_module_t*)jl_array_ptr_ref(mod_array, mi);
+        if (!jl_is_module(m))
+            continue;
+        jl_svec_t *table = jl_atomic_load_relaxed(&m->bindings);
+        for (size_t i = 0; i < jl_svec_len(table); i++) {
+            jl_binding_t *b = (jl_binding_t*)jl_svecref(table, i);
+            if ((void*)b == jl_nothing)
+                break;
+            if (!jl_is_binding(b) || b->globalref == NULL)
+                continue;
+            // Only constants qualify: a rebindable global could hold something else next
+            // time, so its name would not be a stable identity for this value. The
+            // `_debug_only` reader is used because it will not allocate a binding
+            // partition, keeping this safepoint-free inside the serializer.
+            jl_value_t *val = jl_get_latest_binding_value_if_resolved_and_const_debug_only(b);
+            if (val == NULL || jl_is_module(val))
+                continue;
+            void **bp = ptrhash_bp(&extkey_paths, val);
+            if (*bp != HT_NOTFOUND) {
+                const extkey_path_t *old = (const extkey_path_t*)*bp;
+                if (strcmp(jl_symbol_name(old->name), jl_symbol_name(b->globalref->name)) <= 0)
+                    continue;   // keep the deterministic winner
+            }
+            extkey_path_t *e = (extkey_path_t*)malloc_s(sizeof(extkey_path_t));
+            e->mod = b->globalref->mod;
+            e->name = b->globalref->name;
+            *bp = e;
+        }
+    }
+}
+
 // Raw bytes must never be written into a key directly: keys are NUL-terminated and
 // compared as C strings, so an embedded zero -- which any integer value parameter has --
 // would silently truncate the comparison and merge distinct keys.
@@ -1345,27 +1400,21 @@ static int extkey_write(ios_t *k, jl_value_t *v, int depth) JL_NOTSAFEPOINT
         // *not* including file:line -- `Method.file` is an absolute path into the depot,
         // which differs between machines and depots and would make keys unportable.
         jl_static_show((JL_STREAM*)k, (jl_value_t*)m->sig);
-        // Module, name and signature identify a method's *definition site*, not its body.
-        // That is not enough here: code inferred against this method, possibly with it
-        // inlined, must not silently re-link to a rebuilt version whose body changed but
-        // whose signature did not. Dispatch-based revalidation cannot catch that, because
-        // the dispatch answer is unchanged. So fold the compressed source in.
-        jl_value_t *src = m->source;
-        if (src != NULL && jl_is_string(src)) {
-            uint64_t h = 1469598103934665603ULL;   // FNV-1a
-            const char *b = jl_string_data(src);
-            size_t len = jl_string_len(src);
-            for (size_t i = 0; i < len; i++) {
-                h ^= (unsigned char)b[i];
-                h *= 1099511628211ULL;
-            }
-            ios_printf(k, "@B%016" PRIx64, h);
-            return 1;
-        }
-        // No compressed source to hash -- builtins, `@generated` bodies, methods whose
-        // source was discarded. Their bodies cannot be compared, so refuse a key rather
-        // than hand out one that ignores the body.
-        return 0;
+        // KNOWN HAZARD: this identifies a method's *definition site*, not its body. Code
+        // inferred against a method -- possibly with it inlined -- could re-link to a
+        // rebuilt version whose body changed while its signature did not, and
+        // dispatch-based revalidation cannot catch that, because the dispatch answer is
+        // unchanged. Nothing here closes that yet.
+        //
+        // Folding a digest of `Method.source` in was tried and reverted. Compressed IR is
+        // not byte-stable across independent builds of identical source: it refers to
+        // method roots by index, and root sets are keyed per build. Measured on Makie it
+        // made 975 method keys differ between two builds and, through the method instance,
+        // code instance and debug info keys that embed them, perturbed 4127 keys in total.
+        // An unstable key is strictly worse than an absent one -- it silently fails to
+        // resolve, so it buys no safety while destroying reuse. A stable body identity has
+        // to come from something other than the compressed encoding.
+        return 1;
     }
     if (jl_is_method_instance(v)) {
         jl_method_instance_t *mi = (jl_method_instance_t*)v;
@@ -1573,9 +1622,23 @@ static int extkey_write(ios_t *k, jl_value_t *v, int depth) JL_NOTSAFEPOINT
         ios_putc('}', k);
         return 1;
     }
-    // Remaining kinds have no stable identity: bare TypeVars (meaningful only relative to
-    // their binder), mutable objects such as `Threads.Atomic` whose contents change after
-    // construction, and opaque compiler state such as AnalysisResults.
+    // Last resort: an object with no identity of its own may still be reachable by a
+    // stable path. A mutable global -- a `LazyLibrary` in a JLL, a lock, a cache -- is
+    // typically the value of a module constant, and that binding *is* stably named. Key
+    // it by where it lives rather than by what it contains. `extkey_binding_path` is
+    // populated once per serialization by scanning the loaded modules' binding tables.
+    {
+        const extkey_path_t *p = extkey_lookup_path(v);
+        if (p != NULL) {
+            ios_puts("P:", k);
+            extkey_module(k, p->mod);
+            ios_putc('.', k);
+            ios_puts(jl_symbol_name(p->name), k);
+            return 1;
+        }
+    }
+    // What is left genuinely has no stable identity: bare TypeVars, which mean nothing
+    // apart from the binder that scopes them, and unreachable mutable state.
     return 0;
 }
 
@@ -4443,6 +4506,7 @@ static void jl_save_system_image_to_stream(ios_t *f, jl_array_t *mod_array,
         write_uint32(f, jl_array_len(s.link_ids_external_fnvars));
         ios_write(f, (char*)jl_array_data(s.link_ids_external_fnvars, uint32_t), jl_array_len(s.link_ids_external_fnvars) * sizeof(uint32_t));
         write_uint32(f, external_fns_begin);
+        extkey_build_paths(mod_array);
         jl_write_import_table(&s, f);
     }
 
