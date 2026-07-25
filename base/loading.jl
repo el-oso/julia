@@ -3394,8 +3394,20 @@ function compilecache(pkg::PkgId, path::String, internal_stderr::IO = stderr, in
                 entrypath, entryfile = cache_file_entry(pkg)
                 cachefiles = filter!(x -> startswith(x, entryfile * "_") && endswith(x, ".ji"), readdir(cachepath))
                 if length(cachefiles) >= MAX_NUM_PRECOMPILE_FILES[]
-                    idx = findmin(mtime.(joinpath.(cachepath, cachefiles)))[2]
-                    evicted_cachefile = joinpath(cachepath, cachefiles[idx])
+                    # Evict something useless before something useful. Age alone is a poor
+                    # proxy for value here: the most widely shared caches -- stdlibs above
+                    # all -- are written once and then only read, so they are reliably the
+                    # oldest by mtime and were reliably evicted first, while caches left
+                    # behind by Julia versions that are no longer installed sat in the
+                    # remaining slots. Losing one shared cache is not a local cost: every
+                    # cache that recorded its build id in `required_modules` is invalidated
+                    # with it, so a single eviction can cascade into rebuilding hundreds of
+                    # packages.
+                    paths = joinpath.(cachepath, cachefiles)
+                    dead = findall(p -> !isvalid_cache_header_file(p), paths)
+                    candidates = isempty(dead) ? eachindex(paths) : dead
+                    idx = candidates[findmin(mtime.(paths[candidates]))[2]]
+                    evicted_cachefile = paths[idx]
                     @debug "Evicting file from cache" evicted_cachefile
                     rm(evicted_cachefile; force=true)
                     try
@@ -3466,6 +3478,28 @@ function object_build_id(obj)
         return nothing
     end
     return module_build_id(mod::Module)
+end
+
+"""
+    isvalid_cache_header_file(path) -> Bool
+
+Whether the cache file at `path` was produced by this Julia build, and so could still be
+loaded. Caches left by other builds are dead weight: no installed Julia will ever load
+them, but they still occupy per-package cache slots.
+"""
+function isvalid_cache_header_file(path::String)
+    io = try
+        open(path, "r")
+    catch
+        return false
+    end
+    try
+        return !iszero(isvalid_cache_header(io))
+    catch
+        return false
+    finally
+        close(io)
+    end
 end
 
 function isvalid_cache_header(f::IOStream)
