@@ -1596,6 +1596,12 @@ static int extkey_type(ios_t *k, jl_value_t *t, extkey_binder_t *env, int depth,
         ios_puts(jl_symbol_name(dt->name->name), k);
         // parameters are part of the identity of an instantiated type
         size_t np = jl_svec_len(dt->parameters);
+        // An empty parameter list is not the same as no parameter list: `Tuple{}` and
+        // `Tuple` are different types that both have zero parameters, and keying them
+        // identically merged them -- found by parsing keys back and comparing. What tells
+        // them apart is that an instantiation is not its own type name's wrapper.
+        if (np == 0 && dt->name->wrapper != (jl_value_t*)dt)
+            ios_puts("{0:}", k);
         if (np) {
             ios_printf(k, "{%zu:", np);
             for (size_t i = 0; i < np; i++) {
@@ -2505,12 +2511,12 @@ static int shadow_modpath(jl_module_t *m, jl_sym_t **out, int max) JL_NOTSAFEPOI
 // restore path is handed, which is where a module operand is resolved from. Anchor on the
 // deepest already-loaded module whose own path is a prefix of the target's, then walk down
 // through constant bindings, which is how a submodule is bound in its parent.
-static jl_module_t *shadow_resolve_module(jl_array_t *mod_array, jl_module_t *orig) JL_GC_DISABLED
+// Find the module named by a root-first path. Split out from `shadow_resolve_module` so
+// that the same descent can be driven by a path parsed out of a key, which is all a
+// load-time relink has, rather than by one read off a live module.
+static jl_module_t *shadow_find_module(jl_array_t *mod_array, jl_sym_t **want, int n) JL_GC_DISABLED
 {
-    jl_sym_t *want[SHADOW_MAX_MODPATH], *have[SHADOW_MAX_MODPATH];
-    int n = shadow_modpath(orig, want, SHADOW_MAX_MODPATH);
-    if (n < 0)
-        return NULL;
+    jl_sym_t *have[SHADOW_MAX_MODPATH];
     jl_module_t *best = NULL;
     int bestk = 0;
     size_t nm = jl_array_nrows(mod_array);
@@ -2542,6 +2548,15 @@ static jl_module_t *shadow_resolve_module(jl_array_t *mod_array, jl_module_t *or
         best = (v != NULL && jl_is_module(v)) ? (jl_module_t*)v : NULL;
     }
     return best;
+}
+
+static jl_module_t *shadow_resolve_module(jl_array_t *mod_array, jl_module_t *orig) JL_GC_DISABLED
+{
+    jl_sym_t *want[SHADOW_MAX_MODPATH];
+    int n = shadow_modpath(orig, want, SHADOW_MAX_MODPATH);
+    if (n < 0)
+        return NULL;
+    return shadow_find_module(mod_array, want, n);
 }
 
 // Re-derive a type name from its module and name. A generic function's type name (`#zero`
@@ -2933,6 +2948,379 @@ static jl_value_t *shadow_resolve(jl_array_t *mod_array, jl_value_t *v, int *kin
 }
 
 // Runs inside the JL_GC_DISABLED region of the save, like the uniquing calls it mirrors.
+// ---- Reading a key back into the object it names ----
+//
+// The shadow pass above re-derives an import from the *live object*, which shows the
+// runtime tables can find it. A load-time relink has no live object: it has the key text
+// out of the image and nothing else. This parses that text and rebuilds the object from
+// it. Whatever the parser cannot express is a defect in the key format rather than in the
+// tables -- and is exactly what has to be found before any of this reaches the load path.
+
+typedef struct {
+    const char *p;
+    const char *end;
+    jl_array_t *mod_array;
+    // binders in scope, outermost first; a `#i` counts from the innermost, so it indexes
+    // this array from the end -- the same walk `extkey_type` does over its binder chain.
+    jl_tvar_t *binders[EXTKEY_MAX_TYPEDEPTH];
+    int nbind;
+} keyparse_t;
+
+#define KP_MAX_UNION 64
+
+static int kp_lit(keyparse_t *kp, const char *s) JL_NOTSAFEPOINT
+{
+    size_t n = strlen(s);
+    if ((size_t)(kp->end - kp->p) >= n && memcmp(kp->p, s, n) == 0) {
+        kp->p += n;
+        return 1;
+    }
+    return 0;
+}
+
+static int kp_char(keyparse_t *kp, char c) JL_NOTSAFEPOINT
+{
+    if (kp->p < kp->end && *kp->p == c) {
+        kp->p++;
+        return 1;
+    }
+    return 0;
+}
+
+static int kp_hexdigit(char c) JL_NOTSAFEPOINT
+{
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    if (c >= 'a' && c <= 'f')
+        return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F')
+        return c - 'A' + 10;
+    return -1;
+}
+
+static int kp_uint(keyparse_t *kp, size_t *out) JL_NOTSAFEPOINT
+{
+    const char *s = kp->p;
+    size_t v = 0;
+    while (kp->p < kp->end && *kp->p >= '0' && *kp->p <= '9')
+        v = v * 10 + (size_t)(*kp->p++ - '0');
+    if (kp->p == s)
+        return 0;
+    *out = v;
+    return 1;
+}
+
+// A name runs to the next structural delimiter. This is the weakest point of a textual
+// key: a symbol containing one of those characters -- `var"a.b"` -- cannot be read back.
+// Such a key is refused rather than misparsed, and the refusals are counted.
+static int kp_name(keyparse_t *kp, jl_sym_t **out) JL_GC_DISABLED
+{
+    const char *s = kp->p;
+    while (kp->p < kp->end && strchr(".{},<>;/@", *kp->p) == NULL)
+        kp->p++;
+    size_t n = (size_t)(kp->p - s);
+    char buf[512];
+    if (n == 0 || n >= sizeof(buf))
+        return 0;
+    memcpy(buf, s, n);
+    buf[n] = '\0';
+    *out = jl_symbol(buf);
+    return 1;
+}
+
+// A root-first dotted path. For the kinds that name something *inside* a module the last
+// component is that name, not a module.
+static int kp_path(keyparse_t *kp, jl_sym_t **out, int max) JL_GC_DISABLED
+{
+    int n = 0;
+    for (;;) {
+        if (n == max)
+            return -1;
+        if (!kp_name(kp, &out[n]))
+            return -1;
+        n++;
+        if (!kp_char(kp, '.'))
+            return n;
+    }
+}
+
+static jl_value_t *kp_type(keyparse_t *kp, int depth, int tdepth) JL_GC_DISABLED;
+
+static jl_value_t *kp_param(keyparse_t *kp, int depth, int tdepth) JL_GC_DISABLED;
+
+// `T:mod.path.Name{n:p,...}` -- the type name is the last path component, and the
+// parameters are applied to whatever that name is bound to, exactly as
+// `shadow_resolve_datatype` does, so that every parameter is re-derived rather than reused.
+static jl_value_t *kp_datatype(keyparse_t *kp, int depth, int tdepth) JL_GC_DISABLED
+{
+    jl_sym_t *path[SHADOW_MAX_MODPATH];
+    int n = kp_path(kp, path, SHADOW_MAX_MODPATH);
+    if (n < 2)
+        return NULL;   // a type always lives in a module, so there is a name and a path
+    jl_module_t *m = shadow_find_module(kp->mod_array, path, n - 1);
+    if (m == NULL)
+        return NULL;
+    jl_binding_t *b = jl_get_module_binding(m, path[n - 1], 0);
+    jl_value_t *v = jl_get_latest_binding_value_if_resolved_and_const_debug_only(b);
+    if (v == NULL || !jl_is_type(v))
+        return NULL;
+    jl_value_t *uw = jl_unwrap_unionall(v);
+    if (!jl_is_datatype(uw))
+        return NULL;
+    jl_typename_t *tn = ((jl_datatype_t*)uw)->name;
+    // the binding may be an alias for a type belonging elsewhere, which would silently
+    // resolve to the wrong thing
+    if (tn->name != path[n - 1] || tn->module != m)
+        return NULL;
+    if (!kp_char(kp, '{'))
+        return uw;
+    size_t np;
+    if (!kp_uint(kp, &np) || !kp_char(kp, ':') || np > KP_MAX_UNION)
+        return NULL;
+    if (np == 0)
+        // `{0:}` -- an instantiation with no parameters, such as `Tuple{}`, which is not
+        // the same type as the bare name it instantiates
+        return kp_char(kp, '}') ? jl_apply_type(v, NULL, 0) : NULL;
+    jl_value_t *params[KP_MAX_UNION];
+    for (size_t i = 0; i < np; i++) {
+        if (i && !kp_char(kp, ','))
+            return NULL;
+        params[i] = kp_param(kp, depth, tdepth + 1);
+        if (params[i] == NULL)
+            return NULL;
+    }
+    if (!kp_char(kp, '}'))
+        return NULL;
+    return jl_apply_type(v, params, np);
+}
+
+static jl_value_t *kp_type(keyparse_t *kp, int depth, int tdepth) JL_GC_DISABLED
+{
+    // two budgets, as the writer has: type nesting is counted separately from value
+    // nesting, because a type reaches only types and never re-enters the value graph
+    if (tdepth > EXTKEY_MAX_TYPEDEPTH || depth > EXTKEY_MAX_DEPTH)
+        return NULL;
+    if (kp_char(kp, '#')) {
+        size_t i;
+        if (!kp_uint(kp, &i) || (int)i >= kp->nbind)
+            return NULL;
+        return (jl_value_t*)kp->binders[kp->nbind - 1 - (int)i];
+    }
+    if (kp_char(kp, 'U')) {
+        size_t n;
+        if (!kp_uint(kp, &n) || !kp_char(kp, '<'))
+            return NULL;
+        if (n == 0)
+            return kp_char(kp, '>') ? (jl_value_t*)jl_bottom_type : NULL;
+        if (n > KP_MAX_UNION)
+            return NULL;
+        jl_value_t *parts[KP_MAX_UNION];
+        for (size_t i = 0; i < n; i++) {
+            if (i && !kp_char(kp, ','))
+                return NULL;
+            parts[i] = kp_type(kp, depth, tdepth + 1);
+            if (parts[i] == NULL)
+                return NULL;
+        }
+        if (!kp_char(kp, '>'))
+            return NULL;
+        return jl_type_union(parts, n);
+    }
+    if (kp_lit(kp, "A<")) {
+        jl_value_t *lb = kp_type(kp, depth, tdepth + 1);
+        if (lb == NULL || !kp_char(kp, ','))
+            return NULL;
+        jl_value_t *ub = kp_type(kp, depth, tdepth + 1);
+        if (ub == NULL || !kp_char(kp, ';'))
+            return NULL;
+        // The name is not part of the identity -- a bound variable is named by its
+        // position, which is why the key carries an index and not a name -- so any name
+        // will do for the reconstruction.
+        if (kp->nbind == EXTKEY_MAX_TYPEDEPTH)
+            return NULL;
+        jl_tvar_t *var = jl_new_typevar(jl_symbol("_"), lb, ub);
+        kp->binders[kp->nbind++] = var;
+        jl_value_t *body = kp_type(kp, depth, tdepth + 1);
+        kp->nbind--;
+        if (body == NULL || !kp_char(kp, '>'))
+            return NULL;
+        return jl_type_unionall(var, body);
+    }
+    if (kp_lit(kp, "X<")) {
+        jl_value_t *T = NULL, *N = NULL;
+        if (!kp_char(kp, '-')) {
+            T = kp_type(kp, depth, tdepth + 1);
+            if (T == NULL)
+                return NULL;
+        }
+        if (!kp_char(kp, ','))
+            return NULL;
+        if (!kp_char(kp, '-')) {
+            N = kp_param(kp, depth, tdepth + 1);
+            if (N == NULL)
+                return NULL;
+        }
+        if (!kp_char(kp, '>'))
+            return NULL;
+        return (jl_value_t*)jl_wrap_vararg(T, N, 1, 0);
+    }
+    if (kp_lit(kp, "T:"))
+        return kp_datatype(kp, depth, tdepth);
+    return NULL;
+}
+
+static jl_value_t *kp_value(keyparse_t *kp, int depth) JL_GC_DISABLED;
+
+static jl_value_t *kp_param(keyparse_t *kp, int depth, int tdepth) JL_GC_DISABLED
+{
+    if (kp->p < kp->end && strchr("#UAXT", *kp->p) != NULL)
+        return kp_type(kp, depth, tdepth);
+    return kp_value(kp, depth + 1);
+}
+
+static jl_value_t *kp_value(keyparse_t *kp, int depth) JL_GC_DISABLED
+{
+    if (depth > EXTKEY_MAX_DEPTH)
+        return NULL;
+    if (kp_lit(kp, "M:")) {
+        jl_sym_t *path[SHADOW_MAX_MODPATH];
+        int n = kp_path(kp, path, SHADOW_MAX_MODPATH);
+        if (n < 1)
+            return NULL;
+        return (jl_value_t*)shadow_find_module(kp->mod_array, path, n);
+    }
+    if (kp_lit(kp, "N:") || kp_lit(kp, "B:")) {
+        int binding = kp->p[-2] == 'B';
+        jl_sym_t *path[SHADOW_MAX_MODPATH];
+        int n = kp_path(kp, path, SHADOW_MAX_MODPATH);
+        if (n < 2)
+            return NULL;
+        jl_module_t *m = shadow_find_module(kp->mod_array, path, n - 1);
+        if (m == NULL)
+            return NULL;
+        jl_binding_t *b = jl_get_module_binding(m, path[n - 1], 0);
+        if (binding)
+            return (jl_value_t*)b;
+        jl_value_t *v = jl_get_latest_binding_value_if_resolved_and_const_debug_only(b);
+        if (v == NULL || !jl_is_type(v))
+            return NULL;
+        jl_value_t *uw = jl_unwrap_unionall(v);
+        if (!jl_is_datatype(uw))
+            return NULL;
+        jl_typename_t *tn = ((jl_datatype_t*)uw)->name;
+        return (tn->name == path[n - 1] && tn->module == m) ? (jl_value_t*)tn : NULL;
+    }
+    if (kp_lit(kp, "S:")) {
+        // A symbol has no terminator, so at the end of a key its name is the rest of the
+        // text; nested inside a parameter list it can only run to the next delimiter,
+        // which a symbol containing one would defeat. The writer has the same blind spot.
+        if (depth == 0) {
+            size_t n = (size_t)(kp->end - kp->p);
+            char buf[512];
+            if (n >= sizeof(buf))
+                return NULL;
+            memcpy(buf, kp->p, n);
+            buf[n] = '\0';
+            kp->p = kp->end;
+            return (jl_value_t*)jl_symbol(buf);
+        }
+        jl_sym_t *s;
+        return kp_name(kp, &s) ? (jl_value_t*)s : NULL;
+    }
+    if (kp_lit(kp, "O:")) {
+        // a singleton is completely determined by its type
+        jl_value_t *t = kp_type(kp, depth, 0);
+        if (t == NULL || !jl_is_datatype(t) || !jl_is_datatype_singleton((jl_datatype_t*)t))
+            return NULL;
+        return ((jl_datatype_t*)t)->instance;
+    }
+    if (kp_lit(kp, "b:")) {
+        // a boxed pointer-free immutable: its type plus its bytes. Re-box rather than
+        // reuse, as the shadow pass does -- the bytes are content, the box is an address.
+        jl_value_t *t = kp_type(kp, depth, 0);
+        if (t == NULL || !jl_is_datatype(t) || !kp_char(kp, '<'))
+            return NULL;
+        size_t sz = jl_datatype_size((jl_datatype_t*)t);
+        char bytes[64];
+        if (sz > sizeof(bytes))
+            return NULL;
+        for (size_t i = 0; i < sz; i++) {
+            int hi, lo;
+            if (kp->p + 2 > kp->end)
+                return NULL;
+            hi = kp_hexdigit(*kp->p++);
+            lo = kp_hexdigit(*kp->p++);
+            if (hi < 0 || lo < 0)
+                return NULL;
+            bytes[i] = (char)((hi << 4) | lo);
+        }
+        if (!kp_char(kp, '>'))
+            return NULL;
+        return jl_new_bits(t, bytes);
+    }
+    return kp_type(kp, depth, 0);
+}
+
+// For every import that has a key, parse the key and compare what comes back against the
+// object the key was written for. This is the invertibility claim the whole scheme rests
+// on, measured rather than asserted.
+static void jl_check_key_parse(jl_serializer_state *s, jl_array_t *mod_array) JL_GC_DISABLED
+{
+    size_t n = s->import_objs.len;
+    size_t keyed = 0, attempted = 0, same = 0, differs = 0, unparsed = 0, trailing = 0;
+    size_t unsupported = 0;
+    ios_t k;
+    ios_mem(&k, 512);
+    for (size_t i = 0; i < n; i++) {
+        jl_value_t *v = (jl_value_t*)s->import_objs.items[i];
+        ios_seek(&k, 0);
+        ios_trunc(&k, 0);
+        if (!extkey_write(&k, v, 0))
+            continue;
+        keyed++;
+        size_t len = (size_t)ios_pos(&k);
+        ios_putc('\0', &k);   // the key is not NUL-terminated in the stream; printing needs it
+        // only the kinds this parser covers so far; the rest are counted, not guessed at
+        if (len < 2 || strchr("MNBSTOb#UAX", k.buf[0]) == NULL) {
+            unsupported++;
+            continue;
+        }
+        attempted++;
+        keyparse_t kp;
+        kp.p = k.buf;
+        kp.end = k.buf + len;
+        kp.mod_array = mod_array;
+        kp.nbind = 0;
+        jl_value_t *got = kp_value(&kp, 0);
+        if (got == NULL) {
+            if (unparsed < 6)
+                jl_safe_printf("KEYPARSE_FAIL [%s] at+%zu %s\n", jl_typeof_str(v),
+                               (size_t)(kp.p - k.buf), k.buf);
+            unparsed++;
+        }
+        else if (kp.p != kp.end) {
+            trailing++;
+        }
+        else if (got == v || extkey_equiv(got, v)) {
+            same++;
+        }
+        else {
+            // the only outcome that would be a miscompile rather than a missed reuse
+            if (differs < 6) {
+                jl_safe_printf("KEYPARSE_DIFF want[%s] got[%s] key=%s\n",
+                               jl_typeof_str(v), jl_typeof_str(got), k.buf);
+                jl_safe_printf("    want="); jl_static_show(JL_STDERR, v);
+                jl_safe_printf("\n    got ="); jl_static_show(JL_STDERR, got);
+                jl_safe_printf("\n");
+            }
+            differs++;
+        }
+    }
+    ios_close(&k);
+    jl_safe_printf("KEYPARSE keyed=%zu covered=%zu same=%zu differs=%zu unparsed=%zu trailing=%zu out_of_scope=%zu\n",
+                   keyed, attempted, same, differs, unparsed, trailing, unsupported);
+}
+
 static void jl_shadow_resolve_imports(jl_serializer_state *s, jl_array_t *mod_array) JL_GC_DISABLED
 {
     size_t n = s->import_objs.len;
@@ -5213,6 +5601,8 @@ static void jl_save_system_image_to_stream(ios_t *f, jl_array_t *mod_array,
         jl_shadow_resolve_imports(&s, mod_array);
     if (getenv("JULIA_IDHASH_TAINT"))
         jl_report_idhash_taint(&s);
+    if (getenv("JULIA_KEY_PARSE"))
+        jl_check_key_parse(&s, mod_array);
 
     assert(object_worklist.len == 0);
     arraylist_free(&object_worklist);
