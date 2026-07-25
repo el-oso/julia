@@ -1433,6 +1433,44 @@ static int extkey_write(ios_t *k, jl_value_t *v, int depth) JL_NOTSAFEPOINT
     return 0;
 }
 
+// Digest an object's content key to 64 bits. Returns 0 if the object has no stable key,
+// in which case a rebuilt dependency could not be re-resolved for it and the importing
+// image would have to be rebuilt, as it always is today.
+static int extkey_hash(jl_value_t *v, uint64_t *out) JL_NOTSAFEPOINT
+{
+    ios_t k;
+    ios_mem(&k, 128);
+    int ok = extkey_write(&k, v, 0);
+    if (ok) {
+        uint64_t h = 1469598103934665603ULL;   // FNV-1a
+        size_t len = (size_t)ios_pos(&k);
+        for (size_t i = 0; i < len; i++) {
+            h ^= (unsigned char)k.buf[i];
+            h *= 1099511628211ULL;
+        }
+        *out = h;
+    }
+    ios_close(&k);
+    return ok;
+}
+
+// Serialize the import table: for each distinct object this image references in another
+// image, the owning image's deps-index and the object's content key, with a zero key
+// marking an object that has no stable identity. Nothing reads this back yet beyond
+// checking that it round-trips; resolving through it is what would let a rebuilt
+// dependency be re-linked instead of invalidating every image above it.
+static void jl_write_import_table(jl_serializer_state *s, ios_t *f) JL_NOTSAFEPOINT
+{
+    size_t n = s->import_objs.len;
+    write_uint32(f, (uint32_t)n);
+    for (size_t i = 0; i < n; i++) {
+        uint64_t h = 0;
+        extkey_hash((jl_value_t*)s->import_objs.items[i], &h);
+        write_uint32(f, (uint32_t)(uintptr_t)s->import_deps.items[i]);
+        write_uint64(f, h);
+    }
+}
+
 // Compute keys for every imported object and report coverage plus injectivity: two
 // distinct objects in the same owning image must never produce the same key.
 static void jl_report_import_keys(jl_serializer_state *s) JL_NOTSAFEPOINT
@@ -1613,6 +1651,32 @@ static void jl_report_import_keys(jl_serializer_state *s) JL_NOTSAFEPOINT
         for (size_t q = 0; q < unty; q++)
             jl_safe_printf("IMPORTKEYS_UNKEYED %-24s %zu\n",
                            jl_symbol_name(((jl_datatype_t*)uty[q])->name->name), ucnt[q]);
+    }
+    // REVIEW instrumentation: per owning pkgimage, total vs unkeyed distinct imports.
+    // Re-resolution is all-or-nothing per (dependent, dependency) pair, so what matters
+    // is how many dependency images have at least one unkeyed import.
+    {
+        size_t maxdep = 0;
+        for (size_t i = 0; i < n; i++)
+            if (kdep[i] > maxdep) maxdep = kdep[i];
+        size_t *dtot = (size_t*)calloc(maxdep + 1, sizeof(size_t));
+        size_t *dunk = (size_t*)calloc(maxdep + 1, sizeof(size_t));
+        for (size_t i = 0; i < n; i++) {
+            dtot[kdep[i]]++;
+            if (koff[i + 1] - koff[i] <= 1)
+                dunk[kdep[i]]++;
+        }
+        size_t ndeps = 0, ndeps_unk = 0;
+        for (size_t d = 1; d <= maxdep; d++) {
+            if (dtot[d]) {
+                ndeps++;
+                if (dunk[d]) ndeps_unk++;
+                jl_safe_printf("IMPORTKEYS_DEP dep=%zu total=%zu unkeyed=%zu\n", d, dtot[d], dunk[d]);
+            }
+        }
+        jl_safe_printf("IMPORTKEYS_DEPS pkgimages=%zu with_unkeyed=%zu\n", ndeps, ndeps_unk);
+        free(dtot);
+        free(dunk);
     }
     jl_safe_printf("IMPORTKEYS distinct=%zu keyed=%zu unkeyed=%zu collisions=%zu keybytes=%zu "
                    "frompkgimage=%zu frompkgimage_keyed=%zu equivdupes=%zu\n",
@@ -3818,6 +3882,7 @@ static void jl_save_system_image_to_stream(ios_t *f, jl_array_t *mod_array,
         write_uint32(f, jl_array_len(s.link_ids_external_fnvars));
         ios_write(f, (char*)jl_array_data(s.link_ids_external_fnvars, uint32_t), jl_array_len(s.link_ids_external_fnvars) * sizeof(uint32_t));
         write_uint32(f, external_fns_begin);
+        jl_write_import_table(&s, f);
     }
 
     if (getenv("JULIA_IMPORT_KEYS"))
@@ -4458,6 +4523,17 @@ static void jl_restore_system_image_from_stream_(ios_t *f, jl_image_t *image,
         ios_read(f, (char*)jl_array_data(s.link_ids_external_fnvars, uint32_t), nlinks_external_fnvars * sizeof(uint32_t));
     }
     uint32_t external_fns_begin = read_uint32(f);
+    {   // import table, written by jl_write_import_table
+        size_t nimports = read_uint32(f);
+        size_t nkeyed = 0;
+        for (size_t i = 0; i < nimports; i++) {
+            (void)read_uint32(f);   // owning image's deps-index
+            if (read_uint64(f))     // content key, 0 when the object has no stable one
+                nkeyed++;
+        }
+        if (getenv("JULIA_IMPORT_KEYS"))
+            jl_safe_printf("IMPORTKEYS_READ entries=%zu keyed=%zu\n", nimports, nkeyed);
+    }
     if (s.incremental) {
         assert(restored && init_order && extext_methods && internal_methods && new_ext_cis && method_roots_list);
         *restored = (jl_array_t*)jl_delayed_reloc(&s, offset_restored);
