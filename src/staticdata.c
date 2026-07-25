@@ -1872,6 +1872,16 @@ static int extkey_equiv(jl_value_t *oa, jl_value_t *ob) JL_NOTSAFEPOINT
         return 1;
     if (jl_is_type(oa) && jl_is_type(ob) && jl_types_equal(oa, ob))
         return 1;
+    if (jl_is_typevar(oa) && jl_is_typevar(ob)) {
+        // Two structurally identical types are often separate allocations, and each binds
+        // its own variable objects. Those are the same variable: a type variable's name is
+        // a gensym as often as not and carries no identity, so compare what does -- the
+        // bounds. Without this, keying variables by their binder reports one collision per
+        // duplicated binder.
+        jl_tvar_t *ta = (jl_tvar_t*)oa, *tb = (jl_tvar_t*)ob;
+        if (jl_types_equal(ta->lb, tb->lb) && jl_types_equal(ta->ub, tb->ub))
+            return 1;
+    }
     if (jl_is_code_instance(oa) && jl_is_code_instance(ob)) {
         jl_code_instance_t *ca = (jl_code_instance_t*)oa;
         jl_code_instance_t *cb = (jl_code_instance_t*)ob;
