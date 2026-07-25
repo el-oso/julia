@@ -1714,6 +1714,31 @@ static int extkey_write(ios_t *k, jl_value_t *v, int depth) JL_NOTSAFEPOINT
         if (!extkey_edges_hash(ci, &ehash))
             return 0;
         ios_printf(k, "/E%016" PRIx64, ehash);
+        // The remaining inference results a caller can have specialized against. Omitting
+        // any of them merges code instances that are not interchangeable: a caller that
+        // inlined one and elided a branch on its effects, or constant-folded through its
+        // `rettype_const`, is not correct against the other.
+        ios_putc('/', k);
+        if (!extkey_type_toplevel(k, ci->exctype))
+            return 0;
+        ios_putc('/', k);
+        if (ci->rettype_const == NULL)
+            ios_putc('-', k);
+        else if (!extkey_write(k, ci->rettype_const, depth + 1))
+            return 0;   // a constant we cannot name is a constant we cannot re-link against
+        ios_printf(k, "/P%08" PRIx32, jl_atomic_load_relaxed(&ci->ipo_purity_bits));
+        // World ages themselves are per-build counters and would never match across a
+        // rebuild, but they are not serialized raw either: an incremental image collapses
+        // every code instance to one of two states on write (staticdata.c, `jl_is_code_instance`
+        // in the fixup pass) -- live, and so subject to revalidation, or dead. That
+        // distinction is the only part of the world range that survives, so it is the only
+        // part the key can carry.
+        ios_putc(jl_atomic_load_relaxed(&ci->max_world) == ~(size_t)0 ? 'L' : 'D', k);
+        // Deliberately excluded: `analysis_results` (a derived cache with no stable
+        // identity of its own; the effects it summarizes are already in the purity bits),
+        // and every compilation-state field -- `invoke`, `specptr`, `precompile`, the
+        // `time_infer_*` counters -- which record what this build happened to compile
+        // rather than what was inferred.
         return 1;
     }
     if (jl_is_symbol(v)) {
