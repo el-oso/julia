@@ -1215,6 +1215,67 @@ static int extkey_type(ios_t *k, jl_value_t *t, extkey_binder_t *env, int depth,
 // `EXTKEY_MAX_TYPEDEPTH`.
 #define extkey_type_toplevel(k, t) extkey_type(k, t, NULL, 0, 0)
 
+// Reverse index from a bound type variable to a binder that introduces it. A `TypeVar`
+// reached on its own -- as a method instance's static parameter, say -- has no identity of
+// its own, but if some imported type binds it, then "the variable introduced by the binder
+// at this depth of that type" names it stably. Built once per serialization.
+typedef struct { uint64_t binder; int depth; } extkey_tvar_t;
+static htable_t extkey_tvars;
+static int extkey_tvars_ready = 0;
+
+static const extkey_tvar_t *extkey_lookup_tvar(jl_value_t *v) JL_NOTSAFEPOINT
+{
+    if (!extkey_tvars_ready)
+        return NULL;
+    void *p = ptrhash_get(&extkey_tvars, v);
+    return p == HT_NOTFOUND ? NULL : (const extkey_tvar_t*)p;
+}
+
+// `ord` counts binders in pre-order within one root type. Nesting depth alone is not
+// enough: two sibling binders at the same depth, as in `Tuple{Vector{T} where T,
+// Vector{S} where S}`, would share it and merge two distinct variables. Pre-order position
+// is structural, so it is identical in any build of the same type.
+static void extkey_register_tvars(jl_value_t *t, uint64_t binder, int *ord,
+                                  int fuel) JL_NOTSAFEPOINT
+{
+    if (t == NULL || fuel <= 0)
+        return;
+    if (jl_is_unionall(t)) {
+        jl_unionall_t *ua = (jl_unionall_t*)t;
+        int here = (*ord)++;
+        void **bp = ptrhash_bp(&extkey_tvars, (void*)ua->var);
+        if (*bp == HT_NOTFOUND) {
+            extkey_tvar_t *e = (extkey_tvar_t*)malloc_s(sizeof(extkey_tvar_t));
+            e->binder = binder;
+            e->depth = here;
+            *bp = e;
+        }
+        else {
+            // Deterministic when several roots bind one variable: keep the smaller
+            // (binder, position) so two builds agree regardless of visit order.
+            extkey_tvar_t *e = (extkey_tvar_t*)*bp;
+            if (binder < e->binder || (binder == e->binder && here < e->depth)) {
+                e->binder = binder;
+                e->depth = here;
+            }
+        }
+        extkey_register_tvars(ua->var->lb, binder, ord, fuel - 1);
+        extkey_register_tvars(ua->var->ub, binder, ord, fuel - 1);
+        extkey_register_tvars(ua->body, binder, ord, fuel - 1);
+        return;
+    }
+    if (jl_is_uniontype(t)) {
+        extkey_register_tvars(((jl_uniontype_t*)t)->a, binder, ord, fuel - 1);
+        extkey_register_tvars(((jl_uniontype_t*)t)->b, binder, ord, fuel - 1);
+        return;
+    }
+    if (jl_is_datatype(t)) {
+        jl_svec_t *ps = ((jl_datatype_t*)t)->parameters;
+        for (size_t i = 0; i < jl_svec_len(ps); i++)
+            extkey_register_tvars(jl_svecref(ps, i), binder, ord, fuel - 1);
+    }
+}
+
 // Raw bytes must never be written into a key directly: keys are NUL-terminated and
 // compared as C strings, so an embedded zero -- which any integer value parameter has --
 // would silently truncate the comparison and merge distinct keys.
@@ -1746,6 +1807,16 @@ static int extkey_write(ios_t *k, jl_value_t *v, int depth) JL_NOTSAFEPOINT
         ios_putc('}', k);
         return 1;
     }
+    if (jl_is_typevar(v)) {
+        // A type variable reached on its own has no identity, but if some imported type
+        // binds it then that binder plus the depth at which it is introduced names it.
+        const extkey_tvar_t *tv = extkey_lookup_tvar(v);
+        if (tv != NULL) {
+            ios_printf(k, "TV:%016" PRIx64 "/%d", tv->binder, tv->depth);
+            return 1;
+        }
+        return 0;   // nothing imported binds it
+    }
     // Last resort: an object with no identity of its own may still be reachable by a
     // stable path. A mutable global -- a `LazyLibrary` in a JLL, a lock, a cache -- is
     // typically the value of a module constant, and that binding *is* stably named. Key
@@ -1815,6 +1886,25 @@ static int extkey_equiv(jl_value_t *oa, jl_value_t *ob) JL_NOTSAFEPOINT
             return 1;
     }
     return 0;
+}
+
+// Register every type variable bound by any imported type, so that a type variable
+// reached on its own can still be named. Must run before any key is computed.
+static void extkey_build_tvars(jl_serializer_state *s) JL_NOTSAFEPOINT
+{
+    if (extkey_tvars_ready)
+        return;
+    htable_new(&extkey_tvars, 0);
+    extkey_tvars_ready = 1;
+    for (size_t i = 0; i < s->import_objs.len; i++) {
+        jl_value_t *v = (jl_value_t*)s->import_objs.items[i];
+        if (!jl_is_type(v))
+            continue;
+        // The binder is identified by its own structural key, which is already stable.
+        uint64_t h = 0;
+        if (extkey_hash(v, &h))
+            { int ord = 0; extkey_register_tvars(v, h, &ord, EXTKEY_MAX_TYPEDEPTH); }
+    }
 }
 
 // Serialize the import table: for each distinct object this image references in another
@@ -4835,6 +4925,7 @@ static void jl_save_system_image_to_stream(ios_t *f, jl_array_t *mod_array,
         ios_write(f, (char*)jl_array_data(s.link_ids_external_fnvars, uint32_t), jl_array_len(s.link_ids_external_fnvars) * sizeof(uint32_t));
         write_uint32(f, external_fns_begin);
         extkey_build_paths(mod_array);
+        extkey_build_tvars(&s);
         jl_write_import_table(&s, f);
     }
 
