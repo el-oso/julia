@@ -1539,8 +1539,45 @@ static int extkey_write(ios_t *k, jl_value_t *v, int depth) JL_NOTSAFEPOINT
         ios_putc('>', k);
         return 1;
     }
+    if (jl_is_datatype(vt) && jl_is_immutable(vt) && vt->layout != NULL &&
+        !vt->name->abstract && jl_datatype_nfields(vt) > 0) {
+        // A general immutable struct is its type plus its fields: pointer fields recurse,
+        // inline fields contribute their bytes. This generalizes the pointer-free case
+        // above and covers wrappers such as `Const` and mixed structs like
+        // `VersionNumber`. Only immutables qualify -- a mutable object's contents can
+        // change after serialization, so no content key for one could be stable.
+        size_t nf = jl_datatype_nfields(vt);
+        ios_puts("v:", k);
+        if (!extkey_write(k, (jl_value_t*)vt, depth + 1))
+            return 0;
+        ios_putc('{', k);
+        for (size_t i = 0; i < nf; i++) {
+            if (i)
+                ios_putc(',', k);
+            if (jl_field_isptr(vt, i)) {
+                jl_value_t *fv = jl_get_nth_field_noalloc(v, i);
+                if (fv == NULL)
+                    ios_putc('0', k);
+                else if (!extkey_write(k, fv, depth + 1))
+                    return 0;
+            }
+            else {
+                // An inline field's bytes are only meaningful if they hold no pointers,
+                // which would be addresses rather than content, and no padding.
+                jl_value_t *ft = jl_field_type_concrete(vt, i);
+                if (!jl_is_datatype(ft))
+                    return 0;
+                const jl_datatype_layout_t *flo = ((jl_datatype_t*)ft)->layout;
+                if (flo == NULL || flo->npointers != 0 || flo->flags.haspadding)
+                    return 0;
+                extkey_bytes(k, (const char*)v + jl_field_offset(vt, i), jl_field_size(vt, i));
+            }
+        }
+        ios_putc('}', k);
+        return 1;
+    }
     // Remaining kinds have no stable identity: bare TypeVars (meaningful only relative to
-    // their binder), mutable boxes such as `Threads.Atomic` whose contents change after
+    // their binder), mutable objects such as `Threads.Atomic` whose contents change after
     // construction, and opaque compiler state such as AnalysisResults.
     return 0;
 }
