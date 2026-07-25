@@ -1127,6 +1127,12 @@ static uintptr_t add_external_linkage(jl_serializer_state *s, jl_value_t *v, jl_
 // treat that as "cannot re-resolve", i.e. fall back to rebuilding the dependent.
 
 #define EXTKEY_MAX_DEPTH 8
+// Types nest deeper than values do -- a method signature is routinely a dozen levels of
+// `Tuple`/`Union`/`UnionAll` -- and unlike a value graph a type graph is finite and
+// acyclic, so type nesting gets its own, looser budget. The value budget still bounds any
+// alternation between the two: every hop back out of a type into a boxed parameter spends
+// one unit of `depth`.
+#define EXTKEY_MAX_TYPEDEPTH 40
 
 static int extkey_write(ios_t *k, jl_value_t *v, int depth) JL_NOTSAFEPOINT;
 
@@ -1184,6 +1190,30 @@ static void extkey_build_paths(jl_array_t *mod_array) JL_NOTSAFEPOINT
         }
     }
 }
+// The chain of `UnionAll` binders in scope while a type is being keyed, innermost first.
+// A bound `TypeVar` has no standalone identity -- only a meaning relative to the binder
+// that introduced it -- so it is keyed by its de Bruijn index into this chain rather than
+// by name. Names are gensyms as often as not (`#s42`) and are no part of a type's
+// identity, so keying by them would be both unstable across rebuilds and gratuitously
+// discriminating: `Vector{T} where T` and `Vector{S} where S` are one type and must
+// produce one key.
+typedef struct extkey_binder {
+    struct extkey_binder *outer;
+    jl_tvar_t *var;
+} extkey_binder_t;
+
+// Structural key for anything type-level: `DataType`, `Union`, `UnionAll`, `Vararg` and
+// bound `TypeVar`s. Returns 0 for a type that cannot be keyed, which now means only one
+// thing: it mentions a type variable no enclosing binder introduced.
+static int extkey_type(ios_t *k, jl_value_t *t, extkey_binder_t *env, int depth,
+                       int tdepth) JL_NOTSAFEPOINT;
+
+// Every caller outside a binder chain enters at `depth` 0: a type reaches only types,
+// symbols and boxed isbits values -- never back into a method, code instance or any other
+// node of the value graph -- so it spends none of the value budget, and whatever the
+// caller has left of it is irrelevant here. Type nesting is bounded separately, by
+// `EXTKEY_MAX_TYPEDEPTH`.
+#define extkey_type_toplevel(k, t) extkey_type(k, t, NULL, 0, 0)
 
 // Raw bytes must never be written into a key directly: keys are NUL-terminated and
 // compared as C strings, so an embedded zero -- which any integer value parameter has --
@@ -1229,11 +1259,11 @@ static int extkey_edge_slot(ios_t *k, jl_value_t *e) JL_NOTSAFEPOINT
         ios_printf(k, "i%zd", jl_unbox_long(e));
         return 1;
     }
-    // signatures and other type-valued slots print stably
-    if (jl_is_type(e)) {
-        jl_static_show((JL_STREAM*)k, e);
-        return 1;
-    }
+    // Signatures and other type-valued slots key structurally, like every other type, but
+    // at full depth: the budget above exists only to keep the recursion through callees
+    // finite, and a type cannot reach back into a code instance.
+    if (jl_is_type(e) || jl_is_vararg(e))
+        return extkey_type_toplevel(k, e);
     return extkey_write(k, e, EXTKEY_MAX_DEPTH - 1);
 }
 
@@ -1348,6 +1378,121 @@ static void extkey_module(ios_t *k, jl_module_t *m) JL_NOTSAFEPOINT
     ios_puts(jl_symbol_name(m->name), k);
 }
 
+// A type parameter is either type-level (and must be keyed inside the binder
+// environment) or an ordinary value such as a boxed integer or a symbol.
+static int extkey_param(ios_t *k, jl_value_t *p, extkey_binder_t *env, int depth,
+                        int tdepth) JL_NOTSAFEPOINT
+{
+    if (p == NULL)
+        return 0;
+    if (jl_is_type(p) || jl_is_typevar(p) || jl_is_vararg(p))
+        return extkey_type(k, p, env, depth, tdepth);
+    return extkey_write(k, p, depth + 1);
+}
+
+// `Union` is a binary tree over a set of components, but `jl_type_union` canonicalizes
+// that tree -- it sorts and de-duplicates -- so the flattened in-order sequence is stable.
+static size_t extkey_union_count(jl_value_t *t) JL_NOTSAFEPOINT
+{
+    if (jl_is_uniontype(t))
+        return extkey_union_count(((jl_uniontype_t*)t)->a) +
+               extkey_union_count(((jl_uniontype_t*)t)->b);
+    return 1;
+}
+
+static int extkey_union_parts(ios_t *k, jl_value_t *t, extkey_binder_t *env, int depth,
+                              int tdepth, int *first) JL_NOTSAFEPOINT
+{
+    if (jl_is_uniontype(t))
+        return extkey_union_parts(k, ((jl_uniontype_t*)t)->a, env, depth, tdepth, first) &&
+               extkey_union_parts(k, ((jl_uniontype_t*)t)->b, env, depth, tdepth, first);
+    if (!*first)
+        ios_putc(',', k);
+    *first = 0;
+    return extkey_type(k, t, env, depth, tdepth);
+}
+
+static int extkey_type(ios_t *k, jl_value_t *t, extkey_binder_t *env, int depth,
+                       int tdepth) JL_NOTSAFEPOINT
+{
+    if (t == NULL || depth > EXTKEY_MAX_DEPTH || tdepth > EXTKEY_MAX_TYPEDEPTH)
+        return 0;
+    if (jl_is_typevar(t)) {
+        int i = 0;
+        for (extkey_binder_t *b = env; b != NULL; b = b->outer, i++) {
+            if (b->var == (jl_tvar_t*)t) {
+                ios_printf(k, "#%d", i);
+                return 1;
+            }
+        }
+        return 0;   // free type variable: nothing binds it, so it has no identity here
+    }
+    if (t == (jl_value_t*)jl_bottom_type) {
+        ios_puts("U0<>", k);   // `Union{}` is the empty union
+        return 1;
+    }
+    if (jl_is_uniontype(t)) {
+        int first = 1;
+        ios_printf(k, "U%zu<", extkey_union_count(t));
+        if (!extkey_union_parts(k, t, env, depth, tdepth + 1, &first))
+            return 0;
+        ios_putc('>', k);
+        return 1;
+    }
+    if (jl_is_unionall(t)) {
+        // the bounds are keyed outside the binder, the body inside it
+        jl_unionall_t *ua = (jl_unionall_t*)t;
+        ios_puts("A<", k);
+        if (!extkey_type(k, ua->var->lb, env, depth, tdepth + 1))
+            return 0;
+        ios_putc(',', k);
+        if (!extkey_type(k, ua->var->ub, env, depth, tdepth + 1))
+            return 0;
+        ios_putc(';', k);
+        extkey_binder_t b = { env, ua->var };
+        if (!extkey_type(k, ua->body, &b, depth, tdepth + 1))
+            return 0;
+        ios_putc('>', k);
+        return 1;
+    }
+    if (jl_is_vararg(t)) {
+        // both fields are optional: `Vararg`, `Vararg{T}` and `Vararg{T,N}` all occur
+        jl_vararg_t *vm = (jl_vararg_t*)t;
+        ios_puts("X<", k);
+        if (vm->T == NULL)
+            ios_putc('-', k);
+        else if (!extkey_type(k, vm->T, env, depth, tdepth + 1))
+            return 0;
+        ios_putc(',', k);
+        if (vm->N == NULL)
+            ios_putc('-', k);
+        else if (!extkey_param(k, vm->N, env, depth, tdepth + 1))
+            return 0;   // a bound length variable, or a boxed `Int`
+        ios_putc('>', k);
+        return 1;
+    }
+    if (jl_is_datatype(t)) {
+        jl_datatype_t *dt = (jl_datatype_t*)t;
+        ios_puts("T:", k);
+        extkey_module(k, dt->name->module);
+        ios_putc('.', k);
+        ios_puts(jl_symbol_name(dt->name->name), k);
+        // parameters are part of the identity of an instantiated type
+        size_t np = jl_svec_len(dt->parameters);
+        if (np) {
+            ios_printf(k, "{%zu:", np);
+            for (size_t i = 0; i < np; i++) {
+                if (i) ios_putc(',', k);
+                if (!extkey_param(k, jl_svecref(dt->parameters, i), env, depth, tdepth + 1))
+                    return 0;
+            }
+            ios_putc('}', k);
+        }
+        return 1;
+    }
+    return 0;
+}
+
 static int extkey_write(ios_t *k, jl_value_t *v, int depth) JL_NOTSAFEPOINT
 {
     if (depth > EXTKEY_MAX_DEPTH)
@@ -1365,24 +1510,12 @@ static int extkey_write(ios_t *k, jl_value_t *v, int depth) JL_NOTSAFEPOINT
         ios_puts(jl_symbol_name(tn->name), k);
         return 1;
     }
-    if (jl_is_datatype(v)) {
-        jl_datatype_t *dt = (jl_datatype_t*)v;
-        ios_puts("T:", k);
-        extkey_module(k, dt->name->module);
-        ios_putc('.', k);
-        ios_puts(jl_symbol_name(dt->name->name), k);
-        // parameters are part of the identity of an instantiated type
-        size_t np = jl_svec_len(dt->parameters);
-        if (np) {
-            ios_putc('{', k);
-            for (size_t i = 0; i < np; i++) {
-                if (i) ios_putc(',', k);
-                if (!extkey_write(k, jl_svecref(dt->parameters, i), depth + 1))
-                    return 0;
-            }
-            ios_putc('}', k);
-        }
-        return 1;
+    if (jl_is_datatype(v) || jl_is_type(v) || jl_is_vararg(v)) {
+        // All type-level kinds are keyed structurally, binders and all, so that the key
+        // records what a type *is* rather than how it prints. A bare `TypeVar` is not
+        // included: it is only meaningful relative to the `UnionAll` that binds it, and
+        // `extkey_type` refuses one that no enclosing binder introduced.
+        return extkey_type_toplevel(k, v);
     }
     if (jl_is_binding(v)) {
         jl_binding_t *b = (jl_binding_t*)v;
@@ -1402,7 +1535,8 @@ static int extkey_write(ios_t *k, jl_value_t *v, int depth) JL_NOTSAFEPOINT
         // The signature disambiguates the methods of one generic function. Deliberately
         // *not* including file:line -- `Method.file` is an absolute path into the depot,
         // which differs between machines and depots and would make keys unportable.
-        jl_static_show((JL_STREAM*)k, (jl_value_t*)m->sig);
+        if (!extkey_type_toplevel(k, (jl_value_t*)m->sig))
+            return 0;
         // KNOWN HAZARD: this identifies a method's *definition site*, not its body. Code
         // inferred against a method -- possibly with it inlined -- could re-link to a
         // rebuilt version whose body changed while its signature did not, and
@@ -1427,8 +1561,7 @@ static int extkey_write(ios_t *k, jl_value_t *v, int depth) JL_NOTSAFEPOINT
         if (!extkey_write(k, mi->def.value, depth + 1))
             return 0;
         ios_putc('/', k);
-        jl_static_show((JL_STREAM*)k, (jl_value_t*)mi->specTypes);
-        return 1;
+        return extkey_type_toplevel(k, (jl_value_t*)mi->specTypes);
     }
     if (jl_is_code_instance(v)) {
         jl_code_instance_t *ci = (jl_code_instance_t*)v;
@@ -1444,7 +1577,8 @@ static int extkey_write(ios_t *k, jl_value_t *v, int depth) JL_NOTSAFEPOINT
             return 0;
         // and the ABI/rettype distinguishes co-existing entries for one owner
         ios_putc('/', k);
-        jl_static_show((JL_STREAM*)k, ci->rettype);
+        if (!extkey_type_toplevel(k, ci->rettype))
+            return 0;
         // Entries in one method instance's cache chain can agree on all of the above and
         // differ only in their edges, so the edge set has to take part in the identity.
         uint64_t ehash;
@@ -1461,16 +1595,6 @@ static int extkey_write(ios_t *k, jl_value_t *v, int depth) JL_NOTSAFEPOINT
     if (jl_is_string(v)) {
         ios_puts("s:", k);
         extkey_bytes(k, jl_string_data(v), jl_string_len(v));
-        return 1;
-    }
-    if (jl_is_type(v)) {
-        // UnionAll and Union have no name of their own but print structurally and stably,
-        // binders included. Without this, every parameterized DataType mentioning one is
-        // unkeyable too. Bare TypeVars are deliberately excluded: a type variable has no
-        // standalone identity, only a meaning relative to the UnionAll that binds it, and
-        // keying one by name alone merges every `T` in the image.
-        ios_puts("t:", k);
-        jl_static_show((JL_STREAM*)k, v);
         return 1;
     }
     if (jl_typetagis(v, jl_debuginfo_type)) {
@@ -1501,8 +1625,6 @@ static int extkey_write(ios_t *k, jl_value_t *v, int depth) JL_NOTSAFEPOINT
                 ios_putc(',', k);
             if (e == NULL)
                 ios_putc('0', k);
-            else if (jl_is_type(e))
-                jl_static_show((JL_STREAM*)k, e);
             else if (!extkey_write(k, e, depth + 1))
                 return 0;
         }
@@ -1527,7 +1649,8 @@ static int extkey_write(ios_t *k, jl_value_t *v, int depth) JL_NOTSAFEPOINT
         if (lo == NULL)
             return 0;
         ios_puts("G:", k);
-        jl_static_show((JL_STREAM*)k, (jl_value_t*)jl_typeof(m));
+        if (!extkey_type_toplevel(k, (jl_value_t*)jl_typeof(m)))
+            return 0;
         ios_printf(k, "<%zu:", (size_t)m->length);
         if (lo->flags.arrayelem_isboxed) {
             jl_value_t **el = jl_genericmemory_ptr_data(m);
@@ -1536,8 +1659,6 @@ static int extkey_write(ios_t *k, jl_value_t *v, int depth) JL_NOTSAFEPOINT
                     ios_putc(',', k);
                 if (el[i] == NULL)
                     ios_putc('0', k);
-                else if (jl_is_type(el[i]))
-                    jl_static_show((JL_STREAM*)k, el[i]);
                 else if (!extkey_write(k, el[i], depth + 1))
                     return 0;
             }
@@ -1928,6 +2049,32 @@ static void jl_report_import_keys(jl_serializer_state *s) JL_NOTSAFEPOINT
                 jl_safe_printf("IMPORTKEYS_DEP dep=%zu name=%s total=%zu unkeyed=%zu %s\n",
                                d, dname[d] ? dname[d] : "?", dtot[d], dunk[d],
                                dunk[d] ? "blocked" : "RELINKABLE");
+                if (dunk[d]) {
+                    // Name the kinds actually blocking *this* dependency. That is what has
+                    // to be keyed next, and it is not the same as the global histogram: a
+                    // kind with a huge global count may block nothing, while a single
+                    // object of a rare kind can block an entire dependency.
+                    void *bty[12]; size_t bcnt[12], bnty = 0;
+                    for (size_t i = 0; i < n; i++) {
+                        if (kdep[i] != d || koff[i + 1] - koff[i] > 1)
+                            continue;
+                        void *ty = (void*)jl_typeof((jl_value_t*)s->import_objs.items[i]);
+                        size_t q;
+                        for (q = 0; q < bnty; q++)
+                            if (bty[q] == ty) break;
+                        if (q == bnty) {
+                            if (q == 12)
+                                continue;
+                            bty[q] = ty; bcnt[q] = 0; bnty++;
+                        }
+                        bcnt[q]++;
+                    }
+                    for (size_t q = 0; q < bnty; q++)
+                        jl_safe_printf("IMPORTKEYS_BLOCKER %s %s %zu\n",
+                                       dname[d] ? dname[d] : "?",
+                                       jl_symbol_name(((jl_datatype_t*)bty[q])->name->name),
+                                       bcnt[q]);
+                }
             }
         }
         free(dname);
@@ -2060,20 +2207,37 @@ static jl_typename_t *shadow_resolve_typename(jl_array_t *mod_array, jl_typename
     return (got->name == tn->name && got->module == m) ? got : NULL;
 }
 
-static jl_value_t *shadow_resolve_datatype(jl_array_t *mod_array, jl_datatype_t *dt, int depth,
+// The re-derived counterpart of `extkey_binder_t`: the chain of `UnionAll` binders in
+// scope, innermost first, pairing each original type variable with the fresh one built
+// for it. Looking a variable up by its original pointer walks exactly the chain its de
+// Bruijn index counts, so this is that index, resolved against the structure being walked
+// rather than against a parsed key. Each frame lives on the C stack of the `UnionAll`
+// resolution that pushed it, which is also what roots `newv`.
+typedef struct shadow_binder {
+    struct shadow_binder *outer;
+    jl_tvar_t *oldv;
+    jl_tvar_t *newv;
+} shadow_binder_t;
+
+static jl_value_t *shadow_resolve_datatype(jl_array_t *mod_array, jl_datatype_t *dt,
+                                           shadow_binder_t *env, int depth,
                                            shadow_ctx_t *c) JL_GC_DISABLED;
+static jl_value_t *shadow_resolve_type(jl_array_t *mod_array, jl_value_t *t,
+                                       shadow_binder_t *env, int depth,
+                                       shadow_ctx_t *c) JL_GC_DISABLED;
 
 // Re-derive a type parameter. Only objects that live in another image need resolving at
 // all: anything else is written into this image and is available directly on load.
-static jl_value_t *shadow_resolve_param(jl_array_t *mod_array, jl_value_t *p, int depth,
+static jl_value_t *shadow_resolve_param(jl_array_t *mod_array, jl_value_t *p,
+                                        shadow_binder_t *env, int depth,
                                         shadow_ctx_t *c) JL_GC_DISABLED
 {
     if (p == NULL)
         return NULL;
     if (!jl_object_in_image(p))
         return p;
-    if (jl_is_datatype(p))
-        return shadow_resolve_datatype(mod_array, (jl_datatype_t*)p, depth, c);
+    if (jl_is_type(p) || jl_is_typevar(p) || jl_is_vararg(p))
+        return shadow_resolve_type(mod_array, p, env, depth, c);
     if (jl_is_module(p)) {
         jl_value_t *m = (jl_value_t*)shadow_resolve_module(mod_array, (jl_module_t*)p);
         if (m == NULL)
@@ -2082,23 +2246,191 @@ static jl_value_t *shadow_resolve_param(jl_array_t *mod_array, jl_value_t *p, in
     }
     if (jl_is_symbol(p))
         return p;   // symbols are interned, so re-deriving one by name returns this same one
-    // Anything else -- a boxed integer dimension, a `Union`, a `UnionAll` -- is passed
-    // through as itself. That is not a re-derivation: it uses the pointer we are supposed
-    // to be re-deriving, so any type resolved this way is counted separately.
+    jl_datatype_t *vt = (jl_datatype_t*)jl_typeof(p);
+    jl_value_t *rt = shadow_resolve_datatype(mod_array, vt, env, depth + 1, c);
+    if (rt != NULL && jl_is_datatype(rt)) {
+        // `O:` -- a singleton is completely determined by its type
+        if (jl_is_datatype_singleton((jl_datatype_t*)rt))
+            return ((jl_datatype_t*)rt)->instance;
+        // `b:` -- a boxed pointer-free immutable, the `2` in `Array{Float64,2}`, is its
+        // type plus its bytes, and the key carries both. Re-box rather than reuse: the
+        // bytes are content, the box is an address.
+        const jl_datatype_layout_t *lo = ((jl_datatype_t*)rt)->layout;
+        if (lo != NULL && lo->npointers == 0 && !lo->flags.haspadding &&
+            jl_is_immutable((jl_datatype_t*)rt)) {
+            c->constructed = 1;
+            return jl_new_bits(rt, (const char*)p);
+        }
+        // `v:` -- a general immutable struct is its type plus its fields, so rebuild it
+        // field by field. This is what carries a `NamedTuple`'s field-name tuple, the
+        // `(:sizehint,)` in `NamedTuple{(:sizehint,), Tuple{Int}}`.
+        size_t nf = jl_datatype_nfields((jl_datatype_t*)rt);
+        if (lo != NULL && nf > 0 && jl_is_immutable((jl_datatype_t*)rt) &&
+            !((jl_datatype_t*)rt)->name->abstract) {
+            jl_value_t **fargs;
+            jl_value_t *res = NULL;
+            JL_GC_PUSH1(&rt);
+            JL_GC_PUSHARGS(fargs, nf);
+            size_t i;
+            for (i = 0; i < nf; i++) {
+                if (jl_field_isptr(vt, i)) {
+                    jl_value_t *fv = jl_get_nth_field_noalloc(p, i);
+                    // an undefined field has no content to re-derive from
+                    if (fv == NULL)
+                        break;
+                    fargs[i] = shadow_resolve_param(mod_array, fv, env, depth + 1, c);
+                }
+                else {
+                    // inline fields contribute their bytes, and the key only accepts
+                    // those when they hold neither pointers nor padding
+                    jl_value_t *ft = jl_field_type_concrete(vt, i);
+                    const jl_datatype_layout_t *flo = jl_is_datatype(ft) ?
+                        ((jl_datatype_t*)ft)->layout : NULL;
+                    if (flo == NULL || flo->npointers != 0 || flo->flags.haspadding)
+                        break;
+                    jl_value_t *rft = shadow_resolve_type(mod_array, ft, env, depth + 1, c);
+                    if (rft == NULL)
+                        break;
+                    fargs[i] = jl_new_bits(rft, (const char*)p + jl_field_offset(vt, i));
+                }
+                if (fargs[i] == NULL)
+                    break;
+            }
+            if (i == nf) {
+                c->constructed = 1;
+                res = jl_new_structv((jl_datatype_t*)rt, fargs, (uint32_t)nf);
+            }
+            JL_GC_POP();
+            JL_GC_POP();
+            if (res != NULL)
+                return res;
+        }
+    }
+    // Anything left -- an object with an undefined or unkeyable field, a mutable object --
+    // is passed through as itself. That is not a re-derivation: it uses the pointer we are
+    // supposed to be re-deriving, so any type resolved this way is counted separately.
     c->passthrough = 1;
     return p;
 }
 
-static jl_value_t *shadow_resolve_datatype(jl_array_t *mod_array, jl_datatype_t *dt, int depth,
-                                           shadow_ctx_t *c) JL_GC_DISABLED
+// Flatten a Union in the same in-order sweep `extkey_union_parts` keys, resolving each
+// component into the caller's rooted `comps` array.
+static int shadow_union_parts(jl_array_t *mod_array, jl_value_t *t, shadow_binder_t *env,
+                              int depth, shadow_ctx_t *c, jl_value_t **comps, size_t *i,
+                              size_t n) JL_GC_DISABLED
 {
-    if (depth > EXTKEY_MAX_DEPTH) {
+    if (jl_is_uniontype(t))
+        return shadow_union_parts(mod_array, ((jl_uniontype_t*)t)->a, env, depth, c, comps, i, n) &&
+               shadow_union_parts(mod_array, ((jl_uniontype_t*)t)->b, env, depth, c, comps, i, n);
+    if (*i >= n)
+        return 0;
+    jl_value_t *r = shadow_resolve_type(mod_array, t, env, depth, c);
+    if (r == NULL)
+        return 0;
+    comps[(*i)++] = r;
+    return 1;
+}
+
+// Re-derive anything type-level from the operands `extkey_type` records.
+static jl_value_t *shadow_resolve_type(jl_array_t *mod_array, jl_value_t *t,
+                                       shadow_binder_t *env, int depth,
+                                       shadow_ctx_t *c) JL_GC_DISABLED
+{
+    if (depth > EXTKEY_MAX_TYPEDEPTH) {
         SHADOW_FAIL(SHRR_DEPTH);
         return NULL;
     }
-    if (dt->hasfreetypevars) {
-        // not cacheable, so the type cache cannot answer for it
+    if (env == NULL && jl_has_free_typevars(t)) {
+        // Nothing here binds this type's variables, so it has no identity of its own,
+        // and `extkey_type` refuses it a key for the same reason.
         SHADOW_FAIL(SHRR_FREETYPEVARS);
+        return NULL;
+    }
+    if (jl_is_typevar(t)) {
+        for (shadow_binder_t *b = env; b != NULL; b = b->outer)
+            if (b->oldv == (jl_tvar_t*)t)
+                return (jl_value_t*)b->newv;
+        SHADOW_FAIL(SHRR_FREETYPEVARS);
+        return NULL;
+    }
+    if (t == (jl_value_t*)jl_bottom_type)
+        return jl_type_union(NULL, 0);   // `U0<>`, the empty union
+    if (jl_is_uniontype(t)) {
+        // a Union is never cached, so it is always rebuilt; `jl_type_union` re-imposes
+        // the canonical component order the key relies on
+        size_t n = extkey_union_count(t), i = 0;
+        jl_value_t **comps;
+        JL_GC_PUSHARGS(comps, n);
+        jl_value_t *res = NULL;
+        if (shadow_union_parts(mod_array, t, env, depth + 1, c, comps, &i, n) && i == n) {
+            c->constructed = 1;
+            res = jl_type_union(comps, n);
+        }
+        else {
+            SHADOW_FAIL(SHRR_PARAM);
+        }
+        JL_GC_POP();
+        return res;
+    }
+    if (jl_is_unionall(t)) {
+        jl_unionall_t *ua = (jl_unionall_t*)t;
+        jl_value_t *lb = NULL, *ub = NULL, *body = NULL, *res = NULL;
+        jl_tvar_t *nv = NULL;
+        JL_GC_PUSH4(&lb, &ub, &body, &nv);
+        lb = shadow_resolve_type(mod_array, ua->var->lb, env, depth + 1, c);
+        ub = lb ? shadow_resolve_type(mod_array, ua->var->ub, env, depth + 1, c) : NULL;
+        if (ub != NULL) {
+            // The key does not carry the variable's name -- it identifies the variable by
+            // its de Bruijn index -- so name the fresh one after that index. Names are
+            // cosmetic: `jl_types_equal`, and hence `extkey_equiv`, ignores them.
+            char nbuf[16];
+            snprintf(nbuf, sizeof(nbuf), "#%d", depth);
+            c->constructed = 1;
+            nv = jl_new_typevar(jl_symbol(nbuf), lb, ub);
+            shadow_binder_t b = { env, ua->var, nv };
+            body = shadow_resolve_type(mod_array, ua->body, &b, depth + 1, c);
+            // wrapping a bare `Vararg` in a `UnionAll` is deprecated and can throw; the
+            // shapes that reach here in practice always have a type body
+            if (body != NULL && !jl_is_vararg(body))
+                res = jl_type_unionall(nv, body);
+        }
+        JL_GC_POP();
+        if (res == NULL)
+            SHADOW_FAIL(SHRR_PARAM);
+        return res;
+    }
+    if (jl_is_vararg(t)) {
+        jl_vararg_t *vm = (jl_vararg_t*)t;
+        jl_value_t *T = NULL, *N = NULL, *res = NULL;
+        JL_GC_PUSH2(&T, &N);
+        int ok = 1;
+        if (vm->T != NULL && (T = shadow_resolve_type(mod_array, vm->T, env, depth + 1, c)) == NULL)
+            ok = 0;
+        if (ok && vm->N != NULL &&
+            (N = shadow_resolve_param(mod_array, vm->N, env, depth + 1, c)) == NULL)
+            ok = 0;
+        if (ok) {
+            c->constructed = 1;
+            // nothrow: a length that fails the checks yields NULL rather than an error
+            res = (jl_value_t*)jl_wrap_vararg(T, N, 1, 1);
+        }
+        JL_GC_POP();
+        if (res == NULL)
+            SHADOW_FAIL(SHRR_PARAM);
+        return res;
+    }
+    if (jl_is_datatype(t))
+        return shadow_resolve_datatype(mod_array, (jl_datatype_t*)t, env, depth, c);
+    SHADOW_FAIL(SHRR_UNSUPPORTED);
+    return NULL;
+}
+
+static jl_value_t *shadow_resolve_datatype(jl_array_t *mod_array, jl_datatype_t *dt,
+                                           shadow_binder_t *env, int depth,
+                                           shadow_ctx_t *c) JL_GC_DISABLED
+{
+    if (depth > EXTKEY_MAX_TYPEDEPTH) {
+        SHADOW_FAIL(SHRR_DEPTH);
         return NULL;
     }
     jl_typename_t *tn = shadow_resolve_typename(mod_array, dt->name);
@@ -2115,7 +2447,7 @@ static jl_value_t *shadow_resolve_datatype(jl_array_t *mod_array, jl_datatype_t 
     int ok = 1;
     for (size_t i = 0; i < np; i++) {
         jl_value_t *rp = shadow_resolve_param(mod_array, jl_svecref(dt->parameters, i),
-                                              depth + 1, c);
+                                              env, depth + 1, c);
         if (rp == NULL) {
             SHADOW_FAIL(SHRR_PARAM);
             ok = 0;
@@ -2124,8 +2456,11 @@ static jl_value_t *shadow_resolve_datatype(jl_array_t *mod_array, jl_datatype_t 
         jl_svecset(p, i, rp);
     }
     jl_datatype_t *found = NULL;
+    // A type mentioning a bound variable is not cacheable (see `cacheable` in jltypes.c),
+    // so there is nothing to look up: it can only be rebuilt.
+    int cacheable = !dt->hasfreetypevars;
     // `typekey_hash` reads key[0] unconditionally for `Type`, so never hand it an empty key
-    if (ok && (np > 0 || tn != jl_type_typename)) {
+    if (ok && cacheable && (np > 0 || tn != jl_type_typename)) {
         // The type cache is keyed on exactly (type name, parameters), so a scratch type
         // carrying the re-derived ones is all `jl_lookup_cache_type_` needs to answer.
         jl_datatype_t *scratch = jl_new_uninitialized_datatype();
@@ -2137,19 +2472,20 @@ static jl_value_t *shadow_resolve_datatype(jl_array_t *mod_array, jl_datatype_t 
         if (found == NULL && jl_is_datatype(w) &&
             jl_egal((jl_value_t*)((jl_datatype_t*)w)->parameters, (jl_value_t*)p))
             found = (jl_datatype_t*)w;   // a type name's wrapper is not kept in its cache
-        if (found == NULL) {
-            // Not every type is in the cache: a tuple type is only entered when all of
-            // its parameters are concrete (see `cacheable` in jltypes.c), which excludes
-            // every method signature. Such a type has to be rebuilt instead of found --
-            // legitimately, since a key names an equivalence class and not an allocation.
-            c->constructed = 1;
-            if (tn == jl_tuple_typename)
-                found = (jl_datatype_t*)jl_apply_tuple_type(p, 1);
-            else if (jl_is_unionall(w))
-                found = (jl_datatype_t*)jl_apply_type(w, jl_svec_data(p), np);
-            if (found != NULL && !jl_is_datatype(found))
-                found = NULL;
-        }
+    }
+    if (ok && found == NULL) {
+        // Not every type is in the cache: a tuple type is only entered when all of its
+        // parameters are concrete, which excludes every method signature, and nothing
+        // mentioning a bound variable is entered at all. Such a type has to be rebuilt
+        // instead of found -- legitimately, since a key names an equivalence class and
+        // not an allocation.
+        c->constructed = 1;
+        if (tn == jl_tuple_typename)
+            found = (jl_datatype_t*)jl_apply_tuple_type(p, 1);
+        else if (jl_is_unionall(w))
+            found = (jl_datatype_t*)jl_apply_type(w, jl_svec_data(p), np);
+        if (found != NULL && !jl_is_datatype(found))
+            found = NULL;
     }
     JL_GC_POP();
     if (found == NULL)
@@ -2163,7 +2499,7 @@ static jl_value_t *shadow_resolve_datatype(jl_array_t *mod_array, jl_datatype_t 
 static jl_method_t *shadow_resolve_method(jl_array_t *mod_array, jl_method_t *m, int depth,
                                           shadow_ctx_t *c) JL_GC_DISABLED
 {
-    jl_value_t *sig = shadow_resolve_param(mod_array, m->sig, depth, c);
+    jl_value_t *sig = shadow_resolve_param(mod_array, m->sig, NULL, depth, c);
     if (sig == NULL)
         return NULL;
     jl_value_t *found = jl_methtable_lookup(sig, jl_atomic_load_acquire(&jl_world_counter));
@@ -2204,7 +2540,7 @@ static jl_value_t *shadow_resolve(jl_array_t *mod_array, jl_value_t *v, int *kin
     }
     if (jl_is_datatype(v)) {
         *kind = SHK_DATATYPE;
-        return shadow_resolve_datatype(mod_array, (jl_datatype_t*)v, 0, c);
+        return shadow_resolve_type(mod_array, v, NULL, 0, c);
     }
     if (jl_is_method_instance(v)) {
         *kind = SHK_METHODINSTANCE;
@@ -2216,7 +2552,7 @@ static jl_value_t *shadow_resolve(jl_array_t *mod_array, jl_value_t *v, int *kin
         jl_method_t *m = shadow_resolve_method(mod_array, mi->def.method, 1, c);
         if (m == NULL)
             return NULL;
-        jl_value_t *spec = shadow_resolve_param(mod_array, mi->specTypes, 1, c);
+        jl_value_t *spec = shadow_resolve_param(mod_array, mi->specTypes, NULL, 1, c);
         if (spec == NULL) {
             SHADOW_FAIL(SHRR_PARAM);
             return NULL;
