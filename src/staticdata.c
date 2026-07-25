@@ -1365,7 +1365,7 @@ static void jl_report_import_keys(jl_serializer_state *s) JL_NOTSAFEPOINT
     }
 
     // injectivity: collisions between *distinct* objects would make keys unusable
-    size_t ncollide = 0;
+    size_t ncollide = 0, ndup = 0;
     htable_t seen;
     htable_new(&seen, 0);
     for (size_t i = 0; i < n; i++) {
@@ -1381,11 +1381,40 @@ static void jl_report_import_keys(jl_serializer_state *s) JL_NOTSAFEPOINT
             size_t j = (size_t)(uintptr_t)*bp - 1;
             if (strcmp(keybuf.buf + koff[j], ki) == 0 &&
                 s->import_objs.items[i] != s->import_objs.items[j]) {
+                // Distinct allocations that Julia itself treats as one identity are not
+                // key failures: type uniquing merges equal types on load, and sibling
+                // entries in a method instance's cache chain are interchangeable. Only
+                // count a collision when the two are genuinely different things.
+                jl_value_t *oa = (jl_value_t*)s->import_objs.items[i];
+                jl_value_t *ob = (jl_value_t*)s->import_objs.items[j];
+                if (jl_is_datatype(oa) && jl_is_datatype(ob) && jl_types_equal(oa, ob)) {
+                    ndup++;
+                    continue;
+                }
+                if (jl_is_code_instance(oa) && jl_is_code_instance(ob)) {
+                    jl_code_instance_t *ca = (jl_code_instance_t*)oa;
+                    jl_code_instance_t *cb = (jl_code_instance_t*)ob;
+                    if (jl_get_ci_mi(ca) == jl_get_ci_mi(cb) && ca->owner == cb->owner &&
+                        ca->rettype == cb->rettype && ca->exctype == cb->exctype &&
+                        ca->rettype_const == cb->rettype_const &&
+                        jl_atomic_load_relaxed(&ca->min_world) == jl_atomic_load_relaxed(&cb->min_world) &&
+                        jl_atomic_load_relaxed(&ca->max_world) == jl_atomic_load_relaxed(&cb->max_world)) {
+                        ndup++;
+                        continue;
+                    }
+                }
                 if (ncollide < 5) {
                     jl_value_t *a = (jl_value_t*)s->import_objs.items[i];
                     jl_value_t *b = (jl_value_t*)s->import_objs.items[j];
                     jl_safe_printf("IMPORTKEYS_COLLISION [%s vs %s] %s\n",
                                    jl_typeof_str(a), jl_typeof_str(b), keybuf.buf + kbeg[i]);
+                    if (jl_is_datatype(a) && jl_is_datatype(b)) {
+                        jl_datatype_t *da = (jl_datatype_t*)a, *db = (jl_datatype_t*)b;
+                        jl_safe_printf("    types_equal=%d same_typename=%d hash_same=%d nparams a=%zu b=%zu concrete a=%d b=%d\n",
+                            jl_types_equal(a, b), da->name == db->name, da->hash == db->hash,
+                            jl_svec_len(da->parameters), jl_svec_len(db->parameters),
+                            (int)da->isconcretetype, (int)db->isconcretetype);
+                    }
                     if (jl_is_code_instance(a) && jl_is_code_instance(b)) {
                         jl_code_instance_t *ca = (jl_code_instance_t*)a;
                         jl_code_instance_t *cb = (jl_code_instance_t*)b;
@@ -1448,8 +1477,8 @@ static void jl_report_import_keys(jl_serializer_state *s) JL_NOTSAFEPOINT
         }
     }
     jl_safe_printf("IMPORTKEYS distinct=%zu keyed=%zu unkeyed=%zu collisions=%zu keybytes=%zu "
-                   "frompkgimage=%zu frompkgimage_keyed=%zu\n",
-                   n, nkeyed, n - nkeyed, ncollide, (size_t)ios_pos(&keybuf), n_pkg, n_pkg_keyed);
+                   "frompkgimage=%zu frompkgimage_keyed=%zu equivdupes=%zu\n",
+                   n, nkeyed, n - nkeyed, ncollide, (size_t)ios_pos(&keybuf), n_pkg, n_pkg_keyed, ndup);
     free(koff);
     free(kbeg);
     free(kdep);
