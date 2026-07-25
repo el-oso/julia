@@ -1484,6 +1484,19 @@ static int extkey_debuginfo(ios_t *k, jl_debuginfo_t *di, int depth) JL_NOTSAFEP
     return 1;
 }
 
+// Names are length-prefixed rather than delimited. A generic function's type name is
+// routinely `#@atomic`, `#>=` or `#<<`, and `@`, `<` and `>` are all structural in this
+// grammar, so a delimited name cannot be read back at all -- measured at 59 of
+// SparseArrays' keys, every one of them a macro or operator. The length also settles
+// `var"a.b"`, which no amount of delimiter choice would have.
+static void extkey_name(ios_t *k, jl_sym_t *s) JL_NOTSAFEPOINT
+{
+    const char *n = jl_symbol_name(s);
+    size_t len = strlen(n);
+    ios_printf(k, "%zu:", len);
+    ios_write(k, n, len);
+}
+
 static void extkey_module(ios_t *k, jl_module_t *m) JL_NOTSAFEPOINT
 {
     // root-first module path; the parent chain terminates at a root module
@@ -1492,7 +1505,7 @@ static void extkey_module(ios_t *k, jl_module_t *m) JL_NOTSAFEPOINT
         extkey_module(k, p);
         ios_putc('.', k);
     }
-    ios_puts(jl_symbol_name(m->name), k);
+    extkey_name(k, m->name);
 }
 
 // A type parameter is either type-level (and must be keyed inside the binder
@@ -1593,7 +1606,7 @@ static int extkey_type(ios_t *k, jl_value_t *t, extkey_binder_t *env, int depth,
         ios_puts("T:", k);
         extkey_module(k, dt->name->module);
         ios_putc('.', k);
-        ios_puts(jl_symbol_name(dt->name->name), k);
+        extkey_name(k, dt->name->name);
         // parameters are part of the identity of an instantiated type
         size_t np = jl_svec_len(dt->parameters);
         // An empty parameter list is not the same as no parameter list: `Tuple{}` and
@@ -1630,7 +1643,7 @@ static int extkey_write(ios_t *k, jl_value_t *v, int depth) JL_NOTSAFEPOINT
         ios_puts("N:", k);
         extkey_module(k, tn->module);
         ios_putc('.', k);
-        ios_puts(jl_symbol_name(tn->name), k);
+        extkey_name(k, tn->name);
         return 1;
     }
     if (jl_is_datatype(v) || jl_is_type(v) || jl_is_vararg(v)) {
@@ -1645,7 +1658,7 @@ static int extkey_write(ios_t *k, jl_value_t *v, int depth) JL_NOTSAFEPOINT
         ios_puts("B:", k);
         extkey_module(k, b->globalref->mod);
         ios_putc('.', k);
-        ios_puts(jl_symbol_name(b->globalref->name), k);
+        extkey_name(k, b->globalref->name);
         return 1;
     }
     if (jl_is_method(v)) {
@@ -1653,7 +1666,7 @@ static int extkey_write(ios_t *k, jl_value_t *v, int depth) JL_NOTSAFEPOINT
         ios_puts("F:", k);
         extkey_module(k, m->module);
         ios_putc('.', k);
-        ios_puts(jl_symbol_name(m->name), k);
+        extkey_name(k, m->name);
         ios_putc('@', k);
         // The signature disambiguates the methods of one generic function. Deliberately
         // *not* including file:line -- `Method.file` is an absolute path into the depot,
@@ -1749,7 +1762,7 @@ static int extkey_write(ios_t *k, jl_value_t *v, int depth) JL_NOTSAFEPOINT
     }
     if (jl_is_symbol(v)) {
         ios_puts("S:", k);
-        ios_puts(jl_symbol_name((jl_sym_t*)v), k);
+        extkey_name(k, (jl_sym_t*)v);
         return 1;
     }
     if (jl_is_string(v)) {
@@ -1797,7 +1810,7 @@ static int extkey_write(ios_t *k, jl_value_t *v, int depth) JL_NOTSAFEPOINT
         ios_puts("R:", k);
         extkey_module(k, g->mod);
         ios_putc('.', k);
-        ios_puts(jl_symbol_name(g->name), k);
+        extkey_name(k, g->name);
         return 1;
     }
     if (jl_is_genericmemory(v)) {
@@ -1842,7 +1855,7 @@ static int extkey_write(ios_t *k, jl_value_t *v, int depth) JL_NOTSAFEPOINT
         ios_puts("MT:", k);
         extkey_module(k, mt->module);
         ios_putc('.', k);
-        ios_puts(jl_symbol_name(mt->name), k);
+        extkey_name(k, mt->name);
         return 1;
     }
     jl_datatype_t *vt = (jl_datatype_t*)jl_typeof(v);
@@ -1927,7 +1940,7 @@ static int extkey_write(ios_t *k, jl_value_t *v, int depth) JL_NOTSAFEPOINT
             ios_puts("P:", k);
             extkey_module(k, p->mod);
             ios_putc('.', k);
-            ios_puts(jl_symbol_name(p->name), k);
+            extkey_name(k, p->name);
             return 1;
         }
     }
@@ -3015,15 +3028,15 @@ static int kp_uint(keyparse_t *kp, size_t *out) JL_NOTSAFEPOINT
 // Such a key is refused rather than misparsed, and the refusals are counted.
 static int kp_name(keyparse_t *kp, jl_sym_t **out) JL_GC_DISABLED
 {
-    const char *s = kp->p;
-    while (kp->p < kp->end && strchr(".{},<>;/@", *kp->p) == NULL)
-        kp->p++;
-    size_t n = (size_t)(kp->p - s);
-    char buf[512];
-    if (n == 0 || n >= sizeof(buf))
+    size_t n;
+    if (!kp_uint(kp, &n) || !kp_char(kp, ':'))
         return 0;
-    memcpy(buf, s, n);
+    char buf[1024];
+    if (n >= sizeof(buf) || kp->p + n > kp->end)
+        return 0;
+    memcpy(buf, kp->p, n);
     buf[n] = '\0';
+    kp->p += n;
     *out = jl_symbol(buf);
     return 1;
 }
@@ -3211,19 +3224,6 @@ static jl_value_t *kp_value(keyparse_t *kp, int depth) JL_GC_DISABLED
         return (tn->name == path[n - 1] && tn->module == m) ? (jl_value_t*)tn : NULL;
     }
     if (kp_lit(kp, "S:")) {
-        // A symbol has no terminator, so at the end of a key its name is the rest of the
-        // text; nested inside a parameter list it can only run to the next delimiter,
-        // which a symbol containing one would defeat. The writer has the same blind spot.
-        if (depth == 0) {
-            size_t n = (size_t)(kp->end - kp->p);
-            char buf[512];
-            if (n >= sizeof(buf))
-                return NULL;
-            memcpy(buf, kp->p, n);
-            buf[n] = '\0';
-            kp->p = kp->end;
-            return (jl_value_t*)jl_symbol(buf);
-        }
         jl_sym_t *s;
         return kp_name(kp, &s) ? (jl_value_t*)s : NULL;
     }
