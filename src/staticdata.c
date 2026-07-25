@@ -1603,6 +1603,36 @@ static int extkey_hash(jl_value_t *v, uint64_t *out) JL_NOTSAFEPOINT
     return ok;
 }
 
+// Does a key name both of these? A key identifies an *equivalence class*, not an
+// allocation: distinct allocations that Julia itself treats as one identity are what the
+// loader is free to merge. Type uniquing merges equal types on load, `jl_egal` is Julia's
+// own definition of "the same value" (covering separately allocated but equal simple
+// vectors, strings and debug info), and sibling entries in one method instance's cache
+// chain are interchangeable. Used both to excuse key collisions and to judge whether a
+// shadow-resolved object is the object we started from.
+static int extkey_equiv(jl_value_t *oa, jl_value_t *ob) JL_NOTSAFEPOINT
+{
+    if (oa == ob)
+        return 1;
+    if (oa == NULL || ob == NULL)
+        return 0;
+    if (jl_egal(oa, ob))
+        return 1;
+    if (jl_is_type(oa) && jl_is_type(ob) && jl_types_equal(oa, ob))
+        return 1;
+    if (jl_is_code_instance(oa) && jl_is_code_instance(ob)) {
+        jl_code_instance_t *ca = (jl_code_instance_t*)oa;
+        jl_code_instance_t *cb = (jl_code_instance_t*)ob;
+        if (jl_get_ci_mi(ca) == jl_get_ci_mi(cb) && ca->owner == cb->owner &&
+            ca->rettype == cb->rettype && ca->exctype == cb->exctype &&
+            ca->rettype_const == cb->rettype_const &&
+            jl_atomic_load_relaxed(&ca->min_world) == jl_atomic_load_relaxed(&cb->min_world) &&
+            jl_atomic_load_relaxed(&ca->max_world) == jl_atomic_load_relaxed(&cb->max_world))
+            return 1;
+    }
+    return 0;
+}
+
 // Serialize the import table: for each distinct object this image references in another
 // image, the owning image's deps-index and the object's content key, with a zero key
 // marking an object that has no stable identity. Nothing reads this back yet beyond
@@ -1691,25 +1721,9 @@ static void jl_report_import_keys(jl_serializer_state *s) JL_NOTSAFEPOINT
                 // count a collision when the two are genuinely different things.
                 jl_value_t *oa = (jl_value_t*)s->import_objs.items[i];
                 jl_value_t *ob = (jl_value_t*)s->import_objs.items[j];
-                // `jl_egal` is Julia's own definition of "the same value", which covers
-                // separately allocated but equal simple vectors, strings and debug info
-                // as well as types; the loader is free to merge any of them.
-                if (jl_egal(oa, ob) ||
-                    (jl_is_type(oa) && jl_is_type(ob) && jl_types_equal(oa, ob))) {
+                if (extkey_equiv(oa, ob)) {
                     ndup++;
                     continue;
-                }
-                if (jl_is_code_instance(oa) && jl_is_code_instance(ob)) {
-                    jl_code_instance_t *ca = (jl_code_instance_t*)oa;
-                    jl_code_instance_t *cb = (jl_code_instance_t*)ob;
-                    if (jl_get_ci_mi(ca) == jl_get_ci_mi(cb) && ca->owner == cb->owner &&
-                        ca->rettype == cb->rettype && ca->exctype == cb->exctype &&
-                        ca->rettype_const == cb->rettype_const &&
-                        jl_atomic_load_relaxed(&ca->min_world) == jl_atomic_load_relaxed(&cb->min_world) &&
-                        jl_atomic_load_relaxed(&ca->max_world) == jl_atomic_load_relaxed(&cb->max_world)) {
-                        ndup++;
-                        continue;
-                    }
                 }
                 if (ncollide < 5) {
                     jl_value_t *a = (jl_value_t*)s->import_objs.items[i];
@@ -1824,14 +1838,36 @@ static void jl_report_import_keys(jl_serializer_state *s) JL_NOTSAFEPOINT
             if (koff[i + 1] - koff[i] <= 1)
                 dunk[kdep[i]]++;
         }
+        // Attribute each blob to a package by naming the top-level module of the first
+        // import that carries one, so the report is readable as dependency names rather
+        // than blob indices.
+        const char **dname = (const char**)calloc(maxdep + 1, sizeof(char*));
+        for (size_t i = 0; i < n; i++) {
+            if (dname[kdep[i]])
+                continue;
+            jl_value_t *o = (jl_value_t*)s->import_objs.items[i];
+            jl_module_t *om = NULL;
+            if (jl_is_datatype(o)) om = ((jl_datatype_t*)o)->name->module;
+            else if (jl_is_typename(o)) om = ((jl_typename_t*)o)->module;
+            else if (jl_is_method(o)) om = ((jl_method_t*)o)->module;
+            else if (jl_is_module(o)) om = (jl_module_t*)o;
+            if (om) {
+                while (om->parent && om->parent != om)
+                    om = om->parent;
+                dname[kdep[i]] = jl_symbol_name(om->name);
+            }
+        }
         size_t ndeps = 0, ndeps_unk = 0;
         for (size_t d = 1; d <= maxdep; d++) {
             if (dtot[d]) {
                 ndeps++;
                 if (dunk[d]) ndeps_unk++;
-                jl_safe_printf("IMPORTKEYS_DEP dep=%zu total=%zu unkeyed=%zu\n", d, dtot[d], dunk[d]);
+                jl_safe_printf("IMPORTKEYS_DEP dep=%zu name=%s total=%zu unkeyed=%zu %s\n",
+                               d, dname[d] ? dname[d] : "?", dtot[d], dunk[d],
+                               dunk[d] ? "blocked" : "RELINKABLE");
             }
         }
+        free(dname);
         jl_safe_printf("IMPORTKEYS_DEPS pkgimages=%zu with_unkeyed=%zu\n", ndeps, ndeps_unk);
         free(dtot);
         free(dunk);
@@ -1843,6 +1879,376 @@ static void jl_report_import_keys(jl_serializer_state *s) JL_NOTSAFEPOINT
     free(kbeg);
     free(kdep);
     ios_close(&keybuf);
+}
+
+// --- Shadow resolution ------------------------------------------------------------
+//
+// A key is a digest, so it cannot be inverted. Resolving one back to an object has to go
+// through the uniquing machinery the restore path already uses: a module comes from the
+// depmods array, a binding from `jl_get_module_binding`. This pass checks that this is
+// enough, while we still have the answer: for every entry of the import table we know the
+// real pointer, so we re-derive the object from its key operands alone and compare.
+// Verification only -- nothing here feeds back into what is written.
+
+enum { SHK_MODULE, SHK_BINDING, SHK_DATATYPE, SHK_METHODINSTANCE, SHK_OTHER, SHK_NKINDS };
+static const char *shadow_kind_name[SHK_NKINDS] =
+    { "Module", "Binding", "DataType", "MethodInstance", "other" };
+enum { SHR_SAME, SHR_DIFF, SHR_UNRESOLVED, SHR_UNKEYED, SHR_SKIPPED, SHR_NOUTCOMES };
+// why a re-derivation gave up; the innermost failure wins
+enum { SHRR_NONE, SHRR_UNSUPPORTED, SHRR_DEPTH, SHRR_FREETYPEVARS, SHRR_MODULE,
+       SHRR_TYPENAME, SHRR_PARAM, SHRR_CACHEMISS, SHRR_METHOD,
+       SHRR_INTERSECTION, SHRR_NREASONS };
+static const char *shadow_reason_name[SHRR_NREASONS] = {
+    "none", "unsupported_kind", "too_deep", "free_typevars", "module_not_found",
+    "typename_not_found", "operand_unresolved", "not_found_or_buildable",
+    "method_not_found", "no_type_intersection" };
+
+typedef struct {
+    int passthrough;   // an operand was taken as-is instead of being re-derived
+    int constructed;   // an equal object had to be built because none was findable
+    int reason;
+} shadow_ctx_t;
+
+#define SHADOW_FAIL(r) do { if (c->reason == SHRR_NONE) c->reason = (r); } while (0)
+
+#define SHADOW_MAX_MODPATH 24
+
+// Write `m`'s root-first path as symbols into `out`; returns the number of components,
+// or -1 if the path is deeper than `max`. This is the operand `extkey_module` renders.
+static int shadow_modpath(jl_module_t *m, jl_sym_t **out, int max) JL_NOTSAFEPOINT
+{
+    int n = 0;
+    for (jl_module_t *p = m; ; p = p->parent) {
+        if (n == max)
+            return -1;
+        out[n++] = p->name;
+        if (p->parent == NULL || p->parent == p)
+            break;
+    }
+    for (int i = 0; i < n / 2; i++) {
+        jl_sym_t *t = out[i];
+        out[i] = out[n - 1 - i];
+        out[n - 1 - i] = t;
+    }
+    return n;
+}
+
+// Re-derive a module from its name path alone. `mod_array` is the set of toplevel modules
+// of the loaded images -- the serialization-time stand-in for the `depmods` array the
+// restore path is handed, which is where a module operand is resolved from. Anchor on the
+// deepest already-loaded module whose own path is a prefix of the target's, then walk down
+// through constant bindings, which is how a submodule is bound in its parent.
+static jl_module_t *shadow_resolve_module(jl_array_t *mod_array, jl_module_t *orig) JL_GC_DISABLED
+{
+    jl_sym_t *want[SHADOW_MAX_MODPATH], *have[SHADOW_MAX_MODPATH];
+    int n = shadow_modpath(orig, want, SHADOW_MAX_MODPATH);
+    if (n < 0)
+        return NULL;
+    jl_module_t *best = NULL;
+    int bestk = 0;
+    size_t nm = jl_array_nrows(mod_array);
+    for (size_t i = 0; i < nm; i++) {
+        jl_module_t *a = (jl_module_t*)jl_array_ptr_ref(mod_array, i);
+        while (a != NULL) {
+            int k = shadow_modpath(a, have, SHADOW_MAX_MODPATH);
+            if (k > bestk && k <= n) {
+                int ok = 1;
+                for (int j = 0; j < k; j++) {
+                    if (have[j] != want[j]) {
+                        ok = 0;
+                        break;
+                    }
+                }
+                if (ok) {
+                    bestk = k;
+                    best = a;
+                }
+            }
+            a = (a->parent == a || a->parent == NULL) ? NULL : a->parent;
+        }
+    }
+    for (int j = bestk; best != NULL && j < n; j++) {
+        // `_debug_only` because it will not allocate a binding partition, so the descent
+        // reads without mutating; a submodule's binding is always already resolved.
+        jl_binding_t *b = jl_get_module_binding(best, want[j], 0);
+        jl_value_t *v = jl_get_latest_binding_value_if_resolved_and_const_debug_only(b);
+        best = (v != NULL && jl_is_module(v)) ? (jl_module_t*)v : NULL;
+    }
+    return best;
+}
+
+// Re-derive a type name from its module and name. A generic function's type name (`#zero`
+// for `typeof(zero)`) is bound in its module under exactly that name, so no special case
+// is needed for those.
+static jl_typename_t *shadow_resolve_typename(jl_array_t *mod_array, jl_typename_t *tn) JL_GC_DISABLED
+{
+    jl_module_t *m = shadow_resolve_module(mod_array, tn->module);
+    if (m == NULL)
+        return NULL;
+    jl_binding_t *b = jl_get_module_binding(m, tn->name, 0);
+    jl_value_t *v = jl_get_latest_binding_value_if_resolved_and_const_debug_only(b);
+    if (v == NULL || !jl_is_type(v))
+        return NULL;
+    jl_value_t *uw = jl_unwrap_unionall(v);
+    if (!jl_is_datatype(uw))
+        return NULL;
+    jl_typename_t *got = ((jl_datatype_t*)uw)->name;
+    // the binding may be an alias for a type that belongs elsewhere
+    return (got->name == tn->name && got->module == m) ? got : NULL;
+}
+
+static jl_value_t *shadow_resolve_datatype(jl_array_t *mod_array, jl_datatype_t *dt, int depth,
+                                           shadow_ctx_t *c) JL_GC_DISABLED;
+
+// Re-derive a type parameter. Only objects that live in another image need resolving at
+// all: anything else is written into this image and is available directly on load.
+static jl_value_t *shadow_resolve_param(jl_array_t *mod_array, jl_value_t *p, int depth,
+                                        shadow_ctx_t *c) JL_GC_DISABLED
+{
+    if (p == NULL)
+        return NULL;
+    if (!jl_object_in_image(p))
+        return p;
+    if (jl_is_datatype(p))
+        return shadow_resolve_datatype(mod_array, (jl_datatype_t*)p, depth, c);
+    if (jl_is_module(p)) {
+        jl_value_t *m = (jl_value_t*)shadow_resolve_module(mod_array, (jl_module_t*)p);
+        if (m == NULL)
+            SHADOW_FAIL(SHRR_MODULE);
+        return m;
+    }
+    if (jl_is_symbol(p))
+        return p;   // symbols are interned, so re-deriving one by name returns this same one
+    // Anything else -- a boxed integer dimension, a `Union`, a `UnionAll` -- is passed
+    // through as itself. That is not a re-derivation: it uses the pointer we are supposed
+    // to be re-deriving, so any type resolved this way is counted separately.
+    c->passthrough = 1;
+    return p;
+}
+
+static jl_value_t *shadow_resolve_datatype(jl_array_t *mod_array, jl_datatype_t *dt, int depth,
+                                           shadow_ctx_t *c) JL_GC_DISABLED
+{
+    if (depth > EXTKEY_MAX_DEPTH) {
+        SHADOW_FAIL(SHRR_DEPTH);
+        return NULL;
+    }
+    if (dt->hasfreetypevars) {
+        // not cacheable, so the type cache cannot answer for it
+        SHADOW_FAIL(SHRR_FREETYPEVARS);
+        return NULL;
+    }
+    jl_typename_t *tn = shadow_resolve_typename(mod_array, dt->name);
+    if (tn == NULL) {
+        SHADOW_FAIL(SHRR_TYPENAME);
+        return NULL;
+    }
+    size_t np = jl_svec_len(dt->parameters);
+    jl_value_t *w = tn->wrapper;
+    if (np == 0 && jl_is_datatype(w) && jl_svec_len(((jl_datatype_t*)w)->parameters) == 0)
+        return w;   // a type that takes no parameters is its own type name's wrapper
+    jl_svec_t *p = np ? jl_alloc_svec(np) : jl_emptysvec;
+    JL_GC_PUSH1(&p);
+    int ok = 1;
+    for (size_t i = 0; i < np; i++) {
+        jl_value_t *rp = shadow_resolve_param(mod_array, jl_svecref(dt->parameters, i),
+                                              depth + 1, c);
+        if (rp == NULL) {
+            SHADOW_FAIL(SHRR_PARAM);
+            ok = 0;
+            break;
+        }
+        jl_svecset(p, i, rp);
+    }
+    jl_datatype_t *found = NULL;
+    // `typekey_hash` reads key[0] unconditionally for `Type`, so never hand it an empty key
+    if (ok && (np > 0 || tn != jl_type_typename)) {
+        // The type cache is keyed on exactly (type name, parameters), so a scratch type
+        // carrying the re-derived ones is all `jl_lookup_cache_type_` needs to answer.
+        jl_datatype_t *scratch = jl_new_uninitialized_datatype();
+        scratch->name = tn;
+        jl_gc_wb(scratch, tn);
+        scratch->parameters = p;
+        jl_gc_wb(scratch, p);
+        found = jl_lookup_cache_type_(scratch);
+        if (found == NULL && jl_is_datatype(w) &&
+            jl_egal((jl_value_t*)((jl_datatype_t*)w)->parameters, (jl_value_t*)p))
+            found = (jl_datatype_t*)w;   // a type name's wrapper is not kept in its cache
+        if (found == NULL) {
+            // Not every type is in the cache: a tuple type is only entered when all of
+            // its parameters are concrete (see `cacheable` in jltypes.c), which excludes
+            // every method signature. Such a type has to be rebuilt instead of found --
+            // legitimately, since a key names an equivalence class and not an allocation.
+            c->constructed = 1;
+            if (tn == jl_tuple_typename)
+                found = (jl_datatype_t*)jl_apply_tuple_type(p, 1);
+            else if (jl_is_unionall(w))
+                found = (jl_datatype_t*)jl_apply_type(w, jl_svec_data(p), np);
+            if (found != NULL && !jl_is_datatype(found))
+                found = NULL;
+        }
+    }
+    JL_GC_POP();
+    if (found == NULL)
+        SHADOW_FAIL(SHRR_CACHEMISS);
+    return (jl_value_t*)found;
+}
+
+// Re-derive a method from its signature. The module and name are part of the key too, but
+// the signature alone identifies it: a second definition with the same signature in the
+// same module is a redefinition, which replaces the first rather than coexisting.
+static jl_method_t *shadow_resolve_method(jl_array_t *mod_array, jl_method_t *m, int depth,
+                                          shadow_ctx_t *c) JL_GC_DISABLED
+{
+    jl_value_t *sig = shadow_resolve_param(mod_array, m->sig, depth, c);
+    if (sig == NULL)
+        return NULL;
+    jl_value_t *found = jl_methtable_lookup(sig, jl_atomic_load_acquire(&jl_world_counter));
+    if (!jl_is_method(found)) {
+        SHADOW_FAIL(SHRR_METHOD);
+        return NULL;
+    }
+    return (jl_method_t*)found;
+}
+
+// Re-derive one imported object from its key operands. Returns NULL if the operands do
+// not lead anywhere, and leaves `*kind` as the bucket to count this object under.
+static jl_value_t *shadow_resolve(jl_array_t *mod_array, jl_value_t *v, int *kind,
+                                  shadow_ctx_t *c) JL_GC_DISABLED
+{
+    if (jl_is_module(v)) {
+        *kind = SHK_MODULE;
+        jl_value_t *m = (jl_value_t*)shadow_resolve_module(mod_array, (jl_module_t*)v);
+        if (m == NULL)
+            SHADOW_FAIL(SHRR_MODULE);
+        return m;
+    }
+    if (jl_is_binding(v)) {
+        *kind = SHK_BINDING;
+        jl_globalref_t *gr = ((jl_binding_t*)v)->globalref;
+        if (gr == NULL) {
+            SHADOW_FAIL(SHRR_UNSUPPORTED);
+            return NULL;
+        }
+        jl_module_t *m = shadow_resolve_module(mod_array, gr->mod);
+        if (m == NULL) {
+            SHADOW_FAIL(SHRR_MODULE);
+            return NULL;
+        }
+        // Same call the restore path makes, alloc and all: a binding that the key names
+        // but that no longer exists is created empty rather than failing to resolve.
+        return (jl_value_t*)jl_get_module_binding(m, gr->name, 1);
+    }
+    if (jl_is_datatype(v)) {
+        *kind = SHK_DATATYPE;
+        return shadow_resolve_datatype(mod_array, (jl_datatype_t*)v, 0, c);
+    }
+    if (jl_is_method_instance(v)) {
+        *kind = SHK_METHODINSTANCE;
+        jl_method_instance_t *mi = (jl_method_instance_t*)v;
+        if (!jl_is_method(mi->def.value)) {
+            SHADOW_FAIL(SHRR_UNSUPPORTED);   // a toplevel thunk has no stable name
+            return NULL;
+        }
+        jl_method_t *m = shadow_resolve_method(mod_array, mi->def.method, 1, c);
+        if (m == NULL)
+            return NULL;
+        jl_value_t *spec = shadow_resolve_param(mod_array, mi->specTypes, 1, c);
+        if (spec == NULL) {
+            SHADOW_FAIL(SHRR_PARAM);
+            return NULL;
+        }
+        // The static parameters are not a key operand of their own: they follow from the
+        // method's signature and the specialization types, which are.
+        jl_svec_t *env = jl_emptysvec;
+        JL_GC_PUSH2(&spec, &env);
+        jl_value_t *ti = jl_type_intersection_env(spec, m->sig, &env);
+        jl_value_t *res = NULL;
+        if (ti == jl_bottom_type)
+            SHADOW_FAIL(SHRR_INTERSECTION);
+        else
+            res = (jl_value_t*)jl_specializations_get_linfo(m, spec, env);
+        JL_GC_POP();
+        return res;
+    }
+    *kind = SHK_OTHER;
+    SHADOW_FAIL(SHRR_UNSUPPORTED);
+    return NULL;
+}
+
+// Runs inside the JL_GC_DISABLED region of the save, like the uniquing calls it mirrors.
+static void jl_shadow_resolve_imports(jl_serializer_state *s, jl_array_t *mod_array) JL_GC_DISABLED
+{
+    size_t n = s->import_objs.len;
+    size_t tally[SHK_NKINDS][SHR_NOUTCOMES];
+    size_t passtally[SHK_NKINDS], builttally[SHK_NKINDS], identical[SHK_NKINDS];
+    memset(tally, 0, sizeof(tally));
+    memset(passtally, 0, sizeof(passtally));
+    memset(builttally, 0, sizeof(builttally));
+    memset(identical, 0, sizeof(identical));
+    size_t reasons[SHRR_NREASONS];
+    memset(reasons, 0, sizeof(reasons));
+    size_t nshown = 0;
+    for (size_t i = 0; i < n; i++) {
+        jl_value_t *v = (jl_value_t*)s->import_objs.items[i];
+        int kind = SHK_OTHER;
+        shadow_ctx_t c = { 0, 0, SHRR_NONE };
+        uint64_t h;
+        if (!extkey_hash(v, &h)) {
+            // no key at all, so there is nothing to resolve from; bucket it by kind so the
+            // count lines up with the unkeyed population `jl_report_import_keys` reports
+            if (jl_is_module(v)) kind = SHK_MODULE;
+            else if (jl_is_binding(v)) kind = SHK_BINDING;
+            else if (jl_is_datatype(v)) kind = SHK_DATATYPE;
+            else if (jl_is_method_instance(v)) kind = SHK_METHODINSTANCE;
+            tally[kind][SHR_UNKEYED]++;
+            continue;
+        }
+        jl_value_t *got = shadow_resolve(mod_array, v, &kind, &c);
+        if (c.passthrough)
+            passtally[kind]++;
+        if (c.constructed)
+            builttally[kind]++;
+        int outcome;
+        if (kind == SHK_OTHER)
+            outcome = SHR_SKIPPED;
+        else if (got == NULL)
+            outcome = SHR_UNRESOLVED;
+        else
+            outcome = extkey_equiv(v, got) ? SHR_SAME : SHR_DIFF;
+        tally[kind][outcome]++;
+        if (v == got)
+            identical[kind]++;   // the strict subset of resolved_same: the very same object
+        if (outcome == SHR_UNRESOLVED)
+            reasons[c.reason]++;
+        if ((outcome == SHR_DIFF || outcome == SHR_UNRESOLVED) && nshown < 10) {
+            nshown++;
+            jl_safe_printf("SHADOW_MISS %s %s (%s) ", shadow_kind_name[kind],
+                           outcome == SHR_DIFF ? "different" : "unresolved",
+                           shadow_reason_name[c.reason]);
+            jl_static_show(JL_STDERR, v);
+            jl_safe_printf("\n");
+        }
+    }
+    for (int r = 1; r < SHRR_NREASONS; r++) {
+        if (reasons[r])
+            jl_safe_printf("SHADOW_UNRESOLVED_REASON %-22s %zu\n", shadow_reason_name[r], reasons[r]);
+    }
+    for (int k = 0; k < SHK_NKINDS; k++) {
+        jl_safe_printf("SHADOW kind=%-16s resolved_same=%zu (identical=%zu) resolved_different=%zu "
+                       "unresolved=%zu unkeyed=%zu skipped=%zu passthrough=%zu built=%zu\n",
+                       shadow_kind_name[k],
+                       tally[k][SHR_SAME], identical[k], tally[k][SHR_DIFF],
+                       tally[k][SHR_UNRESOLVED], tally[k][SHR_UNKEYED], tally[k][SHR_SKIPPED],
+                       passtally[k], builttally[k]);
+    }
+    size_t tot[SHR_NOUTCOMES] = {0};
+    for (int k = 0; k < SHK_NKINDS; k++)
+        for (int o = 0; o < SHR_NOUTCOMES; o++)
+            tot[o] += tally[k][o];
+    jl_safe_printf("SHADOW total=%zu resolved_same=%zu resolved_different=%zu "
+                   "unresolved=%zu unkeyed=%zu skipped=%zu\n", n, tot[SHR_SAME], tot[SHR_DIFF],
+                   tot[SHR_UNRESOLVED], tot[SHR_UNKEYED], tot[SHR_SKIPPED]);
 }
 
 // Return the integer `id` for `v`. Generically this is looked up in `serialization_order`,
@@ -4034,6 +4440,8 @@ static void jl_save_system_image_to_stream(ios_t *f, jl_array_t *mod_array,
 
     if (getenv("JULIA_IMPORT_KEYS"))
         jl_report_import_keys(&s);
+    if (getenv("JULIA_SHADOW_RESOLVE"))
+        jl_shadow_resolve_imports(&s, mod_array);
 
     assert(object_worklist.len == 0);
     arraylist_free(&object_worklist);
