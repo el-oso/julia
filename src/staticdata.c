@@ -1215,6 +1215,65 @@ static int extkey_type(ios_t *k, jl_value_t *t, extkey_binder_t *env, int depth,
 // `EXTKEY_MAX_TYPEDEPTH`.
 #define extkey_type_toplevel(k, t) extkey_type(k, t, NULL, 0, 0)
 
+// Digest of a source file's contents, cached per file symbol. Used to give method keys a
+// body identity: without one, a rebuilt dependency whose method bodies changed but whose
+// signatures did not would re-link silently, and dispatch-based revalidation cannot catch
+// that because the dispatch answer is unchanged.
+//
+// This is deliberately coarse -- every method defined in a file shares its digest, so
+// editing the file invalidates all of them -- but it is *stable*, which the compressed IR
+// is not: that refers to method roots by index and root sets are keyed per build. Coarse
+// and sound beats fine and unstable, because an unstable key silently fails to resolve and
+// so buys no safety at all.
+static htable_t extkey_filehash;
+static int extkey_filehash_ready = 0;
+
+static int extkey_file_digest(jl_sym_t *file, uint64_t *out) JL_NOTSAFEPOINT
+{
+    if (file == NULL)
+        return 0;
+    if (!extkey_filehash_ready) {
+        htable_new(&extkey_filehash, 0);
+        extkey_filehash_ready = 1;
+    }
+    void **bp = ptrhash_bp(&extkey_filehash, (void*)file);
+    if (*bp != HT_NOTFOUND) {
+        uint64_t h = *(uint64_t*)*bp;
+        if (h == 0)
+            return 0;   // remembered failure
+        *out = h;
+        return 1;
+    }
+    uint64_t h = 0;
+    ios_t f;
+    // Package methods carry absolute paths, which is the set that matters here; sysimage
+    // methods carry bare relative names and are exempted by the caller.
+    ios_t *fp = ios_file(&f, jl_symbol_name(file), 1, 0, 0, 0);
+    if (fp != NULL) {
+        h = 1469598103934665603ULL;   // FNV-1a over the file's bytes
+        char buf[4096];
+        size_t got;
+        while ((got = ios_read(&f, buf, sizeof(buf))) > 0) {
+            for (size_t i = 0; i < got; i++) {
+                h ^= (unsigned char)buf[i];
+                h *= 1099511628211ULL;
+            }
+            if (got < sizeof(buf))
+                break;
+        }
+        ios_close(&f);
+        if (h == 0)
+            h = 1;   // never collide with the failure marker
+    }
+    uint64_t *slot = (uint64_t*)malloc_s(sizeof(uint64_t));
+    *slot = h;
+    *bp = slot;
+    if (h == 0)
+        return 0;
+    *out = h;
+    return 1;
+}
+
 // Reverse index from a bound type variable to a binder that introduces it. A `TypeVar`
 // reached on its own -- as a method instance's static parameter, say -- has no identity of
 // its own, but if some imported type binds it, then "the variable introduced by the binder
@@ -1598,20 +1657,32 @@ static int extkey_write(ios_t *k, jl_value_t *v, int depth) JL_NOTSAFEPOINT
         // which differs between machines and depots and would make keys unportable.
         if (!extkey_type_toplevel(k, (jl_value_t*)m->sig))
             return 0;
-        // KNOWN HAZARD: this identifies a method's *definition site*, not its body. Code
-        // inferred against a method -- possibly with it inlined -- could re-link to a
-        // rebuilt version whose body changed while its signature did not, and
-        // dispatch-based revalidation cannot catch that, because the dispatch answer is
-        // unchanged. Nothing here closes that yet.
+        // Module, name and signature identify a method's *definition site*, not its body,
+        // and that is not enough. Code inferred against a method -- possibly with it
+        // inlined -- must not re-link to a rebuilt version whose body changed while its
+        // signature did not: dispatch-based revalidation cannot catch that, because the
+        // dispatch answer is unchanged, so it would silently run stale code. Bumping a
+        // dependency's patch version is exactly that case.
         //
-        // Folding a digest of `Method.source` in was tried and reverted. Compressed IR is
-        // not byte-stable across independent builds of identical source: it refers to
-        // method roots by index, and root sets are keyed per build. Measured on Makie it
-        // made 975 method keys differ between two builds and, through the method instance,
-        // code instance and debug info keys that embed them, perturbed 4127 keys in total.
-        // An unstable key is strictly worse than an absent one -- it silently fails to
-        // resolve, so it buys no safety while destroying reuse. A stable body identity has
-        // to come from something other than the compressed encoding.
+        // The body identity is the defining file's contents. Digesting `Method.source`
+        // instead was tried and reverted: compressed IR refers to method roots by index
+        // and root sets are keyed per build, so it is not byte-stable across independent
+        // builds of identical source -- on Makie it perturbed 4127 keys. Refusing a key
+        // when the file cannot be read keeps this conservative: no key means no re-link,
+        // which is exactly today's behaviour.
+        // Only methods in a *rebuildable* image need a body identity. A method in the
+        // sysimage cannot change without changing the Julia build, which already
+        // invalidates every cache through the header check, and its `file` is a bare
+        // relative name (`reduce.jl`) that cannot be resolved from the symbol anyway.
+        // Demanding a digest there fails, and the failure cascades into every pkgimage
+        // code instance that calls into Base.
+        size_t blob = external_blob_index((jl_value_t*)m);
+        if (blob != 0 && blob < n_linkage_blobs()) {
+            uint64_t fh;
+            if (!extkey_file_digest(m->file, &fh))
+                return 0;
+            ios_printf(k, "@F%016" PRIx64, fh);
+        }
         return 1;
     }
     if (jl_is_method_instance(v)) {
