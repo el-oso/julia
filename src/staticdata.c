@@ -1130,6 +1130,79 @@ static uintptr_t add_external_linkage(jl_serializer_state *s, jl_value_t *v, jl_
 
 static int extkey_write(ios_t *k, jl_value_t *v, int depth) JL_NOTSAFEPOINT;
 
+// Render one slot of a `CodeInstance.edges` vector. `edges` is a positional,
+// heterogeneous encoding (callees, `Int` match counts that govern the following slots,
+// bindings, invoke signatures, method-table markers), but a *digest* does not need to
+// interpret it: rendering each slot in order is stable and discriminating as long as
+// each slot renders stably. Callees are rendered shallowly -- recursing into their own
+// edges would not terminate.
+// Returns 0 if this slot has no stable rendering, which makes the whole edge digest --
+// and therefore the owning code instance -- unkeyable. Rendering such a slot as a
+// generic placeholder instead would silently merge distinct edge sets.
+static int extkey_edge_slot(ios_t *k, jl_value_t *e) JL_NOTSAFEPOINT
+{
+    if (e == NULL) {
+        ios_putc('0', k);
+        return 1;
+    }
+    if (jl_is_code_instance(e)) {
+        // Identify the callee by its method instance, not by which entry of that method
+        // instance's cache chain this happens to point at. Recursing into the callee's
+        // own edges would not terminate, and the sibling entries are equivalent anyway:
+        // they agree on inferred code, return and exception types, effects and world
+        // range, differing only in compilation state.
+        jl_method_instance_t *mi = jl_get_ci_mi((jl_code_instance_t*)e);
+        ios_puts("c<", k);
+        if (!extkey_write(k, (jl_value_t*)mi, EXTKEY_MAX_DEPTH - 1))
+            return 0;
+        ios_putc('>', k);
+        return 1;
+    }
+    if (jl_is_long(e)) {
+        ios_printf(k, "i%zd", jl_unbox_long(e));
+        return 1;
+    }
+    // signatures and other type-valued slots print stably
+    if (jl_is_type(e)) {
+        jl_static_show((JL_STREAM*)k, e);
+        return 1;
+    }
+    return extkey_write(k, e, EXTKEY_MAX_DEPTH - 1);
+}
+
+// A 64-bit digest of a code instance's edge set, so the key stays bounded in size.
+// Returns 0 if any slot lacks a stable rendering.
+static int extkey_edges_hash(jl_code_instance_t *ci, uint64_t *out) JL_NOTSAFEPOINT
+{
+    jl_svec_t *edges = jl_atomic_load_relaxed(&ci->edges);
+    if (edges == NULL) {
+        *out = 0;
+        return 1;
+    }
+    ios_t d;
+    ios_mem(&d, 256);
+    size_t n = jl_svec_len(edges);
+    int ok = 1;
+    for (size_t i = 0; i < n; i++) {
+        if (!extkey_edge_slot(&d, jl_svecref(edges, i))) {
+            ok = 0;
+            break;
+        }
+        ios_putc('\x1e', &d);
+    }
+    if (ok) {
+        uint64_t h = 1469598103934665603ULL;   // FNV-1a
+        size_t len = (size_t)ios_pos(&d);
+        for (size_t i = 0; i < len; i++) {
+            h ^= (unsigned char)d.buf[i];
+            h *= 1099511628211ULL;
+        }
+        *out = h;
+    }
+    ios_close(&d);
+    return ok;
+}
+
 static void extkey_module(ios_t *k, jl_module_t *m) JL_NOTSAFEPOINT
 {
     // root-first module path; the parent chain terminates at a root module
@@ -1224,6 +1297,12 @@ static int extkey_write(ios_t *k, jl_value_t *v, int depth) JL_NOTSAFEPOINT
         // and the ABI/rettype distinguishes co-existing entries for one owner
         ios_putc('/', k);
         jl_static_show((JL_STREAM*)k, ci->rettype);
+        // Entries in one method instance's cache chain can agree on all of the above and
+        // differ only in their edges, so the edge set has to take part in the identity.
+        uint64_t ehash;
+        if (!extkey_edges_hash(ci, &ehash))
+            return 0;
+        ios_printf(k, "/E%016" PRIx64, ehash);
         return 1;
     }
     if (jl_is_symbol(v)) {
@@ -1319,6 +1398,26 @@ static void jl_report_import_keys(jl_serializer_state *s) JL_NOTSAFEPOINT
                             jl_atomic_load_relaxed(&ca->ipo_purity_bits) == jl_atomic_load_relaxed(&cb->ipo_purity_bits),
                             ca->def == cb->def,
                             !jl_is_method_instance(ca->def));
+                        jl_svec_t *ea = jl_atomic_load_relaxed(&ca->edges);
+                        jl_svec_t *eb = jl_atomic_load_relaxed(&cb->edges);
+                        int elen_same = ea && eb && jl_svec_len(ea) == jl_svec_len(eb);
+                        int eelem_same = elen_same;
+                        if (elen_same)
+                            for (size_t q = 0; q < jl_svec_len(ea); q++) {
+                                jl_value_t *sa = jl_svecref(ea, q), *sb = jl_svecref(eb, q);
+                                if (sa != sb) {
+                                    if (eelem_same)   // report only the first difference
+                                        jl_safe_printf("    first differing edge slot %zu: %s vs %s%s\n",
+                                            q, jl_typeof_str(sa), jl_typeof_str(sb),
+                                            (jl_is_code_instance(sa) && jl_is_code_instance(sb) &&
+                                             jl_get_ci_mi((jl_code_instance_t*)sa) == jl_get_ci_mi((jl_code_instance_t*)sb))
+                                                ? "  [same MethodInstance -- sibling cache entries]" : "");
+                                    eelem_same = 0;
+                                }
+                            }
+                        jl_safe_printf("    edges_len_same=%d edges_elems_identical=%d (len a=%zu b=%zu)\n",
+                            elen_same, eelem_same,
+                            ea ? jl_svec_len(ea) : (size_t)0, eb ? jl_svec_len(eb) : (size_t)0);
                         jl_safe_printf("    edges_same=%d inferred_same=%d a{inferred=%d,invoke=%d} b{inferred=%d,invoke=%d} chained=%d\n",
                             jl_atomic_load_relaxed(&ca->edges) == jl_atomic_load_relaxed(&cb->edges),
                             jl_atomic_load_relaxed(&ca->inferred) == jl_atomic_load_relaxed(&cb->inferred),
