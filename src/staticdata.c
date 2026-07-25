@@ -1245,6 +1245,7 @@ static void jl_report_import_keys(jl_serializer_state *s) JL_NOTSAFEPOINT
     ios_t keybuf;
     ios_mem(&keybuf, n ? n * 48 : 64);
     size_t *koff = (size_t*)malloc_s((n + 1) * sizeof(size_t));
+    size_t *kbeg = (size_t*)malloc_s((n ? n : 1) * sizeof(size_t));
     size_t *kdep = (size_t*)malloc_s((n ? n : 1) * sizeof(size_t));
     size_t nkeyed = 0;
     for (size_t i = 0; i < n; i++) {
@@ -1252,6 +1253,7 @@ static void jl_report_import_keys(jl_serializer_state *s) JL_NOTSAFEPOINT
         kdep[i] = (size_t)(uintptr_t)s->import_deps.items[i];
         // prefix with the owning image so keys only need to be unique within it
         ios_printf(&keybuf, "%zu\x1f", kdep[i]);
+        kbeg[i] = (size_t)ios_pos(&keybuf);
         if (extkey_write(&keybuf, (jl_value_t*)s->import_objs.items[i], 0))
             nkeyed++;
         else
@@ -1259,6 +1261,29 @@ static void jl_report_import_keys(jl_serializer_state *s) JL_NOTSAFEPOINT
         ios_putc('\0', &keybuf);
     }
     koff[n] = (size_t)ios_pos(&keybuf);
+
+    // Dump the keys so two builds can be compared: a key that is not identical across
+    // rebuilds of its owning image is useless, however unique it is within one build.
+    // The owning-image index is deliberately omitted -- it is a per-build numbering.
+    const char *dumppath = getenv("JULIA_IMPORT_KEYS_DUMP");
+    if (dumppath) {
+        ios_t d;
+        if (ios_file(&d, dumppath, 0, 1, 1, 1) != NULL) {
+            for (size_t i = 0; i < n; i++) {
+                if (koff[i + 1] - koff[i] > 1) {
+                    ios_puts(keybuf.buf + kbeg[i], &d);
+                }
+                else {
+                    // unkeyed: record the type name so the unkeyed population can be
+                    // compared across builds too
+                    jl_value_t *o = (jl_value_t*)s->import_objs.items[i];
+                    ios_printf(&d, "?%s", jl_typeof_str(o));
+                }
+                ios_putc('\n', &d);
+            }
+            ios_close(&d);
+        }
+    }
 
     // injectivity: collisions between *distinct* objects would make keys unusable
     size_t ncollide = 0;
@@ -1276,8 +1301,36 @@ static void jl_report_import_keys(jl_serializer_state *s) JL_NOTSAFEPOINT
         if (*bp != HT_NOTFOUND) {
             size_t j = (size_t)(uintptr_t)*bp - 1;
             if (strcmp(keybuf.buf + koff[j], ki) == 0 &&
-                s->import_objs.items[i] != s->import_objs.items[j])
+                s->import_objs.items[i] != s->import_objs.items[j]) {
+                if (ncollide < 5) {
+                    jl_value_t *a = (jl_value_t*)s->import_objs.items[i];
+                    jl_value_t *b = (jl_value_t*)s->import_objs.items[j];
+                    jl_safe_printf("IMPORTKEYS_COLLISION [%s vs %s] %s\n",
+                                   jl_typeof_str(a), jl_typeof_str(b), keybuf.buf + kbeg[i]);
+                    if (jl_is_code_instance(a) && jl_is_code_instance(b)) {
+                        jl_code_instance_t *ca = (jl_code_instance_t*)a;
+                        jl_code_instance_t *cb = (jl_code_instance_t*)b;
+                        jl_safe_printf("    worlds  [%zu,%zu] vs [%zu,%zu]\n",
+                            jl_atomic_load_relaxed(&ca->min_world), jl_atomic_load_relaxed(&ca->max_world),
+                            jl_atomic_load_relaxed(&cb->min_world), jl_atomic_load_relaxed(&cb->max_world));
+                        jl_safe_printf("    exctype_same=%d rettype_const_same=%d purity_same=%d def_same=%d def_is_abioverride=%d\n",
+                            ca->exctype == cb->exctype,
+                            ca->rettype_const == cb->rettype_const,
+                            jl_atomic_load_relaxed(&ca->ipo_purity_bits) == jl_atomic_load_relaxed(&cb->ipo_purity_bits),
+                            ca->def == cb->def,
+                            !jl_is_method_instance(ca->def));
+                        jl_safe_printf("    edges_same=%d inferred_same=%d a{inferred=%d,invoke=%d} b{inferred=%d,invoke=%d} chained=%d\n",
+                            jl_atomic_load_relaxed(&ca->edges) == jl_atomic_load_relaxed(&cb->edges),
+                            jl_atomic_load_relaxed(&ca->inferred) == jl_atomic_load_relaxed(&cb->inferred),
+                            jl_atomic_load_relaxed(&ca->inferred) != NULL,
+                            jl_atomic_load_relaxed(&ca->invoke) != NULL,
+                            jl_atomic_load_relaxed(&cb->inferred) != NULL,
+                            jl_atomic_load_relaxed(&cb->invoke) != NULL,
+                            jl_atomic_load_relaxed(&ca->next) == cb || jl_atomic_load_relaxed(&cb->next) == ca);
+                    }
+                }
                 ncollide++;
+            }
         }
         else {
             *bp = (void*)(uintptr_t)(i + 1);
@@ -1285,9 +1338,21 @@ static void jl_report_import_keys(jl_serializer_state *s) JL_NOTSAFEPOINT
     }
     htable_free(&seen);
 
-    jl_safe_printf("IMPORTKEYS distinct=%zu keyed=%zu unkeyed=%zu collisions=%zu keybytes=%zu\n",
-                   n, nkeyed, n - nkeyed, ncollide, (size_t)ios_pos(&keybuf));
+    // How many imports point into a rebuildable pkgimage rather than the sysimage
+    // (blob 0)? Only the former exercise cross-rebuild key stability.
+    size_t n_pkg = 0, n_pkg_keyed = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (kdep[i] != 0) {
+            n_pkg++;
+            if (koff[i + 1] - koff[i] > 1)
+                n_pkg_keyed++;
+        }
+    }
+    jl_safe_printf("IMPORTKEYS distinct=%zu keyed=%zu unkeyed=%zu collisions=%zu keybytes=%zu "
+                   "frompkgimage=%zu frompkgimage_keyed=%zu\n",
+                   n, nkeyed, n - nkeyed, ncollide, (size_t)ios_pos(&keybuf), n_pkg, n_pkg_keyed);
     free(koff);
+    free(kbeg);
     free(kdep);
     ios_close(&keybuf);
 }
