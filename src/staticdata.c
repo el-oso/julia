@@ -1130,6 +1130,18 @@ static uintptr_t add_external_linkage(jl_serializer_state *s, jl_value_t *v, jl_
 
 static int extkey_write(ios_t *k, jl_value_t *v, int depth) JL_NOTSAFEPOINT;
 
+// Raw bytes must never be written into a key directly: keys are NUL-terminated and
+// compared as C strings, so an embedded zero -- which any integer value parameter has --
+// would silently truncate the comparison and merge distinct keys.
+static void extkey_bytes(ios_t *k, const char *p, size_t len) JL_NOTSAFEPOINT
+{
+    static const char hex[] = "0123456789abcdef";
+    for (size_t i = 0; i < len; i++) {
+        ios_putc(hex[((unsigned char)p[i]) >> 4], k);
+        ios_putc(hex[((unsigned char)p[i]) & 0xf], k);
+    }
+}
+
 // Render one slot of a `CodeInstance.edges` vector. `edges` is a positional,
 // heterogeneous encoding (callees, `Int` match counts that govern the following slots,
 // bindings, invoke signatures, method-table markers), but a *digest* does not need to
@@ -1332,13 +1344,31 @@ static int extkey_write(ios_t *k, jl_value_t *v, int depth) JL_NOTSAFEPOINT
         ios_putc('.', k);
         ios_puts(jl_symbol_name(m->name), k);
         ios_putc('@', k);
-        // The signature disambiguates the methods of one generic function, and is
-        // sufficient: a second method with the same signature in the same module is a
-        // redefinition, which replaces the first rather than coexisting. Deliberately
+        // The signature disambiguates the methods of one generic function. Deliberately
         // *not* including file:line -- `Method.file` is an absolute path into the depot,
         // which differs between machines and depots and would make keys unportable.
         jl_static_show((JL_STREAM*)k, (jl_value_t*)m->sig);
-        return 1;
+        // Module, name and signature identify a method's *definition site*, not its body.
+        // That is not enough here: code inferred against this method, possibly with it
+        // inlined, must not silently re-link to a rebuilt version whose body changed but
+        // whose signature did not. Dispatch-based revalidation cannot catch that, because
+        // the dispatch answer is unchanged. So fold the compressed source in.
+        jl_value_t *src = m->source;
+        if (src != NULL && jl_is_string(src)) {
+            uint64_t h = 1469598103934665603ULL;   // FNV-1a
+            const char *b = jl_string_data(src);
+            size_t len = jl_string_len(src);
+            for (size_t i = 0; i < len; i++) {
+                h ^= (unsigned char)b[i];
+                h *= 1099511628211ULL;
+            }
+            ios_printf(k, "@B%016" PRIx64, h);
+            return 1;
+        }
+        // No compressed source to hash -- builtins, `@generated` bodies, methods whose
+        // source was discarded. Their bodies cannot be compared, so refuse a key rather
+        // than hand out one that ignores the body.
+        return 0;
     }
     if (jl_is_method_instance(v)) {
         jl_method_instance_t *mi = (jl_method_instance_t*)v;
@@ -1381,7 +1411,7 @@ static int extkey_write(ios_t *k, jl_value_t *v, int depth) JL_NOTSAFEPOINT
     }
     if (jl_is_string(v)) {
         ios_puts("s:", k);
-        ios_write(k, jl_string_data(v), jl_string_len(v));
+        extkey_bytes(k, jl_string_data(v), jl_string_len(v));
         return 1;
     }
     if (jl_is_type(v)) {
@@ -1464,7 +1494,7 @@ static int extkey_write(ios_t *k, jl_value_t *v, int depth) JL_NOTSAFEPOINT
             }
         }
         else if (lo->npointers == 0 && !lo->flags.haspadding) {
-            ios_write(k, (char*)m->ptr, (size_t)m->length * lo->size);
+            extkey_bytes(k, (char*)m->ptr, (size_t)m->length * lo->size);
         }
         else {
             return 0;   // inline elements carrying pointers or padding
@@ -1505,7 +1535,7 @@ static int extkey_write(ios_t *k, jl_value_t *v, int depth) JL_NOTSAFEPOINT
         if (!extkey_write(k, (jl_value_t*)vt, depth + 1))
             return 0;
         ios_putc('<', k);
-        ios_write(k, (const char*)v, jl_datatype_size(vt));
+        extkey_bytes(k, (const char*)v, jl_datatype_size(vt));
         ios_putc('>', k);
         return 1;
     }
