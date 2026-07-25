@@ -1203,6 +1203,73 @@ static int extkey_edges_hash(jl_code_instance_t *ci, uint64_t *out) JL_NOTSAFEPO
     return ok;
 }
 
+// `DebugInfo` has no name-based identity -- it is immutable line/file table data, and it
+// is the single largest kind in the import table (26% of the distinct objects a large
+// package imports). Key it by content instead. Returns 0 if any part lacks a stable
+// rendering.
+static int extkey_debuginfo(ios_t *k, jl_debuginfo_t *di, int depth) JL_NOTSAFEPOINT
+{
+    if (depth > EXTKEY_MAX_DEPTH)
+        return 0;
+    // def is a Method, MethodInstance or Symbol naming what this describes
+    if (di->def != NULL && di->def != jl_nothing) {
+        if (!extkey_write(k, di->def, depth + 1))
+            return 0;
+    }
+    ios_putc(';', k);
+    if (di->linetable != NULL && (jl_value_t*)di->linetable != jl_nothing) {
+        if (!extkey_debuginfo(k, di->linetable, depth + 1))
+            return 0;
+    }
+    ios_putc(';', k);
+    // edges: declared as a SimpleVector but in practice a Memory{DebugInfo}; accept both
+    jl_value_t *edges = (jl_value_t*)di->edges;
+    if (edges != NULL && edges != jl_nothing) {
+        size_t ne;
+        jl_value_t **ed;
+        if (jl_is_genericmemory(edges)) {
+            ne = ((jl_genericmemory_t*)edges)->length;
+            ed = jl_genericmemory_ptr_data((jl_genericmemory_t*)edges);
+        }
+        else if (jl_is_svec(edges)) {
+            ne = jl_svec_len(edges);
+            ed = jl_svec_data(edges);
+        }
+        else {
+            return 0;
+        }
+        ios_printf(k, "n%zu", ne);
+        for (size_t i = 0; i < ne; i++) {
+            jl_value_t *e = ed[i];
+            if (e == NULL)
+                continue;
+            if (!jl_typetagis(e, jl_debuginfo_type))
+                return 0;
+            if (!extkey_debuginfo(k, (jl_debuginfo_t*)e, depth + 1))
+                return 0;
+        }
+    }
+    ios_putc(';', k);
+    // codelocs: compressed location data, hashed verbatim; either a String or a Memory
+    if (di->codelocs == NULL || di->codelocs == jl_nothing) {
+        /* nothing to add */
+    }
+    else if (jl_is_string(di->codelocs)) {
+        ios_write(k, jl_string_data(di->codelocs), jl_string_len(di->codelocs));
+    }
+    else if (jl_is_genericmemory(di->codelocs)) {
+        jl_genericmemory_t *m = (jl_genericmemory_t*)di->codelocs;
+        const jl_datatype_layout_t *lo = ((jl_datatype_t*)jl_typeof(m))->layout;
+        if (lo == NULL || lo->flags.arrayelem_isboxed)
+            return 0;
+        ios_write(k, (char*)m->ptr, m->length * lo->size);
+    }
+    else {
+        return 0;
+    }
+    return 1;
+}
+
 static void extkey_module(ios_t *k, jl_module_t *m) JL_NOTSAFEPOINT
 {
     // root-first module path; the parent chain terminates at a root module
@@ -1265,10 +1332,12 @@ static int extkey_write(ios_t *k, jl_value_t *v, int depth) JL_NOTSAFEPOINT
         ios_putc('.', k);
         ios_puts(jl_symbol_name(m->name), k);
         ios_putc('@', k);
-        // the signature disambiguates the methods of one generic function
+        // The signature disambiguates the methods of one generic function, and is
+        // sufficient: a second method with the same signature in the same module is a
+        // redefinition, which replaces the first rather than coexisting. Deliberately
+        // *not* including file:line -- `Method.file` is an absolute path into the depot,
+        // which differs between machines and depots and would make keys unportable.
         jl_static_show((JL_STREAM*)k, (jl_value_t*)m->sig);
-        // and file:line disambiguates same-signature methods from different sources
-        ios_printf(k, "@%s:%d", m->file ? jl_symbol_name(m->file) : "?", (int)m->line);
         return 1;
     }
     if (jl_is_method_instance(v)) {
@@ -1308,6 +1377,57 @@ static int extkey_write(ios_t *k, jl_value_t *v, int depth) JL_NOTSAFEPOINT
     if (jl_is_symbol(v)) {
         ios_puts("S:", k);
         ios_puts(jl_symbol_name((jl_sym_t*)v), k);
+        return 1;
+    }
+    if (jl_is_string(v)) {
+        ios_puts("s:", k);
+        ios_write(k, jl_string_data(v), jl_string_len(v));
+        return 1;
+    }
+    if (jl_is_type(v)) {
+        // UnionAll and Union have no name of their own but print structurally and stably,
+        // binders included. Without this, every parameterized DataType mentioning one is
+        // unkeyable too. Bare TypeVars are deliberately excluded: a type variable has no
+        // standalone identity, only a meaning relative to the UnionAll that binds it, and
+        // keying one by name alone merges every `T` in the image.
+        ios_puts("t:", k);
+        jl_static_show((JL_STREAM*)k, v);
+        return 1;
+    }
+    if (jl_typetagis(v, jl_debuginfo_type)) {
+        // digest the content so the key stays bounded
+        ios_t d;
+        ios_mem(&d, 256);
+        int ok = extkey_debuginfo(&d, (jl_debuginfo_t*)v, depth);
+        if (ok) {
+            uint64_t h = 1469598103934665603ULL;   // FNV-1a
+            size_t len = (size_t)ios_pos(&d);
+            for (size_t i = 0; i < len; i++) {
+                h ^= (unsigned char)d.buf[i];
+                h *= 1099511628211ULL;
+            }
+            ios_printf(k, "D:%016" PRIx64, h);
+        }
+        ios_close(&d);
+        return ok;
+    }
+    if (jl_is_svec(v)) {
+        // element-wise; svecs in the import table are mostly type tuples
+        ios_puts("V:", k);
+        size_t n = jl_svec_len(v);
+        ios_printf(k, "%zu<", n);
+        for (size_t i = 0; i < n; i++) {
+            jl_value_t *e = jl_svecref(v, i);
+            if (i)
+                ios_putc(',', k);
+            if (e == NULL)
+                ios_putc('0', k);
+            else if (jl_is_type(e))
+                jl_static_show((JL_STREAM*)k, e);
+            else if (!extkey_write(k, e, depth + 1))
+                return 0;
+        }
+        ios_putc('>', k);
         return 1;
     }
     // Everything else (DebugInfo, SimpleVector, singletons, constants, arrays, ...) has
@@ -1387,7 +1507,11 @@ static void jl_report_import_keys(jl_serializer_state *s) JL_NOTSAFEPOINT
                 // count a collision when the two are genuinely different things.
                 jl_value_t *oa = (jl_value_t*)s->import_objs.items[i];
                 jl_value_t *ob = (jl_value_t*)s->import_objs.items[j];
-                if (jl_is_datatype(oa) && jl_is_datatype(ob) && jl_types_equal(oa, ob)) {
+                // `jl_egal` is Julia's own definition of "the same value", which covers
+                // separately allocated but equal simple vectors, strings and debug info
+                // as well as types; the loader is free to merge any of them.
+                if (jl_egal(oa, ob) ||
+                    (jl_is_type(oa) && jl_is_type(ob) && jl_types_equal(oa, ob))) {
                     ndup++;
                     continue;
                 }
@@ -1475,6 +1599,23 @@ static void jl_report_import_keys(jl_serializer_state *s) JL_NOTSAFEPOINT
             if (koff[i + 1] - koff[i] > 1)
                 n_pkg_keyed++;
         }
+    }
+    // what is still unkeyed, by concrete type
+    {
+        void *uty[24]; size_t ucnt[24], unty = 0;
+        for (size_t i = 0; i < n; i++) {
+            if (koff[i + 1] - koff[i] > 1)
+                continue;
+            void *ty = (void*)jl_typeof((jl_value_t*)s->import_objs.items[i]);
+            size_t q;
+            for (q = 0; q < unty; q++)
+                if (uty[q] == ty) break;
+            if (q == unty && q < 24) { uty[q] = ty; ucnt[q] = 0; unty++; }
+            if (q < 24) ucnt[q]++;
+        }
+        for (size_t q = 0; q < unty; q++)
+            jl_safe_printf("IMPORTKEYS_UNKEYED %-24s %zu\n",
+                           jl_symbol_name(((jl_datatype_t*)uty[q])->name->name), ucnt[q]);
     }
     jl_safe_printf("IMPORTKEYS distinct=%zu keyed=%zu unkeyed=%zu collisions=%zu keybytes=%zu "
                    "frompkgimage=%zu frompkgimage_keyed=%zu equivdupes=%zu\n",
