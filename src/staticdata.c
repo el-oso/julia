@@ -349,6 +349,14 @@ typedef struct {
     jl_array_t *link_ids_external_fnvars;
     jl_array_t *method_roots_list;
     htable_t method_roots_index;
+    // Import table: the distinct objects this image references in *other* images, in
+    // first-reference order. `import_objs[i]` lives in the image whose deps-index is
+    // `import_deps.items[i]`. Today this is descriptive only; it is the table a
+    // content-keyed external-reference scheme would serialize, so that a rebuilt
+    // dependency can be re-resolved by key instead of invalidating this image.
+    arraylist_t import_objs;
+    arraylist_t import_deps;
+    htable_t import_index;      // jl_value_t* -> 1-based index into import_objs
     uint64_t worklist_key;
     jl_query_cache *query_cache;
     jl_ptls_t ptls;
@@ -1075,6 +1083,14 @@ static uintptr_t add_external_linkage(jl_serializer_state *s, jl_value_t *v, jl_
 {
     size_t i = external_blob_index(v);
     if (i < n_linkage_blobs()) {
+        // Record `v` in the import table the first time we reference it. Distinct objects
+        // are vastly fewer than references to them (~87:1 for a large package), which is
+        // what makes a per-image key table cheap.
+        if (ptrhash_get(&s->import_index, v) == HT_NOTFOUND) {
+            arraylist_push(&s->import_objs, v);
+            arraylist_push(&s->import_deps, (void*)(uintptr_t)i);
+            ptrhash_put(&s->import_index, v, (void*)(uintptr_t)s->import_objs.len);
+        }
         // We found the sysimg/pkg that this item links against
         // Compute the relocation code
         size_t offset = (uintptr_t)v - (uintptr_t)jl_linkage_blobs.items[2*i];
@@ -1095,6 +1111,182 @@ static uintptr_t add_external_linkage(jl_serializer_state *s, jl_value_t *v, jl_
         return ((uintptr_t)ExternalLinkage << RELOC_TAG_OFFSET) + offset;
     }
     return 0;
+}
+
+// --- Content keys for external references -----------------------------------------
+//
+// A key identifies an object *within its owning image* using only information that
+// survives a rebuild of that image: names and structure, never addresses. This is what
+// lets a dependent image be re-resolved against a rebuilt dependency rather than
+// discarded. Keys need only be unique per owning image, not globally.
+//
+// `extkey_write` returns 0 for object kinds that have no stable key yet; callers must
+// treat that as "cannot re-resolve", i.e. fall back to rebuilding the dependent.
+
+#define EXTKEY_MAX_DEPTH 8
+
+static int extkey_write(ios_t *k, jl_value_t *v, int depth) JL_NOTSAFEPOINT;
+
+static void extkey_module(ios_t *k, jl_module_t *m) JL_NOTSAFEPOINT
+{
+    // root-first module path; the parent chain terminates at a root module
+    jl_module_t *p = m->parent;
+    if (p && p != m) {
+        extkey_module(k, p);
+        ios_putc('.', k);
+    }
+    ios_puts(jl_symbol_name(m->name), k);
+}
+
+static int extkey_write(ios_t *k, jl_value_t *v, int depth) JL_NOTSAFEPOINT
+{
+    if (depth > EXTKEY_MAX_DEPTH)
+        return 0;
+    if (jl_is_module(v)) {
+        ios_puts("M:", k);
+        extkey_module(k, (jl_module_t*)v);
+        return 1;
+    }
+    if (jl_is_typename(v)) {
+        jl_typename_t *tn = (jl_typename_t*)v;
+        ios_puts("N:", k);
+        extkey_module(k, tn->module);
+        ios_putc('.', k);
+        ios_puts(jl_symbol_name(tn->name), k);
+        return 1;
+    }
+    if (jl_is_datatype(v)) {
+        jl_datatype_t *dt = (jl_datatype_t*)v;
+        ios_puts("T:", k);
+        extkey_module(k, dt->name->module);
+        ios_putc('.', k);
+        ios_puts(jl_symbol_name(dt->name->name), k);
+        // parameters are part of the identity of an instantiated type
+        size_t np = jl_svec_len(dt->parameters);
+        if (np) {
+            ios_putc('{', k);
+            for (size_t i = 0; i < np; i++) {
+                if (i) ios_putc(',', k);
+                if (!extkey_write(k, jl_svecref(dt->parameters, i), depth + 1))
+                    return 0;
+            }
+            ios_putc('}', k);
+        }
+        return 1;
+    }
+    if (jl_is_binding(v)) {
+        jl_binding_t *b = (jl_binding_t*)v;
+        ios_puts("B:", k);
+        extkey_module(k, b->globalref->mod);
+        ios_putc('.', k);
+        ios_puts(jl_symbol_name(b->globalref->name), k);
+        return 1;
+    }
+    if (jl_is_method(v)) {
+        jl_method_t *m = (jl_method_t*)v;
+        ios_puts("F:", k);
+        extkey_module(k, m->module);
+        ios_putc('.', k);
+        ios_puts(jl_symbol_name(m->name), k);
+        ios_putc('@', k);
+        // the signature disambiguates the methods of one generic function
+        jl_static_show((JL_STREAM*)k, (jl_value_t*)m->sig);
+        // and file:line disambiguates same-signature methods from different sources
+        ios_printf(k, "@%s:%d", m->file ? jl_symbol_name(m->file) : "?", (int)m->line);
+        return 1;
+    }
+    if (jl_is_method_instance(v)) {
+        jl_method_instance_t *mi = (jl_method_instance_t*)v;
+        if (!jl_is_method(mi->def.value))
+            return 0;   // toplevel thunks have no stable name
+        ios_puts("I:", k);
+        if (!extkey_write(k, mi->def.value, depth + 1))
+            return 0;
+        ios_putc('/', k);
+        jl_static_show((JL_STREAM*)k, (jl_value_t*)mi->specTypes);
+        return 1;
+    }
+    if (jl_is_code_instance(v)) {
+        jl_code_instance_t *ci = (jl_code_instance_t*)v;
+        jl_method_instance_t *mi = jl_get_ci_mi(ci);
+        ios_puts("C:", k);
+        if (!extkey_write(k, (jl_value_t*)mi, depth + 1))
+            return 0;
+        ios_putc('/', k);
+        // the owner distinguishes foreign-interpreter caches sharing one MethodInstance
+        if (ci->owner == jl_nothing)
+            ios_putc('-', k);
+        else if (!extkey_write(k, ci->owner, depth + 1))
+            return 0;
+        // and the ABI/rettype distinguishes co-existing entries for one owner
+        ios_putc('/', k);
+        jl_static_show((JL_STREAM*)k, ci->rettype);
+        return 1;
+    }
+    if (jl_is_symbol(v)) {
+        ios_puts("S:", k);
+        ios_puts(jl_symbol_name((jl_sym_t*)v), k);
+        return 1;
+    }
+    // Everything else (DebugInfo, SimpleVector, singletons, constants, arrays, ...) has
+    // no name-based identity. The bulk of it by count is DebugInfo, which is immutable
+    // content and wants a content hash rather than a name -- not yet implemented.
+    return 0;
+}
+
+// Compute keys for every imported object and report coverage plus injectivity: two
+// distinct objects in the same owning image must never produce the same key.
+static void jl_report_import_keys(jl_serializer_state *s) JL_NOTSAFEPOINT
+{
+    size_t n = s->import_objs.len;
+    ios_t keybuf;
+    ios_mem(&keybuf, n ? n * 48 : 64);
+    size_t *koff = (size_t*)malloc_s((n + 1) * sizeof(size_t));
+    size_t *kdep = (size_t*)malloc_s((n ? n : 1) * sizeof(size_t));
+    size_t nkeyed = 0;
+    for (size_t i = 0; i < n; i++) {
+        koff[i] = (size_t)ios_pos(&keybuf);
+        kdep[i] = (size_t)(uintptr_t)s->import_deps.items[i];
+        // prefix with the owning image so keys only need to be unique within it
+        ios_printf(&keybuf, "%zu\x1f", kdep[i]);
+        if (extkey_write(&keybuf, (jl_value_t*)s->import_objs.items[i], 0))
+            nkeyed++;
+        else
+            ios_seek(&keybuf, koff[i]);   // unkeyed: leave a zero-length entry
+        ios_putc('\0', &keybuf);
+    }
+    koff[n] = (size_t)ios_pos(&keybuf);
+
+    // injectivity: collisions between *distinct* objects would make keys unusable
+    size_t ncollide = 0;
+    htable_t seen;
+    htable_new(&seen, 0);
+    for (size_t i = 0; i < n; i++) {
+        char *ki = keybuf.buf + koff[i];
+        if (koff[i + 1] - koff[i] <= 1)
+            continue;   // unkeyed
+        // linear probe over a pointer table keyed by the string's hash
+        uintptr_t h = 5381;
+        for (char *c = ki; *c; c++)
+            h = h * 33 + (unsigned char)*c;
+        void **bp = ptrhash_bp(&seen, (void*)(h | 1));
+        if (*bp != HT_NOTFOUND) {
+            size_t j = (size_t)(uintptr_t)*bp - 1;
+            if (strcmp(keybuf.buf + koff[j], ki) == 0 &&
+                s->import_objs.items[i] != s->import_objs.items[j])
+                ncollide++;
+        }
+        else {
+            *bp = (void*)(uintptr_t)(i + 1);
+        }
+    }
+    htable_free(&seen);
+
+    jl_safe_printf("IMPORTKEYS distinct=%zu keyed=%zu unkeyed=%zu collisions=%zu keybytes=%zu\n",
+                   n, nkeyed, n - nkeyed, ncollide, (size_t)ios_pos(&keybuf));
+    free(koff);
+    free(kdep);
+    ios_close(&keybuf);
 }
 
 // Return the integer `id` for `v`. Generically this is looked up in `serialization_order`,
@@ -3032,6 +3224,9 @@ static void jl_save_system_image_to_stream(ios_t *f, jl_array_t *mod_array,
     s.link_ids_external_fnvars = jl_alloc_array_1d(jl_array_int32_type, 0);
     s.method_roots_list = NULL;
     htable_new(&s.method_roots_index, 0);
+    arraylist_new(&s.import_objs, 0);
+    arraylist_new(&s.import_deps, 0);
+    htable_new(&s.import_index, 0);
     jl_value_t **_tags[NUM_TAGS];
     jl_value_t ***tags = s.incremental ? NULL : _tags;
     if (worklist) {
@@ -3291,6 +3486,9 @@ static void jl_save_system_image_to_stream(ios_t *f, jl_array_t *mod_array,
         write_uint32(f, external_fns_begin);
     }
 
+    if (getenv("JULIA_IMPORT_KEYS"))
+        jl_report_import_keys(&s);
+
     assert(object_worklist.len == 0);
     arraylist_free(&object_worklist);
     arraylist_free(&serialization_queue);
@@ -3307,6 +3505,9 @@ static void jl_save_system_image_to_stream(ios_t *f, jl_array_t *mod_array,
     arraylist_free(&gvars);
     arraylist_free(&external_fns);
     htable_free(&s.method_roots_index);
+    arraylist_free(&s.import_objs);
+    arraylist_free(&s.import_deps);
+    htable_free(&s.import_index);
     htable_free(&field_replace);
     htable_free(&bits_replace);
     htable_free(&serialization_order);
