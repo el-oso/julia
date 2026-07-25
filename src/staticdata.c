@@ -1427,9 +1427,88 @@ static int extkey_write(ios_t *k, jl_value_t *v, int depth) JL_NOTSAFEPOINT
         ios_putc('>', k);
         return 1;
     }
-    // Everything else (DebugInfo, SimpleVector, singletons, constants, arrays, ...) has
-    // no name-based identity. The bulk of it by count is DebugInfo, which is immutable
-    // content and wants a content hash rather than a name -- not yet implemented.
+    if (jl_is_globalref(v)) {
+        // A global reference is exactly the module and name it names.
+        jl_globalref_t *g = (jl_globalref_t*)v;
+        ios_puts("R:", k);
+        extkey_module(k, g->mod);
+        ios_putc('.', k);
+        ios_puts(jl_symbol_name(g->name), k);
+        return 1;
+    }
+    if (jl_is_genericmemory(v)) {
+        // No name; content, exactly like DebugInfo. The layout on a GenericMemory's type
+        // describes its element, so boxed elements recurse and inline ones hash their
+        // bytes -- but only when those bytes are fully defined, hence the padding guard.
+        jl_genericmemory_t *m = (jl_genericmemory_t*)v;
+        const jl_datatype_layout_t *lo = ((jl_datatype_t*)jl_typeof(m))->layout;
+        if (lo == NULL)
+            return 0;
+        ios_puts("G:", k);
+        jl_static_show((JL_STREAM*)k, (jl_value_t*)jl_typeof(m));
+        ios_printf(k, "<%zu:", (size_t)m->length);
+        if (lo->flags.arrayelem_isboxed) {
+            jl_value_t **el = jl_genericmemory_ptr_data(m);
+            for (size_t i = 0; i < (size_t)m->length; i++) {
+                if (i)
+                    ios_putc(',', k);
+                if (el[i] == NULL)
+                    ios_putc('0', k);
+                else if (jl_is_type(el[i]))
+                    jl_static_show((JL_STREAM*)k, el[i]);
+                else if (!extkey_write(k, el[i], depth + 1))
+                    return 0;
+            }
+        }
+        else if (lo->npointers == 0 && !lo->flags.haspadding) {
+            ios_write(k, (char*)m->ptr, (size_t)m->length * lo->size);
+        }
+        else {
+            return 0;   // inline elements carrying pointers or padding
+        }
+        ios_putc('>', k);
+        return 1;
+    }
+    if (jl_is_mtable(v)) {
+        // Method tables are only ever created for the global `Core.methodtable`, as a
+        // clone carrying an existing table's name and module, or by
+        // `Base.Experimental.@MethodTable name`, which always binds the result to a
+        // constant. There is no anonymous construction path, so name and module identify
+        // one exactly.
+        jl_methtable_t *mt = (jl_methtable_t*)v;
+        ios_puts("MT:", k);
+        extkey_module(k, mt->module);
+        ios_putc('.', k);
+        ios_puts(jl_symbol_name(mt->name), k);
+        return 1;
+    }
+    jl_datatype_t *vt = (jl_datatype_t*)jl_typeof(v);
+    if (jl_is_datatype_singleton(vt)) {
+        // A singleton -- `nothing`, `Colon()`, `IndexLinear()`, a generic function object,
+        // a closure with no captures -- has exactly one instance, so its type identifies
+        // it completely. This also covers the long tail of `#foo`-typed function objects.
+        ios_puts("O:", k);
+        return extkey_write(k, (jl_value_t*)vt, depth + 1);
+    }
+    if (jl_is_datatype(vt) && vt->layout != NULL && vt->layout->npointers == 0 &&
+        !vt->layout->flags.haspadding && jl_is_immutable(vt)) {
+        // A boxed immutable with no pointers and no padding -- an Int, Bool, Char, Float,
+        // or a tightly packed isbits struct used as a type parameter, such as the `3` in
+        // `NTuple{3,Float64}` -- is exactly its type plus its bytes. Padding is excluded
+        // because gap bytes are not required to be initialized, so two logically identical
+        // values could otherwise key differently within a single build. Without this,
+        // every parameterized type carrying a value parameter was unkeyable.
+        ios_puts("b:", k);
+        if (!extkey_write(k, (jl_value_t*)vt, depth + 1))
+            return 0;
+        ios_putc('<', k);
+        ios_write(k, (const char*)v, jl_datatype_size(vt));
+        ios_putc('>', k);
+        return 1;
+    }
+    // Remaining kinds have no stable identity: bare TypeVars (meaningful only relative to
+    // their binder), mutable boxes such as `Threads.Atomic` whose contents change after
+    // construction, and opaque compiler state such as AnalysisResults.
     return 0;
 }
 
@@ -1637,7 +1716,11 @@ static void jl_report_import_keys(jl_serializer_state *s) JL_NOTSAFEPOINT
     }
     // what is still unkeyed, by concrete type
     {
-        void *uty[24]; size_t ucnt[24], unty = 0;
+        // A fixed 24 slots silently dropped kinds once full, which hid CodeInstance
+        // entirely on a large image and made the counts here untrustworthy. Report any
+        // overflow rather than swallowing it.
+        enum { UTY_MAX = 512 };
+        void *uty[UTY_MAX]; size_t ucnt[UTY_MAX], unty = 0, udropped = 0;
         for (size_t i = 0; i < n; i++) {
             if (koff[i + 1] - koff[i] > 1)
                 continue;
@@ -1645,12 +1728,17 @@ static void jl_report_import_keys(jl_serializer_state *s) JL_NOTSAFEPOINT
             size_t q;
             for (q = 0; q < unty; q++)
                 if (uty[q] == ty) break;
-            if (q == unty && q < 24) { uty[q] = ty; ucnt[q] = 0; unty++; }
-            if (q < 24) ucnt[q]++;
+            if (q == unty) {
+                if (q == UTY_MAX) { udropped++; continue; }
+                uty[q] = ty; ucnt[q] = 0; unty++;
+            }
+            ucnt[q]++;
         }
         for (size_t q = 0; q < unty; q++)
             jl_safe_printf("IMPORTKEYS_UNKEYED %-24s %zu\n",
                            jl_symbol_name(((jl_datatype_t*)uty[q])->name->name), ucnt[q]);
+        if (udropped)
+            jl_safe_printf("IMPORTKEYS_UNKEYED <overflow>              %zu\n", udropped);
     }
     // REVIEW instrumentation: per owning pkgimage, total vs unkeyed distinct imports.
     // Re-resolution is all-or-nothing per (dependent, dependency) pair, so what matters
