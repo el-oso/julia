@@ -2160,12 +2160,35 @@ static void jl_write_import_table(jl_serializer_state *s, ios_t *f) JL_NOTSAFEPO
 {
     size_t n = s->import_objs.len;
     write_uint32(f, (uint32_t)n);
+    ios_t k;
+    ios_mem(&k, 4096);
+    size_t keybytes = 0;
     for (size_t i = 0; i < n; i++) {
         uint64_t h = 0;
         extkey_hash((jl_value_t*)s->import_objs.items[i], &h);
         write_uint32(f, (uint32_t)(uintptr_t)s->import_deps.items[i]);
         write_uint64(f, h);
+        // The digest alone cannot be turned back into the object it names -- it is not
+        // invertible -- so resolution against a rebuilt dependency needs the key itself.
+        // The digest stays as the *verification*: resolution finds a candidate through the
+        // runtime tables by structure, recomputes its key, and must reproduce this digest
+        // before the candidate is accepted. Finding and checking are deliberately separate,
+        // because a structural lookup that finds the wrong thing is not detectable by the
+        // lookup itself.
+        ios_seek(&k, 0);
+        ios_trunc(&k, 0);
+        uint32_t len = 0;
+        if (h && extkey_write(&k, (jl_value_t*)s->import_objs.items[i], 0))
+            len = (uint32_t)ios_pos(&k);
+        write_uint32(f, len);
+        if (len) {
+            ios_write(f, k.buf, len);
+            keybytes += len;
+        }
     }
+    ios_close(&k);
+    if (getenv("JULIA_IMPORT_KEYS"))
+        jl_safe_printf("IMPORTKEYS_WRITE entries=%zu keybytes=%zu\n", n, keybytes);
 }
 
 // Compute keys for every imported object and report coverage plus injectivity: two
@@ -5828,14 +5851,20 @@ static void jl_restore_system_image_from_stream_(ios_t *f, jl_image_t *image,
     uint32_t external_fns_begin = read_uint32(f);
     {   // import table, written by jl_write_import_table
         size_t nimports = read_uint32(f);
-        size_t nkeyed = 0;
+        size_t nkeyed = 0, keybytes = 0;
         for (size_t i = 0; i < nimports; i++) {
             (void)read_uint32(f);   // owning image's deps-index
-            if (read_uint64(f))     // content key, 0 when the object has no stable one
+            if (read_uint64(f))     // content key digest, 0 when there is no stable one
                 nkeyed++;
+            size_t len = read_uint32(f);   // the key itself, for re-deriving the object
+            if (len) {
+                keybytes += len;
+                ios_skip(f, len);
+            }
         }
         if (getenv("JULIA_IMPORT_KEYS"))
-            jl_safe_printf("IMPORTKEYS_READ entries=%zu keyed=%zu\n", nimports, nkeyed);
+            jl_safe_printf("IMPORTKEYS_READ entries=%zu keyed=%zu keybytes=%zu\n",
+                           nimports, nkeyed, keybytes);
     }
     if (s.incremental) {
         assert(restored && init_order && extext_methods && internal_methods && new_ext_cis && method_roots_list);
