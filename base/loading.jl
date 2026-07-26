@@ -4269,6 +4269,13 @@ end
                     return true # Won't be able to fulfill dependency
                 elseif ignore_loaded || !stalecheck
                     # Used by Pkg.precompile given that there it's ok to precompile different versions of loaded packages
+                elseif PkgId(M) == req_key && get_bool_env("JULIA_PKGIMAGE_RELINK", false) === true
+                    # relink probe: let the build_id mismatch through so the import table
+                    # can be resolved against the rebuilt dependency; the restore itself
+                    # is refused later in the C code, so the stale cache never executes
+                    @debug "JULIA_PKGIMAGE_RELINK: accepting build_id mismatch for $req_key in $cachefile"
+                    depmods[i] = M
+                    continue
                 else
                     @debug "Rejecting cache file $cachefile because module $req_key is already loaded and incompatible."
                     record_reason(reasons, "different dependency version already loaded")

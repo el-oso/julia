@@ -915,8 +915,15 @@ static int jl_copy_roots(jl_array_t *method_roots_list, uint64_t key)
     return failed;
 }
 
+// Set when read_verify_mod_list lets a dependency build_id mismatch through under
+// JULIA_PKGIMAGE_RELINK so the relink probe can run against the rebuilt dependency.
+// jl_restore_system_image_from_stream_ consumes it to abandon the restore after the
+// probe, so the mismatched cache is still refused and nothing stale ever executes.
+static int relink_probe_buildid_mismatch = 0;
+
 static jl_value_t *read_verify_mod_list(ios_t *s, jl_array_t *depmods)
 {
+    relink_probe_buildid_mismatch = 0;
     if (!jl_main_module->build_id.lo) {
         return jl_get_exceptionf(jl_errorexception_type,
                 "Main module uuid state is invalid for module deserialization.");
@@ -939,8 +946,15 @@ static jl_value_t *read_verify_mod_list(ios_t *s, jl_array_t *depmods)
         build_id.lo = read_uint64(s);
         jl_sym_t *sym = _jl_symbol(name, len);
         jl_module_t *m = (jl_module_t*)jl_array_ptr_ref(depmods, i);
-        if (!m || !jl_is_module(m) || m->uuid.hi != uuid.hi || m->uuid.lo != uuid.lo || m->name != sym ||
-                m->build_id.hi != build_id.hi || m->build_id.lo != build_id.lo) {
+        if (!m || !jl_is_module(m) || m->uuid.hi != uuid.hi || m->uuid.lo != uuid.lo || m->name != sym) {
+            return jl_get_exceptionf(jl_errorexception_type,
+                "Invalid input in module list: expected %s.", name);
+        }
+        if (m->build_id.hi != build_id.hi || m->build_id.lo != build_id.lo) {
+            if (getenv("JULIA_PKGIMAGE_RELINK")) {
+                relink_probe_buildid_mismatch = 1;
+                continue;
+            }
             return jl_get_exceptionf(jl_errorexception_type,
                 "Invalid input in module list: expected %s.", name);
         }
