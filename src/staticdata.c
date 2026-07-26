@@ -4368,6 +4368,7 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
     extkey_build_paths(depmods);
     int verbose = getenv("JULIA_PKGIMAGE_RELINK_VERBOSE") != NULL;
     size_t keyed = 0, resolved = 0, accepted = 0, unresolved = 0, digest_bad = 0, extfn_bad = 0, fabricated = 0;
+    size_t rootkey_bad = 0;
     size_t gt_checked = 0, gt_bad = 0, gt_shown = 0;
     const char *gt_verbose = getenv("JULIA_PKGIMAGE_RELINK_SELFCHECK");
     jl_value_t **memo = (jl_value_t**)calloc(tbl->n ? tbl->n : 1, sizeof(jl_value_t*));
@@ -4547,9 +4548,43 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
                     }
                 }
             }
+            // A method carries its roots, and a dependent's cached code addresses them by
+            // a number that a rebuild invalidates. `literal_val_id` (ircode.c) encodes a
+            // constant in compressed IR as a reference into `Method.roots`, made
+            // relocatable by `get_root_reference` as a pair (owning module's
+            // `build_id.lo`, index within that module's block) -- and `jl_add_method_root`
+            // takes that key from `mod->build_id.lo`, a per-build counter. So when this
+            // image inferred code for a method the dependency owns, its IR may cite roots
+            // under the dependency's *old* build_id. Repoint the method at the rebuilt
+            // dependency and that key is in no block of the new `root_blocks`, whereupon
+            // `rle_reference_to_index` (support/rle.c) walks off the table and returns a
+            // wrong index with no bounds check and no way to signal failure. The wrong
+            // root is then read as whatever it happens to be: measured here, a Makie image
+            // repointed at a rebuilt Animations segfaults in `jl_decode_value_any`
+            // dereferencing the layout of a "DataType" that is not one.
+            //
+            // Nothing in this scheme can see that: the number is buried in compressed IR
+            // bytes, not in any reference the import table describes, so no key, digest or
+            // blob check touches it. It is the same defect class as world ages -- a
+            // per-build counter that a content key cannot commit to -- and the same answer
+            // applies. Refuse. Importing a method is what makes this image able to hold IR
+            // compressed against that method, so it is the necessary condition; refusing on
+            // it over-refuses (the IR need not actually cite such a root) and that is the
+            // right direction to be wrong in.
+            if (ok && jl_is_method(got)) {
+                ok = 0;
+                rootkey_bad++;
+            }
             if (ok) {
                 accepted++;
                 dep_accepted[d]++;
+                // The ground-truth check above is vacuous for exactly the dependencies
+                // that moved -- which is the only case repointing is used for. Name what
+                // is about to be repointed so a wrong program has something to bisect.
+                if (verbose && d < relink_mismatched_ndeps && relink_mismatched_deps[d])
+                    jl_safe_printf("RELINK_ACCEPT dep=%u off=%zu [%s] %.200s\n",
+                                   (unsigned)d, (size_t)tbl->e[i].offset,
+                                   jl_typeof_str(got), tbl->e[i].loc);
                 // the name below comes from the representative's blob, so a rebuilt
                 // object (a fresh svec or re-boxed immutable lives in no blob) cannot
                 // serve as one
@@ -4629,8 +4664,8 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
     free(state);
     free(resolved_objs);
     free(fail_at);
-    jl_safe_printf("RELINK_PROBE entries=%zu keyed=%zu resolved=%zu accepted=%zu unresolved=%zu digest_mismatch=%zu uncompiled_extfn=%zu fabricated=%zu\n",
-                   tbl->n, keyed, resolved, accepted, unresolved, digest_bad, extfn_bad, fabricated);
+    jl_safe_printf("RELINK_PROBE entries=%zu keyed=%zu resolved=%zu accepted=%zu unresolved=%zu digest_mismatch=%zu uncompiled_extfn=%zu fabricated=%zu method_rootkey=%zu\n",
+                   tbl->n, keyed, resolved, accepted, unresolved, digest_bad, extfn_bad, fabricated, rootkey_bad);
     jl_safe_printf("RELINK_SELFCHECK identical=%zu different=%zu\n", gt_checked - gt_bad, gt_bad);
     // kinds sorted by unresolved count, mismatches alongside; examples for the top two
     int order[RK_MAX];
