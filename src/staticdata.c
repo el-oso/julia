@@ -2317,6 +2317,15 @@ static void jl_write_import_table(jl_serializer_state *s, ios_t *f) JL_NOTSAFEPO
     ios_t k;
     ios_mem(&k, 4096);
     size_t keybytes = 0;
+    // An object the writer cannot render carries no locator, so no loader can re-derive
+    // it and its dependency edge can never be re-linked -- which makes the unkeyed
+    // population, not the failing one, the ceiling on whole-edge acceptance. Only the
+    // writer can name these: at load the recorded offset is meaningless against a
+    // rebuilt blob.
+#define UK_MAX 24
+    const char *uk_name[UK_MAX];
+    size_t uk_count[UK_MAX];
+    int nuk = 0;
     for (size_t i = 0; i < n; i++) {
         jl_value_t *v = (jl_value_t*)s->import_objs.items[i];
         uint64_t h = 0;
@@ -2353,10 +2362,28 @@ static void jl_write_import_table(jl_serializer_state *s, ios_t *f) JL_NOTSAFEPO
             ios_write(f, k.buf, len);
             keybytes += len;
         }
+        else {
+            const char *ukind = jl_typeof_str(v);
+            int q;
+            for (q = 0; q < nuk; q++)
+                if (strcmp(uk_name[q], ukind) == 0)
+                    break;
+            if (q == nuk && nuk < UK_MAX) {
+                uk_name[nuk] = ukind;
+                uk_count[nuk] = 0;
+                nuk++;
+            }
+            if (q < nuk)
+                uk_count[q]++;
+        }
     }
     ios_close(&k);
-    if (getenv("JULIA_IMPORT_KEYS"))
+    if (getenv("JULIA_IMPORT_KEYS")) {
         jl_safe_printf("IMPORTKEYS_WRITE entries=%zu keybytes=%zu\n", n, keybytes);
+        for (int q = 0; q < nuk; q++)
+            jl_safe_printf("IMPORTKEYS_UNKEYED %-20s %zu\n", uk_name[q], uk_count[q]);
+    }
+#undef UK_MAX
 }
 
 // Compute keys for every imported object and report coverage plus injectivity: two
@@ -4046,6 +4073,12 @@ static void jl_relink_probe(jl_import_table_t *tbl, jl_array_t *depmods) JL_GC_D
     // decision-relevant number is how many entries block each edge, and of what kind
     size_t *dep_mis = (size_t*)calloc(maxdep + 1, sizeof(size_t));
     size_t *dep_kind_unres = (size_t*)calloc((size_t)(maxdep + 1) * RK_MAX, sizeof(size_t));
+    // An entry the *writer* could not render carries no locator, so nothing can re-derive
+    // it and its edge can never be re-linked however good the parser gets. That makes the
+    // unkeyed population, not the failing one, the ceiling on `fully_accepted_all` -- so
+    // name what those objects are. The blob offset recorded with each entry is what
+    // identifies them here: it is the same (deps-index, offset) a reference carries.
+    size_t *dep_unkeyed = (size_t*)calloc(maxdep + 1, sizeof(size_t));
     memset(kp_ci_miss, 0, sizeof(kp_ci_miss));
     kp_ci_verbose = verbose;
     // Pass 1: resolve every locator. The identity checks wait for pass 2, because
@@ -4107,8 +4140,15 @@ static void jl_relink_probe(jl_import_table_t *tbl, jl_array_t *depmods) JL_GC_D
     for (size_t i = 0; i < tbl->n; i++) {
         uint32_t d = tbl->e[i].depsidx;
         dep_entries[d]++;
-        if (tbl->e[i].loclen == 0)
+        if (tbl->e[i].loclen == 0) {
+            // What *kind* of object this is cannot be asked here: the recorded offset is
+            // only meaningful against the layout the image was written against, and the
+            // probe runs precisely when that dependency may have been rebuilt, so the
+            // address can land mid-object. The writer names these instead (RELINK_UNKEYED
+            // below, under JULIA_IMPORT_KEYS), where the object is live.
+            dep_unkeyed[d]++;
             continue;
+        }
         dep_keyed[d]++;
         keyed++;
         jl_value_t *got = resolved_objs[i];
@@ -4252,6 +4292,9 @@ static void jl_relink_probe(jl_import_table_t *tbl, jl_array_t *depmods) JL_GC_D
         }
         jl_safe_printf("RELINK_DEP idx=%u name=%s entries=%zu keyed=%zu resolved=%zu accepted=%zu\n",
                        d, name, dep_entries[d], dep_keyed[d], dep_resolved[d], dep_accepted[d]);
+        if (dep_unkeyed[d])
+            jl_safe_printf("RELINK_UNKEYED_DEP idx=%u name=%s entries=%zu unkeyed=%zu\n",
+                           d, name, dep_entries[d], dep_unkeyed[d]);
         if (dep_accepted[d] != dep_keyed[d]) {
             // the edge is refused; name exactly what blocks it, by locator kind
             jl_safe_printf("RELINK_BLOCKED idx=%u name=%s keyed=%zu failed=%zu:",
@@ -4274,6 +4317,7 @@ static void jl_relink_probe(jl_import_table_t *tbl, jl_array_t *depmods) JL_GC_D
     free(dep_rep);
     free(dep_mis);
     free(dep_kind_unres);
+    free(dep_unkeyed);
     kp_ci_verbose = 0;
 #undef RK_MAX
 #undef RK_NEX
