@@ -1185,6 +1185,7 @@ static void extkey_build_paths(jl_array_t *mod_array) JL_NOTSAFEPOINT
         jl_module_t *m = (jl_module_t*)jl_array_ptr_ref(mod_array, mi);
         if (!jl_is_module(m))
             continue;
+        // (the module set scopes the table: see `extkey_reset_paths`)
         jl_svec_t *table = jl_atomic_load_relaxed(&m->bindings);
         for (size_t i = 0; i < jl_svec_len(table); i++) {
             jl_binding_t *b = (jl_binding_t*)jl_svecref(table, i);
@@ -1211,6 +1212,23 @@ static void extkey_build_paths(jl_array_t *mod_array) JL_NOTSAFEPOINT
             *bp = e;
         }
     }
+}
+
+// Drop the path table so the next build starts from its own module set. In the writer
+// process one image is saved and the once-built table is right for its whole lifetime,
+// but the loading process restores many images in one session: a table built from the
+// first image's dependencies is missing every module only a later image depends on, so
+// a `P:`-keyed object would resolve and then fail to re-render, refusing entries whose
+// resolution was correct.
+static void extkey_reset_paths(void) JL_NOTSAFEPOINT
+{
+    if (!extkey_paths_ready)
+        return;
+    for (size_t i = 0; i < extkey_paths.size; i += 2)
+        if (extkey_paths.table[i + 1] != HT_NOTFOUND)
+            free(extkey_paths.table[i + 1]);
+    htable_free(&extkey_paths);
+    extkey_paths_ready = 0;
 }
 // The chain of `UnionAll` binders in scope while a type is being keyed, innermost first.
 // A bound `TypeVar` has no standalone identity -- only a meaning relative to the binder
@@ -3223,6 +3241,9 @@ static jl_value_t *kp_value(keyparse_t *kp, int depth) JL_GC_DISABLED;
 enum { KP_CI_OWNER, KP_CI_RETTYPE, KP_CI_EXCTYPE, KP_CI_CONST, KP_CI_PURITY, KP_CI_LIVE,
        KP_CI_EDGES, KP_CI_EMPTY, KP_CI_NOMATCH, KP_CI_NREASON };
 static size_t kp_ci_miss[KP_CI_NREASON];
+// set by `jl_relink_probe` under JULIA_PKGIMAGE_RELINK_VERBOSE so a liveness rejection
+// can show *which* state each side saw, not only that they disagreed
+static int kp_ci_verbose = 0;
 static const char *kp_ci_reason[KP_CI_NREASON] = {
     "owner", "rettype", "exctype", "rettype_const", "purity", "liveness", "edges",
     "chain_empty", "no_match"
@@ -3655,8 +3676,24 @@ static jl_value_t *kp_value(keyparse_t *kp, int depth) JL_GC_DISABLED
                 { kp_ci_miss[KP_CI_CONST]++; continue; }
             if (jl_atomic_load_relaxed(&ci->ipo_purity_bits) != purity)
                 { kp_ci_miss[KP_CI_PURITY]++; continue; }
-            if ((jl_atomic_load_relaxed(&ci->max_world) == ~(size_t)0) != live)
-                { kp_ci_miss[KP_CI_LIVE]++; continue; }
+            // A liveness rejection here is a real state difference, not two spellings of
+            // one state: measured on Makie (480 rejections under VERBOSE), every one was
+            // a key written over a live instance whose counterpart in the loading session
+            // has a finite -- or zero, never-validated -- max_world. The writer promised
+            // an instance callers may have compiled against; an invalidated instance is
+            // not that object, so refusing it is correct.
+            if ((jl_atomic_load_relaxed(&ci->max_world) == ~(size_t)0) != live) {
+                kp_ci_miss[KP_CI_LIVE]++;
+                if (kp_ci_verbose) {
+                    jl_safe_printf("RELINK_CI_LIVE want=%s got=[%zu,%zu] of ",
+                                   live ? "live" : "dead",
+                                   (size_t)jl_atomic_load_relaxed(&ci->min_world),
+                                   (size_t)jl_atomic_load_relaxed(&ci->max_world));
+                    jl_static_show(JL_STDERR, (jl_value_t*)mi->specTypes);
+                    jl_safe_printf("\n");
+                }
+                continue;
+            }
             uint64_t h;
             if (!extkey_edges_hash(ci, &h) || h != ehash)
                 { kp_ci_miss[KP_CI_EDGES]++; continue; }
@@ -3762,6 +3799,27 @@ static jl_value_t *kp_value(keyparse_t *kp, int depth) JL_GC_DISABLED
             return NULL;
         return jl_module_globalref(m, path[n - 1]);
     }
+    if (kp_lit(kp, "P:")) {
+        // keyed by binding path: the object has no content identity of its own, so the
+        // constant binding that holds it names it. Resolve to whatever that binding holds
+        // *now* -- the rebuilt dependency's own object -- re-checking the writer's
+        // registration conditions (resolved, constant, not a module). The digest gate
+        // then requires the resolved object to re-render to this same path, which it can
+        // only do if `extkey_build_paths` still records this binding as its deterministic
+        // winner.
+        jl_sym_t *path[SHADOW_MAX_MODPATH];
+        int n = kp_path(kp, path, SHADOW_MAX_MODPATH);
+        if (n < 2)
+            return NULL;
+        jl_module_t *m = shadow_find_module(kp->mod_array, path, n - 1);
+        if (m == NULL)
+            return NULL;
+        jl_binding_t *b = jl_get_module_binding(m, path[n - 1], 0);
+        jl_value_t *v = jl_get_latest_binding_value_if_resolved_and_const_debug_only(b);
+        if (v == NULL || jl_is_module(v))
+            return NULL;
+        return v;
+    }
     if (kp_lit(kp, "G:")) {
         // a GenericMemory is its type plus its contents: rebuild a fresh one from
         // re-derived parts, exactly as `V:` rebuilds a simple vector. The element
@@ -3848,7 +3906,7 @@ static void jl_check_key_parse(jl_serializer_state *s, jl_array_t *mod_array) JL
         size_t len = (size_t)ios_pos(&k);
         ios_putc('\0', &k);   // the key is not NUL-terminated in the stream; printing needs it
         // only the kinds this parser covers so far; the rest are counted, not guessed at
-        if (len < 2 || strchr("MNBSTObvFICVsGR#UAX@", k.buf[0]) == NULL) {
+        if (len < 2 || strchr("MNBSTObvFICVsGRP#UAX@", k.buf[0]) == NULL) {
             unsupported++;
             continue;
         }
@@ -3937,6 +3995,7 @@ static const char *relink_loc_kind(const char *loc, uint32_t len) JL_NOTSAFEPOIN
     case 'V': return "V: simplevec";
     case 'G': return "G: memory";
     case 'R': return "R: globalref";
+    case 'P': return "P: pathkeyed";
     case '@': return "@ reference";
     case '#': return "# binder";
     case 'A': return "A< unionall";
@@ -3958,6 +4017,8 @@ static const char *relink_loc_kind(const char *loc, uint32_t len) JL_NOTSAFEPOIN
 // answer: no reference is repointed, so a wrong answer here cannot become a wrong program.
 static void jl_relink_probe(jl_import_table_t *tbl, jl_array_t *depmods) JL_GC_DISABLED
 {
+    // scoped to this image's dependency set, like the type-variable table below
+    extkey_reset_paths();
     extkey_build_paths(depmods);
     int verbose = getenv("JULIA_PKGIMAGE_RELINK_VERBOSE") != NULL;
     size_t keyed = 0, resolved = 0, accepted = 0, unresolved = 0, digest_bad = 0;
@@ -3981,7 +4042,12 @@ static void jl_relink_probe(jl_import_table_t *tbl, jl_array_t *depmods) JL_GC_D
     size_t *dep_resolved = (size_t*)calloc(maxdep + 1, sizeof(size_t));
     size_t *dep_accepted = (size_t*)calloc(maxdep + 1, sizeof(size_t));
     jl_value_t **dep_rep = (jl_value_t**)calloc(maxdep + 1, sizeof(jl_value_t*));
+    // per-dependency failure breakdown: one failing entry refuses a whole edge, so the
+    // decision-relevant number is how many entries block each edge, and of what kind
+    size_t *dep_mis = (size_t*)calloc(maxdep + 1, sizeof(size_t));
+    size_t *dep_kind_unres = (size_t*)calloc((size_t)(maxdep + 1) * RK_MAX, sizeof(size_t));
     memset(kp_ci_miss, 0, sizeof(kp_ci_miss));
+    kp_ci_verbose = verbose;
     // Pass 1: resolve every locator. The identity checks wait for pass 2, because
     // re-rendering an object that contains a bare TypeVar needs the type-variable table
     // below, and that table is built from the resolved objects.
@@ -4055,7 +4121,10 @@ static void jl_relink_probe(jl_import_table_t *tbl, jl_array_t *depmods) JL_GC_D
             if (extkey_hash(got, &h) && h == tbl->e[i].digest) {
                 accepted++;
                 dep_accepted[d]++;
-                if (dep_rep[d] == NULL)
+                // the name below comes from the representative's blob, so a rebuilt
+                // object (a fresh svec or re-boxed immutable lives in no blob) cannot
+                // serve as one
+                if (dep_rep[d] == NULL && external_blob_index(got) < n_linkage_blobs())
                     dep_rep[d] = got;
                 tbl->e[i].resolved = got;
             }
@@ -4111,6 +4180,7 @@ static void jl_relink_probe(jl_import_table_t *tbl, jl_array_t *depmods) JL_GC_D
             if (q < nrk) {
                 if (failed) {
                     rk_unres[q]++;
+                    dep_kind_unres[(size_t)d * RK_MAX + q]++;
                     if (rk_nex[q] < RK_NEX) {
                         rk_ex[q][rk_nex[q]] = i;
                         rk_exat[q][rk_nex[q]] = fail_at[i];
@@ -4119,6 +4189,7 @@ static void jl_relink_probe(jl_import_table_t *tbl, jl_array_t *depmods) JL_GC_D
                 }
                 else {
                     rk_mis[q]++;
+                    dep_mis[d]++;
                 }
             }
         }
@@ -4181,6 +4252,17 @@ static void jl_relink_probe(jl_import_table_t *tbl, jl_array_t *depmods) JL_GC_D
         }
         jl_safe_printf("RELINK_DEP idx=%u name=%s entries=%zu keyed=%zu resolved=%zu accepted=%zu\n",
                        d, name, dep_entries[d], dep_keyed[d], dep_resolved[d], dep_accepted[d]);
+        if (dep_accepted[d] != dep_keyed[d]) {
+            // the edge is refused; name exactly what blocks it, by locator kind
+            jl_safe_printf("RELINK_BLOCKED idx=%u name=%s keyed=%zu failed=%zu:",
+                           d, name, dep_keyed[d], dep_keyed[d] - dep_accepted[d]);
+            for (int q = 0; q < nrk; q++)
+                if (dep_kind_unres[(size_t)d * RK_MAX + q])
+                    jl_safe_printf(" [%s]=%zu", rk_name[q], dep_kind_unres[(size_t)d * RK_MAX + q]);
+            if (dep_mis[d])
+                jl_safe_printf(" [digest_mismatch]=%zu", dep_mis[d]);
+            jl_safe_printf("\n");
+        }
     }
     jl_safe_printf("RELINK_DEPS ndeps=%zu fully_accepted_keyed=%zu (%.1f%%) fully_accepted_all=%zu (%.1f%%)\n",
                    ndeps, full_keyed, ndeps ? 100.0 * (double)full_keyed / (double)ndeps : 0.0,
@@ -4190,6 +4272,9 @@ static void jl_relink_probe(jl_import_table_t *tbl, jl_array_t *depmods) JL_GC_D
     free(dep_resolved);
     free(dep_accepted);
     free(dep_rep);
+    free(dep_mis);
+    free(dep_kind_unres);
+    kp_ci_verbose = 0;
 #undef RK_MAX
 #undef RK_NEX
 }
