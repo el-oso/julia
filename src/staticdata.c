@@ -1792,8 +1792,17 @@ static int extkey_write(ios_t *k, jl_value_t *v, int depth) JL_NOTSAFEPOINT
             return 0;
         // Entries in one method instance's cache chain can agree on all of the above and
         // differ only in their edges, so the edge set has to take part in the identity.
+        // The edge digest is identity data even inside a locator: it is a hash, so it can
+        // only ever be compared, and it is compared against one recomputed from a live
+        // candidate with no import table in hand. Rendering the edges with references on
+        // made those two disagree for 65 of SparseArrays' code instances -- every one of
+        // them a candidate that matched on every other field.
         uint64_t ehash;
-        if (!extkey_edges_hash(ci, &ehash))
+        htable_t *saved_refs = extkey_import_index;
+        extkey_import_index = NULL;
+        int edges_ok = extkey_edges_hash(ci, &ehash);
+        extkey_import_index = saved_refs;
+        if (!edges_ok)
             return 0;
         ios_printf(k, "/E%016" PRIx64, ehash);
         // The remaining inference results a caller can have specialized against. Omitting
@@ -3146,6 +3155,16 @@ static jl_value_t *kp_param(keyparse_t *kp, int depth, int tdepth) JL_GC_DISABLE
 
 static jl_value_t *kp_value(keyparse_t *kp, int depth) JL_GC_DISABLED;
 
+// why a code instance was not found, counted per candidate rejected and per lookup that
+// found nothing: "which field disagrees" is the whole question for the chain walk
+enum { KP_CI_OWNER, KP_CI_RETTYPE, KP_CI_EXCTYPE, KP_CI_CONST, KP_CI_PURITY, KP_CI_LIVE,
+       KP_CI_EDGES, KP_CI_EMPTY, KP_CI_NOMATCH, KP_CI_NREASON };
+static size_t kp_ci_miss[KP_CI_NREASON];
+static const char *kp_ci_reason[KP_CI_NREASON] = {
+    "owner", "rettype", "exctype", "rettype_const", "purity", "liveness", "edges",
+    "chain_empty", "no_match"
+};
+
 // `@i` -- resolve import entry `i` by resolving its own locator. The recursion terminates
 // because a locator cites only entries it does not itself contain, and an in-progress mark
 // refuses the case where that stops being true rather than looping.
@@ -3491,25 +3510,29 @@ static jl_value_t *kp_value(keyparse_t *kp, int depth) JL_GC_DISABLED
         else
             return NULL;
         jl_method_instance_t *mi = (jl_method_instance_t*)miv;
+        size_t nchain = 0;
         for (jl_code_instance_t *ci = jl_atomic_load_relaxed(&mi->cache); ci != NULL;
              ci = jl_atomic_load_relaxed(&ci->next)) {
+            nchain++;
             if (!jl_egal(ci->owner, owner))
-                continue;
-            if (!jl_types_equal(ci->rettype, rettype) || !jl_types_equal(ci->exctype, exctype))
-                continue;
-            if ((rtc == NULL) != (ci->rettype_const == NULL))
-                continue;
-            if (rtc != NULL && !jl_egal(rtc, ci->rettype_const))
-                continue;
+                { kp_ci_miss[KP_CI_OWNER]++; continue; }
+            if (!jl_types_equal(ci->rettype, rettype))
+                { kp_ci_miss[KP_CI_RETTYPE]++; continue; }
+            if (!jl_types_equal(ci->exctype, exctype))
+                { kp_ci_miss[KP_CI_EXCTYPE]++; continue; }
+            if ((rtc == NULL) != (ci->rettype_const == NULL) ||
+                (rtc != NULL && !jl_egal(rtc, ci->rettype_const)))
+                { kp_ci_miss[KP_CI_CONST]++; continue; }
             if (jl_atomic_load_relaxed(&ci->ipo_purity_bits) != purity)
-                continue;
+                { kp_ci_miss[KP_CI_PURITY]++; continue; }
             if ((jl_atomic_load_relaxed(&ci->max_world) == ~(size_t)0) != live)
-                continue;
+                { kp_ci_miss[KP_CI_LIVE]++; continue; }
             uint64_t h;
             if (!extkey_edges_hash(ci, &h) || h != ehash)
-                continue;
+                { kp_ci_miss[KP_CI_EDGES]++; continue; }
             return (jl_value_t*)ci;
         }
+        kp_ci_miss[nchain == 0 ? KP_CI_EMPTY : KP_CI_NOMATCH]++;
         return NULL;
     }
     if (kp_lit(kp, "O:")) {
@@ -3622,6 +3645,10 @@ static void jl_check_key_parse(jl_serializer_state *s, jl_array_t *mod_array) JL
     free(memo_state);
     jl_safe_printf("KEYPARSE keyed=%zu covered=%zu same=%zu differs=%zu unparsed=%zu trailing=%zu out_of_scope=%zu\n",
                    keyed, attempted, same, differs, unparsed, trailing, unsupported);
+    for (int r = 0; r < KP_CI_NREASON; r++)
+        if (kp_ci_miss[r])
+            jl_safe_printf("KEYPARSE_CI %-14s %zu\n", kp_ci_reason[r], kp_ci_miss[r]);
+    memset(kp_ci_miss, 0, sizeof(kp_ci_miss));
     jl_safe_printf("KEYSIZE identity=%zu locator=%zu ratio=%.1fx\n",
                    idbytes, locbytes, locbytes ? (double)idbytes / (double)locbytes : 0.0);
 }
