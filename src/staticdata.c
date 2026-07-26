@@ -3924,24 +3924,18 @@ static jl_value_t *kp_value(keyparse_t *kp, int depth) JL_GC_DISABLED
                 { kp_ci_miss[KP_CI_CONST]++; continue; }
             if (jl_atomic_load_relaxed(&ci->ipo_purity_bits) != purity)
                 { kp_ci_miss[KP_CI_PURITY]++; continue; }
-            // A liveness rejection here is a real state difference, not two spellings of
-            // one state: measured on Makie (480 rejections under VERBOSE), every one was
-            // a key written over a live instance whose counterpart in the loading session
-            // has a finite -- or zero, never-validated -- max_world. The writer promised
-            // an instance callers may have compiled against; an invalidated instance is
-            // not that object, so refusing it is correct.
-            if ((jl_atomic_load_relaxed(&ci->max_world) == ~(size_t)0) != live) {
-                kp_ci_miss[KP_CI_LIVE]++;
-                if (kp_ci_verbose) {
-                    jl_safe_printf("RELINK_CI_LIVE want=%s got=[%zu,%zu] of ",
-                                   live ? "live" : "dead",
-                                   (size_t)jl_atomic_load_relaxed(&ci->min_world),
-                                   (size_t)jl_atomic_load_relaxed(&ci->max_world));
-                    jl_static_show(JL_STDERR, (jl_value_t*)mi->specTypes);
-                    jl_safe_printf("\n");
-                }
-                continue;
-            }
+            // Liveness is deliberately *not* a filter here, though the key records it.
+            // Whether an instance has been invalidated is a property of the loading
+            // session, not of the object: measured against ground truth, the same code
+            // instance was dead when one image was written and live when that image was
+            // loaded, and dead-now where the key said live. Filtering on it therefore
+            // does not select the object the reference names, it selects whichever
+            // sibling happens to be in the recorded state -- which is how a key that
+            // reads `D` resolved to a sibling instead of to the instance the reference
+            // means. Ignoring it makes the two siblings indistinguishable, so the
+            // ambiguity check below refuses, and the digest gate (which does still carry
+            // the bit) refuses a state that no longer matches. Both cost a rebuild.
+            (void)live;
             uint64_t h;
             if (!extkey_edges_hash(ci, &h) || h != ehash)
                 { kp_ci_miss[KP_CI_EDGES]++; continue; }
