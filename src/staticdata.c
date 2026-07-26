@@ -2261,10 +2261,20 @@ static void jl_write_import_table(jl_serializer_state *s, ios_t *f) JL_NOTSAFEPO
     ios_mem(&k, 4096);
     size_t keybytes = 0;
     for (size_t i = 0; i < n; i++) {
+        jl_value_t *v = (jl_value_t*)s->import_objs.items[i];
         uint64_t h = 0;
-        extkey_hash((jl_value_t*)s->import_objs.items[i], &h);
+        extkey_hash(v, &h);
         write_uint32(f, (uint32_t)(uintptr_t)s->import_deps.items[i]);
         write_uint64(f, h);
+        // The offset this object has in its owning blob, which is what every reference to
+        // it in this image carries. Recording it is what lets a relink find the entry a
+        // reference belongs to without changing how references are encoded: the loader
+        // maps (deps-index, offset) to the object it resolved, and only on the slow path.
+        size_t blob = external_blob_index(v);
+        uint64_t off = 0;
+        if (blob < n_linkage_blobs())
+            off = ((uintptr_t)v - (uintptr_t)jl_linkage_blobs.items[2 * blob]) / SYS_EXTERNAL_LINK_UNIT;
+        write_uint64(f, off);
         // The digest alone cannot be turned back into the object it names -- it is not
         // invertible -- so resolution against a rebuilt dependency needs the key itself.
         // The digest stays as the *verification*: resolution finds a candidate through the
@@ -3043,6 +3053,22 @@ static jl_value_t *shadow_resolve(jl_array_t *mod_array, jl_value_t *v, int *kin
 }
 
 // Runs inside the JL_GC_DISABLED region of the save, like the uniquing calls it mirrors.
+// The loader-side shape of the import table, declared here because the parser resolves
+// `@i` against it; defined below with the probe that uses it.
+typedef struct jl_import_entry_t {
+    uint32_t depsidx;
+    uint32_t loclen;
+    uint64_t digest;
+    uint64_t offset;
+    char *loc;
+    jl_value_t *resolved;
+} jl_import_entry_t;
+
+typedef struct jl_import_table_t {
+    size_t n;
+    jl_import_entry_t *e;
+} jl_import_table_t;
+
 // ---- Reading a key back into the object it names ----
 //
 // The shadow pass above re-derives an import from the *live object*, which shows the
@@ -3059,6 +3085,7 @@ typedef struct {
     // and a memo: a locator graph is shared, not a tree, and re-deriving a shared entry
     // once per citation is what makes a naive resolver quadratic.
     jl_serializer_state *st;
+    struct jl_import_table_t *tbl;   // set instead of `st` when reading a loaded table
     jl_value_t **memo;
     char *memo_state;   // 0 unvisited, 1 resolved, 2 in progress
     size_t nmemo;
@@ -3167,7 +3194,7 @@ static const char *kp_ci_reason[KP_CI_NREASON] = {
 // refuses the case where that stops being true rather than looping.
 static jl_value_t *kp_ref(keyparse_t *kp, size_t idx) JL_GC_DISABLED
 {
-    if (idx == 0 || idx > kp->nmemo || kp->st == NULL)
+    if (idx == 0 || idx > kp->nmemo)
         return NULL;
     size_t i = idx - 1;
     if (kp->memo_state[i] == 1)
@@ -3175,17 +3202,34 @@ static jl_value_t *kp_ref(keyparse_t *kp, size_t idx) JL_GC_DISABLED
     if (kp->memo_state[i] == 2)
         return NULL;
     kp->memo_state[i] = 2;
+    // The cited entry's locator comes either from the table being read, which is the case
+    // that matters, or is re-rendered from the live object, which is how the self-check
+    // exercises the same path at save time.
+    const char *loc = NULL;
+    size_t loclen = 0;
     ios_t k;
-    ios_mem(&k, 256);
-    extkey_import_index = &kp->st->import_index;
-    int ok = extkey_write(&k, (jl_value_t*)kp->st->import_objs.items[i], 0);
-    extkey_import_index = NULL;
+    int rendered = 0;
+    if (kp->tbl != NULL) {
+        loc = kp->tbl->e[i].loc;
+        loclen = kp->tbl->e[i].loclen;
+    }
+    else if (kp->st != NULL) {
+        ios_mem(&k, 256);
+        rendered = 1;
+        extkey_import_index = &kp->st->import_index;
+        int ok = extkey_write(&k, (jl_value_t*)kp->st->import_objs.items[i], 0);
+        extkey_import_index = NULL;
+        if (ok) {
+            loc = k.buf;
+            loclen = (size_t)ios_pos(&k);
+        }
+    }
     jl_value_t *got = NULL;
-    if (ok) {
+    if (loc != NULL && loclen != 0) {
         const char *savep = kp->p, *saveend = kp->end;
         int savenbind = kp->nbind;
-        kp->p = k.buf;
-        kp->end = k.buf + ios_pos(&k);
+        kp->p = loc;
+        kp->end = loc + loclen;
         kp->nbind = 0;
         got = kp_value(kp, 0);
         if (got != NULL && kp->p != kp->end)
@@ -3194,7 +3238,8 @@ static jl_value_t *kp_ref(keyparse_t *kp, size_t idx) JL_GC_DISABLED
         kp->end = saveend;
         kp->nbind = savenbind;
     }
-    ios_close(&k);
+    if (rendered)
+        ios_close(&k);
     kp->memo[i] = got;
     kp->memo_state[i] = got != NULL ? 1 : 0;
     return got;
@@ -3608,6 +3653,7 @@ static void jl_check_key_parse(jl_serializer_state *s, jl_array_t *mod_array) JL
         kp.end = k.buf + len;
         kp.mod_array = mod_array;
         kp.st = s;
+        kp.tbl = NULL;
         kp.memo = memo;
         kp.memo_state = memo_state;
         kp.nmemo = n;
@@ -3657,6 +3703,57 @@ static void jl_check_key_parse(jl_serializer_state *s, jl_array_t *mod_array) JL
     memset(kp_ci_miss, 0, sizeof(kp_ci_miss));
     jl_safe_printf("KEYSIZE identity=%zu locator=%zu ratio=%.1fx\n",
                    idbytes, locbytes, locbytes ? (double)idbytes / (double)locbytes : 0.0);
+}
+
+// ---- The import table as the loader sees it ----
+//
+// At save time the table is a list of live objects. At load time it is this: a deps-index,
+// the offset the object had in that dependency's blob, the identity digest, and the
+// locator. The offset is what ties an entry back to the references that point at it,
+// without any change to how a reference is encoded.
+// Resolve every locator in a loaded table against the dependencies as they exist *now*,
+// and accept an entry only when the object found reproduces the digest recorded for it.
+// This is the load-time half of the scheme, doing the work but not yet consuming the
+// answer: no reference is repointed, so a wrong answer here cannot become a wrong program.
+static void jl_relink_probe(jl_import_table_t *tbl, jl_array_t *depmods) JL_GC_DISABLED
+{
+    extkey_build_paths(depmods);
+    size_t keyed = 0, resolved = 0, accepted = 0, unresolved = 0, digest_bad = 0;
+    jl_value_t **memo = (jl_value_t**)calloc(tbl->n ? tbl->n : 1, sizeof(jl_value_t*));
+    char *state = (char*)calloc(tbl->n ? tbl->n : 1, 1);
+    for (size_t i = 0; i < tbl->n; i++) {
+        if (tbl->e[i].loclen == 0)
+            continue;
+        keyed++;
+        keyparse_t kp;
+        kp.p = tbl->e[i].loc;
+        kp.end = kp.p + tbl->e[i].loclen;
+        kp.mod_array = depmods;
+        kp.st = NULL;
+        kp.tbl = tbl;
+        kp.memo = memo;
+        kp.memo_state = state;
+        kp.nmemo = tbl->n;
+        kp.nbind = 0;
+        jl_value_t *got = kp_value(&kp, 0);
+        if (got == NULL || kp.p != kp.end) {
+            unresolved++;
+            continue;
+        }
+        resolved++;
+        uint64_t h = 0;
+        if (extkey_hash(got, &h) && h == tbl->e[i].digest) {
+            accepted++;
+            tbl->e[i].resolved = got;
+        }
+        else {
+            digest_bad++;
+        }
+    }
+    free(memo);
+    free(state);
+    jl_safe_printf("RELINK_PROBE entries=%zu keyed=%zu resolved=%zu accepted=%zu unresolved=%zu digest_mismatch=%zu\n",
+                   tbl->n, keyed, resolved, accepted, unresolved, digest_bad);
 }
 
 static void jl_shadow_resolve_imports(jl_serializer_state *s, jl_array_t *mod_array) JL_GC_DISABLED
@@ -6580,16 +6677,40 @@ static void jl_restore_system_image_from_stream_(ios_t *f, jl_image_t *image,
     {   // import table, written by jl_write_import_table
         size_t nimports = read_uint32(f);
         size_t nkeyed = 0, keybytes = 0;
+        jl_import_table_t *itbl = NULL;
+        int want_relink = getenv("JULIA_PKGIMAGE_RELINK") != NULL;
+        if (want_relink && nimports) {
+            itbl = (jl_import_table_t*)calloc(1, sizeof(jl_import_table_t));
+            itbl->n = nimports;
+            itbl->e = (jl_import_entry_t*)calloc(nimports, sizeof(jl_import_entry_t));
+        }
         for (size_t i = 0; i < nimports; i++) {
-            (void)read_uint32(f);   // owning image's deps-index
-            if (read_uint64(f))     // content key digest, 0 when there is no stable one
+            uint32_t depsidx = read_uint32(f);
+            uint64_t digest = read_uint64(f);
+            if (digest)
                 nkeyed++;
-            size_t len = read_uint32(f);   // the key itself, for re-deriving the object
+            uint64_t off = read_uint64(f);
+            size_t len = read_uint32(f);   // the locator, for re-deriving the object
+            if (itbl) {
+                itbl->e[i].depsidx = depsidx;
+                itbl->e[i].digest = digest;
+                itbl->e[i].offset = off;
+                itbl->e[i].loclen = (uint32_t)len;
+                if (len) {
+                    itbl->e[i].loc = (char*)malloc_s(len + 1);
+                    ios_read(f, itbl->e[i].loc, len);
+                    itbl->e[i].loc[len] = '\0';
+                    keybytes += len;
+                    continue;
+                }
+            }
             if (len) {
                 keybytes += len;
                 ios_skip(f, len);
             }
         }
+        if (itbl)
+            jl_relink_probe(itbl, depmods);
         if (getenv("JULIA_IMPORT_KEYS"))
             jl_safe_printf("IMPORTKEYS_READ entries=%zu keyed=%zu keybytes=%zu\n",
                            nimports, nkeyed, keybytes);
