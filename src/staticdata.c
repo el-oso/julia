@@ -470,9 +470,22 @@ JL_DLLEXPORT int jl_running_on_valgrind(void)
 // import-table entry resolvable. The `edges` simplevectors holding nested DebugInfo are
 // reached by the same path and copied for the same reason (their key would be a list of
 // those same digests).
+//
+// A String is copied for the same reason and at a lower price. Its key can only be its
+// bytes, and a parser handed those bytes can allocate an equal string but can never
+// locate the one the dependency owns, so every cross-image string reference is refused
+// on re-link. Copying is free of semantic consequence here in a way it would not be for
+// most objects: `jl_egal` on strings is a memcmp (builtins.c, the `jl_string_tag` case)
+// and `jl_object_id` of a string hashes its bytes, so a copy is `===` the original, has
+// the same `objectid`, and is found by an `IdDict` lookup under the original. The only
+// thing that differs is the address, which is not stable across builds anyway. Unlike
+// DebugInfo a string has no pointer fields, so copying it exposes no new leaves as
+// imports of their own.
 static int jl_copy_instead_of_import(jl_value_t *v) JL_NOTSAFEPOINT
 {
     if (jl_typetagis(v, jl_debuginfo_type))
+        return 1;
+    if (jl_is_string(v))
         return 1;
     if (jl_is_svec(v)) {
         size_t i, l = jl_svec_len(v);
