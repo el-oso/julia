@@ -453,10 +453,35 @@ JL_DLLEXPORT int jl_running_on_valgrind(void)
 
 #define NBOX_C 1024
 
+// DebugInfo owned by another image is copied into the image being written instead of
+// being referenced across images: it is immutable content with no stable name, so a
+// cross-image reference could only be keyed by a content digest, which a loader cannot
+// invert to locate the object again. Copying trades image size for keeping every
+// import-table entry resolvable. The `edges` simplevectors holding nested DebugInfo are
+// reached by the same path and copied for the same reason (their key would be a list of
+// those same digests).
+static int jl_copy_instead_of_import(jl_value_t *v) JL_NOTSAFEPOINT
+{
+    if (jl_typetagis(v, jl_debuginfo_type))
+        return 1;
+    if (jl_is_svec(v)) {
+        size_t i, l = jl_svec_len(v);
+        if (l == 0)
+            return 0;
+        for (i = 0; i < l; i++) {
+            jl_value_t *e = jl_svecref(v, i);
+            if (e == NULL || !jl_typetagis(e, jl_debuginfo_type))
+                return 0;
+        }
+        return 1;
+    }
+    return 0;
+}
+
 static int jl_needs_serialization(jl_serializer_state *s, jl_value_t *v) JL_NOTSAFEPOINT
 {
     // ignore items that are given a special relocation representation
-    if (s->incremental && jl_object_in_image(v))
+    if (s->incremental && jl_object_in_image(v) && !jl_copy_instead_of_import(v))
         return 0;
 
     if (v == NULL || jl_is_symbol(v) || v == jl_nothing) {
@@ -519,7 +544,7 @@ static int needs_recaching(jl_value_t *v, jl_query_cache *query_cache) JL_NOTSAF
 
 static int needs_uniquing(jl_value_t *v, jl_query_cache *query_cache) JL_NOTSAFEPOINT
 {
-    assert(!jl_object_in_image(v));
+    assert(!jl_object_in_image(v) || jl_copy_instead_of_import(v));
     return caching_tag(v, query_cache) == 1;
 }
 
@@ -4068,7 +4093,7 @@ static uintptr_t _backref_id(jl_serializer_state *s, jl_value_t *v, jl_array_t *
         uint8_t u8 = *(uint8_t*)v;
         return ((uintptr_t)TagRef << RELOC_TAG_OFFSET) + u8 + 2 + NBOX_C + NBOX_C;
     }
-    if (s->incremental && jl_object_in_image(v)) {
+    if (s->incremental && jl_object_in_image(v) && !jl_copy_instead_of_import(v)) {
         assert(link_ids);
         uintptr_t item = add_external_linkage(s, v, link_ids);
         assert(item && "no external linkage identified");
@@ -4284,7 +4309,7 @@ static void jl_write_values(jl_serializer_state *s) JL_GC_DISABLED
     for (size_t item = 0; item < l; item++) {
         jl_value_t *v = (jl_value_t*)serialization_queue.items[item];           // the object
         JL_GC_PROMISE_ROOTED(v);
-        assert(!(s->incremental && jl_object_in_image(v)));
+        assert(!(s->incremental && jl_object_in_image(v)) || jl_copy_instead_of_import(v));
         jl_datatype_t *t = (jl_datatype_t*)jl_typeof(v);
         assert((!jl_is_datatype_singleton(t) || t->instance == v) && "detected singleton construction corruption");
         int mutabl = t->name->mutabl;
