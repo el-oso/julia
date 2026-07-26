@@ -3672,6 +3672,60 @@ static jl_value_t *kp_value(keyparse_t *kp, int depth) JL_GC_DISABLED
             return NULL;
         return jl_new_bits(t, bytes);
     }
+    if (kp_lit(kp, "v:")) {
+        // a general immutable struct: its type plus its fields. Rebuild a fresh object
+        // from re-derived parts, exactly as `b:` re-boxes -- the serialized pointer is
+        // an address, never content. `jl_egal` on immutables compares field-wise, so the
+        // rebuilt object is the object. The field-wise writes below mirror the writer:
+        // pointer fields recurse, inline fields are bytes, and the inline conditions
+        // (concrete datatype, no pointers, no padding) are re-checked so that a byte run
+        // is only ever interpreted the way it was written.
+        jl_value_t *t = kp_type(kp, depth, 0);
+        if (t == NULL || !jl_is_datatype(t) || !kp_char(kp, '{'))
+            return NULL;
+        jl_datatype_t *dt = (jl_datatype_t*)t;
+        if (!jl_is_immutable(dt) || !dt->isconcretetype || dt->layout == NULL ||
+            jl_is_layout_opaque(dt->layout) || dt->instance != NULL)
+            return NULL;
+        size_t nf = jl_datatype_nfields(dt);
+        if (nf == 0)
+            return NULL;
+        // zero-initialized, so a `0` (NULL) pointer slot needs no write
+        jl_value_t *v = jl_new_struct_uninit(dt);
+        for (size_t i = 0; i < nf; i++) {
+            if (i && !kp_char(kp, ','))
+                return NULL;
+            if (jl_field_isptr(dt, i)) {
+                if (kp_char(kp, '0'))
+                    continue;
+                jl_value_t *fv = kp_param(kp, depth + 1, 0);
+                if (fv == NULL)
+                    return NULL;
+                *(jl_value_t**)((char*)v + jl_field_offset(dt, i)) = fv;
+                jl_gc_wb(v, fv);
+            }
+            else {
+                jl_value_t *ft = jl_field_type_concrete(dt, i);
+                if (!jl_is_datatype(ft))
+                    return NULL;
+                const jl_datatype_layout_t *flo = ((jl_datatype_t*)ft)->layout;
+                if (flo == NULL || flo->npointers != 0 || flo->flags.haspadding)
+                    return NULL;
+                size_t fsz = jl_field_size(dt, i);
+                char *fp = (char*)v + jl_field_offset(dt, i);
+                for (size_t b = 0; b < fsz; b++) {
+                    if (kp->p + 2 > kp->end)
+                        return NULL;
+                    int hi = kp_hexdigit(*kp->p++);
+                    int lo = kp_hexdigit(*kp->p++);
+                    if (hi < 0 || lo < 0)
+                        return NULL;
+                    fp[b] = (char)((hi << 4) | lo);
+                }
+            }
+        }
+        return kp_char(kp, '}') ? v : NULL;
+    }
     return kp_type(kp, depth, 0);
 }
 
@@ -3707,7 +3761,7 @@ static void jl_check_key_parse(jl_serializer_state *s, jl_array_t *mod_array) JL
         size_t len = (size_t)ios_pos(&k);
         ios_putc('\0', &k);   // the key is not NUL-terminated in the stream; printing needs it
         // only the kinds this parser covers so far; the rest are counted, not guessed at
-        if (len < 2 || strchr("MNBSTObFICVs#UAX@", k.buf[0]) == NULL) {
+        if (len < 2 || strchr("MNBSTObvFICVs#UAX@", k.buf[0]) == NULL) {
             unsupported++;
             continue;
         }
