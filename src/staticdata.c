@@ -2326,8 +2326,11 @@ static void jl_write_import_table(jl_serializer_state *s, ios_t *f) JL_NOTSAFEPO
     // writer can name these: at load the recorded offset is meaningless against a
     // rebuilt blob.
 #define UK_MAX 24
+#define UK_NEX 2
     const char *uk_name[UK_MAX];
     size_t uk_count[UK_MAX];
+    jl_value_t *uk_ex[UK_MAX][UK_NEX];
+    size_t uk_nex[UK_MAX];
     int nuk = 0;
     for (size_t i = 0; i < n; i++) {
         jl_value_t *v = (jl_value_t*)s->import_objs.items[i];
@@ -2374,19 +2377,48 @@ static void jl_write_import_table(jl_serializer_state *s, ios_t *f) JL_NOTSAFEPO
             if (q == nuk && nuk < UK_MAX) {
                 uk_name[nuk] = ukind;
                 uk_count[nuk] = 0;
+                uk_nex[nuk] = 0;
                 nuk++;
             }
-            if (q < nuk)
+            if (q < nuk) {
                 uk_count[q]++;
+                if (uk_nex[q] < UK_NEX)
+                    uk_ex[q][uk_nex[q]++] = v;
+            }
         }
     }
     ios_close(&k);
     if (getenv("JULIA_IMPORT_KEYS")) {
         jl_safe_printf("IMPORTKEYS_WRITE entries=%zu keybytes=%zu\n", n, keybytes);
-        for (int q = 0; q < nuk; q++)
+        for (int q = 0; q < nuk; q++) {
             jl_safe_printf("IMPORTKEYS_UNKEYED %-20s %zu\n", uk_name[q], uk_count[q]);
+            for (size_t x = 0; x < uk_nex[q]; x++) {
+                // just the name: `jl_static_show` recurses without a depth limit and
+                // overflows the stack on the cyclic objects that land here
+                jl_value_t *e = uk_ex[q][x];
+                jl_datatype_t *dt = jl_is_datatype(e) ? (jl_datatype_t*)e : NULL;
+                if (jl_is_code_instance(e))
+                    dt = (jl_datatype_t*)jl_typeof(e);
+                jl_method_instance_t *emi = NULL;
+                if (jl_is_code_instance(e))
+                    emi = jl_get_ci_mi((jl_code_instance_t*)e);
+                else if (jl_is_method_instance(e))
+                    emi = (jl_method_instance_t*)e;
+                if (emi && jl_is_method(emi->def.method))
+                    jl_safe_printf("IMPORTKEYS_UNKEYED_EX %-16s %s.%s\n", uk_name[q],
+                                   jl_symbol_name(emi->def.method->module->name),
+                                   jl_symbol_name(emi->def.method->name));
+                else if (dt && jl_is_datatype(e))
+                    jl_safe_printf("IMPORTKEYS_UNKEYED_EX %-16s %s.%s\n", uk_name[q],
+                                   jl_symbol_name(dt->name->module->name),
+                                   jl_symbol_name(dt->name->name));
+                else
+                    jl_safe_printf("IMPORTKEYS_UNKEYED_EX %-16s (unnamed)\n", uk_name[q]);
+            }
+        }
     }
 #undef UK_MAX
+#undef UK_NEX
 }
 
 // Compute keys for every imported object and report coverage plus injectivity: two
