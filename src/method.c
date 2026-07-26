@@ -1650,6 +1650,17 @@ jl_value_t *lookup_root(jl_method_t *m, uint64_t key, int index)
     }
     rle_reference rr = {key, index};
     size_t i = rle_reference_to_index(&rr, jl_array_data(m->root_blocks, uint64_t), jl_array_nrows(m->root_blocks), 0);
+    if (i == RLE_NOTFOUND || i >= jl_array_nrows(m->roots)) {
+        // A repointed pkgimage's IR cites roots under the build_id its dependency had
+        // when the image was written. The repoint verified each contributor's root
+        // sequence through the method digests before registering the alias, so the same
+        // index under the rebuilt module's build_id names the same value.
+        uint64_t alt = jl_relink_buildid_alias(key);
+        if (alt != 0) {
+            rle_reference ar = {alt, index};
+            i = rle_reference_to_index(&ar, jl_array_data(m->root_blocks, uint64_t), jl_array_nrows(m->root_blocks), 0);
+        }
+    }
     // The key is the build_id of the module that contributed the root, so a reference
     // written against a different build of that module names a block this method does not
     // have. Reading `m->roots` at whatever index came back would hand out an unrelated

@@ -951,6 +951,44 @@ static size_t relink_mismatched_ndeps = 0;
 // this image's own bytes wherever it cites one. See `relink_scan_for_key`.
 static uint64_t *relink_dep_buildid = NULL;
 static size_t relink_ndep_buildids = 0;
+// build_id aliases: when an image is repointed at a rebuilt dependency after every method
+// it imports verified -- roots included -- its compressed IR still cites method roots
+// under the build_id the dependency had when the image was written. The citation is
+// (contributing module's build_id.lo, index within that module's roots), and the index is
+// sound against the rebuilt module precisely because the method digests committed to each
+// contributor's root sequence. `lookup_root` consults this table when a key matches no
+// block, translating the old build_id to the one the same dependency has now. Empty
+// unless a repoint registered an alias, so with JULIA_PKGIMAGE_RELINK unset the lookup
+// never fires.
+static uint64_t *relink_alias_old = NULL;
+static uint64_t *relink_alias_new = NULL;
+static size_t relink_alias_n = 0;
+static size_t relink_alias_cap = 0;
+
+void jl_relink_register_buildid_alias(uint64_t oldid, uint64_t newid)
+{
+    if (oldid == 0 || newid == 0 || oldid == newid)
+        return;
+    for (size_t i = 0; i < relink_alias_n; i++)
+        if (relink_alias_old[i] == oldid)
+            return;
+    if (relink_alias_n == relink_alias_cap) {
+        relink_alias_cap = relink_alias_cap ? 2 * relink_alias_cap : 8;
+        relink_alias_old = (uint64_t*)realloc_s(relink_alias_old, relink_alias_cap * sizeof(uint64_t));
+        relink_alias_new = (uint64_t*)realloc_s(relink_alias_new, relink_alias_cap * sizeof(uint64_t));
+    }
+    relink_alias_old[relink_alias_n] = oldid;
+    relink_alias_new[relink_alias_n] = newid;
+    relink_alias_n++;
+}
+
+uint64_t jl_relink_buildid_alias(uint64_t oldid) JL_NOTSAFEPOINT
+{
+    for (size_t i = 0; i < relink_alias_n; i++)
+        if (relink_alias_old[i] == oldid)
+            return relink_alias_new[i];
+    return 0;
+}
 
 static jl_value_t *read_verify_mod_list(ios_t *s, jl_array_t *depmods)
 {
