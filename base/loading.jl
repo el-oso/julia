@@ -1307,8 +1307,18 @@ function _include_from_serialized(pkg::PkgId, path::String, ocachepath::Union{No
             dep = depmods[i]
             dep isa Module && continue
             _, depkey, depbuild_id = dep::Tuple{String, PkgId, UInt128}
-            dep = something(maybe_loaded_precompile(depkey, depbuild_id))
-            @assert PkgId(dep) == depkey && module_build_id(dep) === depbuild_id
+            dep = maybe_loaded_precompile(depkey, depbuild_id)
+            if dep isa Module
+                @assert PkgId(dep) == depkey && module_build_id(dep) === depbuild_id
+            elseif get_bool_env("JULIA_PKGIMAGE_RELINK", false) === true
+                # The dependency was rebuilt, so it is not registered under the build_id
+                # this image pinned. Hand over whichever build is loaded and let the import
+                # table decide; the C side still refuses the cache if it cannot repoint.
+                dep = something(maybe_root_module(depkey))
+                @assert PkgId(dep) == depkey
+            else
+                dep = something(dep)
+            end
             depmods[i] = dep
         end
 
@@ -4240,9 +4250,19 @@ end
         id_build = (UInt128(checksum) << 64) | (id_build % UInt64)
         if build_id != UInt128(0)
             if id_build != build_id
-                @debug "Ignoring cache file $cachefile for $modkey ($(UUID(id_build))) since it does not provide desired build_id ($((UUID(build_id))))"
-                record_reason(reasons, "different build identifier")
-                return true
+                # A dependent pins each dependency by build_id, so a cold `using` asks for
+                # the build the dependent was compiled against and rejects the rebuilt one
+                # here -- before any of the relink machinery is reached. Under
+                # JULIA_PKGIMAGE_RELINK, take whichever build is installed and let the
+                # import table decide whether the dependent can be repointed at it; the C
+                # side still refuses the cache if it cannot.
+                if get_bool_env("JULIA_PKGIMAGE_RELINK", false) === true
+                    @debug "JULIA_PKGIMAGE_RELINK: accepting $cachefile ($(UUID(id_build))) for $modkey in place of build_id $(UUID(build_id))"
+                else
+                    @debug "Ignoring cache file $cachefile for $modkey ($(UUID(id_build))) since it does not provide desired build_id ($((UUID(build_id))))"
+                    record_reason(reasons, "different build identifier")
+                    return true
+                end
             end
         end
         id = id.first
