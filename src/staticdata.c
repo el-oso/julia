@@ -3721,6 +3721,7 @@ static void jl_check_key_parse(jl_serializer_state *s, jl_array_t *mod_array) JL
 static void jl_relink_probe(jl_import_table_t *tbl, jl_array_t *depmods) JL_GC_DISABLED
 {
     extkey_build_paths(depmods);
+    int verbose = getenv("JULIA_PKGIMAGE_RELINK_VERBOSE") != NULL;
     size_t keyed = 0, resolved = 0, accepted = 0, unresolved = 0, digest_bad = 0;
     jl_value_t **memo = (jl_value_t**)calloc(tbl->n ? tbl->n : 1, sizeof(jl_value_t*));
     char *state = (char*)calloc(tbl->n ? tbl->n : 1, 1);
@@ -3741,6 +3742,9 @@ static void jl_relink_probe(jl_import_table_t *tbl, jl_array_t *depmods) JL_GC_D
         jl_value_t *got = kp_value(&kp, 0);
         if (got == NULL || kp.p != kp.end) {
             unresolved++;
+            if (verbose)
+                jl_safe_printf("RELINK_UNRESOLVED at+%zu %s\n",
+                               (size_t)(kp.p - tbl->e[i].loc), tbl->e[i].loc);
             continue;
         }
         resolved++;
@@ -3751,6 +3755,9 @@ static void jl_relink_probe(jl_import_table_t *tbl, jl_array_t *depmods) JL_GC_D
         }
         else {
             digest_bad++;
+            if (verbose)
+                jl_safe_printf("RELINK_DIGEST_MISMATCH [%s] %s\n",
+                               jl_typeof_str(got), tbl->e[i].loc);
         }
     }
     free(memo);
@@ -6529,12 +6536,16 @@ static int all_usings_unchanged_implicit(jl_module_t *mod)
     return unchanged_implicit;
 }
 
-static void jl_restore_system_image_from_stream_(ios_t *f, jl_image_t *image,
-                                                 jl_array_t *depmods, uint64_t checksum,
-                                /* outputs */    jl_array_t **restored,         jl_array_t **init_order,
-                                                 jl_array_t **extext_methods, jl_array_t **internal_methods,
-                                                 jl_array_t **new_ext_cis, jl_array_t **method_roots_list,
-                                                 pkgcachesizes *cachesizes) JL_GC_DISABLED
+// Returns 0 on success, -1 when the restore was deliberately abandoned after the
+// relink probe (JULIA_PKGIMAGE_RELINK with a rebuilt dependency): the abandonment
+// happens before any relocation is applied or any global state is repointed, so the
+// caller can simply refuse the cache and fall back to recompiling.
+static int jl_restore_system_image_from_stream_(ios_t *f, jl_image_t *image,
+                                                jl_array_t *depmods, uint64_t checksum,
+                                /* outputs */   jl_array_t **restored,         jl_array_t **init_order,
+                                                jl_array_t **extext_methods, jl_array_t **internal_methods,
+                                                jl_array_t **new_ext_cis, jl_array_t **method_roots_list,
+                                                pkgcachesizes *cachesizes) JL_GC_DISABLED
 {
     jl_task_t *ct = jl_current_task;
     int en = jl_gc_enable(0);
@@ -6706,6 +6717,22 @@ static void jl_restore_system_image_from_stream_(ios_t *f, jl_image_t *image,
         if (getenv("JULIA_IMPORT_KEYS"))
             jl_safe_printf("IMPORTKEYS_READ entries=%zu keyed=%zu keybytes=%zu\n",
                            nimports, nkeyed, keybytes);
+    }
+    if (s.incremental && relink_probe_buildid_mismatch) {
+        // A dependency was rebuilt with a different build_id. The probe above has
+        // already measured what it needed; the relocations below would be applied
+        // against the wrong blob layout, so abandon the restore before touching any
+        // global state. The caller refuses the cache and Julia recompiles.
+        ios_close(&sysimg);
+        ios_close(&const_data);
+        ios_close(&symbols);
+        ios_close(&relocs);
+        ios_close(&gvar_record);
+        ios_close(&fptr_record);
+        htable_free(&new_dt_objs);
+        arraylist_free(&deser_sym);
+        jl_gc_enable(en);
+        return -1;
     }
     if (s.incremental) {
         assert(restored && init_order && extext_methods && internal_methods && new_ext_cis && method_roots_list);
@@ -7118,6 +7145,7 @@ static void jl_restore_system_image_from_stream_(ios_t *f, jl_image_t *image,
 
     if (s.incremental)
         jl_add_methods(*extext_methods);
+    return 0;
 }
 
 static jl_value_t *jl_validate_cache_file(ios_t *f, jl_array_t *depmods, uint64_t *checksum, int64_t *dataendpos, int64_t *datastartpos)
@@ -7189,8 +7217,16 @@ static jl_value_t *jl_restore_package_image_from_stream(ios_t *f, jl_image_t *im
                 ios_close(f);
             ios_static_buffer(f, sysimg, len);
             pkgcachesizes cachesizes;
-            jl_restore_system_image_from_stream_(f, image, depmods, checksum, (jl_array_t**)&restored, &init_order, &extext_methods, &internal_methods, &new_ext_cis, &method_roots_list, &cachesizes);
+            int abandoned = jl_restore_system_image_from_stream_(f, image, depmods, checksum, (jl_array_t**)&restored, &init_order, &extext_methods, &internal_methods, &new_ext_cis, &method_roots_list, &cachesizes);
             JL_SIGATOMIC_END();
+            if (abandoned) {
+                // relink probe ran against a rebuilt dependency; refuse the cache so
+                // nothing stale executes -- the caller falls back to recompiling
+                restored = jl_get_exceptionf(jl_errorexception_type,
+                        "Refusing cache for %s after relink probe: dependency build_id mismatch.", pkgname);
+                JL_GC_POP();
+                return restored;
+            }
 
             // Add roots to methods
             int failed = jl_copy_roots(method_roots_list, jl_worklist_key((jl_array_t*)restored));
