@@ -3488,14 +3488,11 @@ static jl_value_t *kp_value(keyparse_t *kp, int depth) JL_GC_DISABLED;
 
 // why a code instance was not found, counted per candidate rejected and per lookup that
 // found nothing: "which field disagrees" is the whole question for the chain walk
-enum { KP_CI_OWNER, KP_CI_RETTYPE, KP_CI_EXCTYPE, KP_CI_CONST, KP_CI_PURITY, KP_CI_LIVE,
+enum { KP_CI_OWNER, KP_CI_RETTYPE, KP_CI_EXCTYPE, KP_CI_CONST, KP_CI_PURITY,
        KP_CI_EDGES, KP_CI_EMPTY, KP_CI_NOMATCH, KP_CI_AMBIG, KP_CI_NREASON };
 static size_t kp_ci_miss[KP_CI_NREASON];
-// set by `jl_relink_probe` under JULIA_PKGIMAGE_RELINK_VERBOSE so a liveness rejection
-// can show *which* state each side saw, not only that they disagreed
-static int kp_ci_verbose = 0;
 static const char *kp_ci_reason[KP_CI_NREASON] = {
-    "owner", "rettype", "exctype", "rettype_const", "purity", "liveness", "edges",
+    "owner", "rettype", "exctype", "rettype_const", "purity", "edges",
     "chain_empty", "no_match", "ambiguous"
 };
 
@@ -4391,7 +4388,6 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
     // identifies them here: it is the same (deps-index, offset) a reference carries.
     size_t *dep_unkeyed = (size_t*)calloc(maxdep + 1, sizeof(size_t));
     memset(kp_ci_miss, 0, sizeof(kp_ci_miss));
-    kp_ci_verbose = verbose;
     // Pass 1: resolve every locator. The identity checks wait for pass 2, because
     // re-rendering an object that contains a bare TypeVar needs the type-variable table
     // below, and that table is built from the resolved objects.
@@ -4708,7 +4704,6 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
     free(dep_mis);
     free(dep_kind_unres);
     free(dep_unkeyed);
-    kp_ci_verbose = 0;
     return relinkable;
 #undef RK_MAX
 #undef RK_NEX
