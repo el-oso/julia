@@ -4303,6 +4303,48 @@ static jl_value_t *relink_compiled_ci(jl_value_t *v, uint64_t digest) JL_NOTSAFE
     return found;
 }
 
+// Diagnostic for an entry the ground-truth gate refused: what the reference means against
+// what resolution found. Kept because it is the only instrument that has ever caught this
+// class of defect, and because the interesting part is always *why* the two differ.
+static void relink_report_wrong(jl_import_table_t *tbl, size_t i, jl_value_t *want, jl_value_t *got) JL_NOTSAFEPOINT
+{
+    jl_safe_printf("RELINK_WRONG [%s] want=[%s]@%p got=[%s]@%p",
+                   relink_loc_kind(tbl->e[i].loc, tbl->e[i].loclen),
+                   jl_typeof_str(want), (void*)want, jl_typeof_str(got), (void*)got);
+    // only types are printed whole: anything else can be an arbitrarily deep graph, and a
+    // diagnostic that overflows the stack takes the load down with it
+    if (jl_is_type(want)) {
+        jl_safe_printf("\n    want=");
+        jl_static_show(JL_STDERR, want);
+        jl_safe_printf("\n    got =");
+        jl_static_show(JL_STDERR, got);
+    }
+    if (jl_is_code_instance(want) && jl_is_code_instance(got)) {
+        jl_code_instance_t *w = (jl_code_instance_t*)want;
+        jl_code_instance_t *g = (jl_code_instance_t*)got;
+        jl_method_instance_t *wmi = jl_get_ci_mi(w);
+        jl_method_instance_t *gmi = jl_get_ci_mi(g);
+        int inchain = 0;
+        for (jl_code_instance_t *c = jl_atomic_load_relaxed(&gmi->cache); c != NULL;
+             c = jl_atomic_load_relaxed(&c->next))
+            if (c == w)
+                inchain = 1;
+        uint64_t wh = 0, gh = 0;
+        extkey_hash(want, &wh);
+        extkey_hash(got, &gh);
+        jl_safe_printf("\n    CIDIAG samemi=%d wantinchain=%d wantblob=%zu gotblob=%zu"
+                       " wantlive=%d gotlive=%d wantdigest=%016" PRIx64
+                       " gotdigest=%016" PRIx64 " recdigest=%016" PRIx64 "\n    mi=",
+                       wmi == gmi, inchain, external_blob_index((jl_value_t*)wmi),
+                       external_blob_index(got),
+                       jl_atomic_load_relaxed(&w->max_world) == ~(size_t)0,
+                       jl_atomic_load_relaxed(&g->max_world) == ~(size_t)0,
+                       wh, gh, tbl->e[i].digest);
+        jl_static_show(JL_STDERR, (jl_value_t*)wmi->specTypes);
+    }
+    jl_safe_printf("\n    loc=%.300s\n", tbl->e[i].loc);
+}
+
 // Returns whether every dependency whose build_id moved came through with its whole edge
 // accepted -- the condition for repointing this image instead of rebuilding it. Fills in
 // `tbl->e[i].resolved` either way.
@@ -4313,6 +4355,8 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
     extkey_build_paths(depmods);
     int verbose = getenv("JULIA_PKGIMAGE_RELINK_VERBOSE") != NULL;
     size_t keyed = 0, resolved = 0, accepted = 0, unresolved = 0, digest_bad = 0, extfn_bad = 0, fabricated = 0;
+    size_t gt_checked = 0, gt_bad = 0, gt_shown = 0;
+    const char *gt_verbose = getenv("JULIA_PKGIMAGE_RELINK_SELFCHECK");
     jl_value_t **memo = (jl_value_t**)calloc(tbl->n ? tbl->n : 1, sizeof(jl_value_t*));
     char *state = (char*)calloc(tbl->n ? tbl->n : 1, 1);
     // failures by locator kind, with a few examples of each kept for the report
@@ -4459,6 +4503,29 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
                     got = fn;
                 }
             }
+            // Ground truth, and it is free. Wherever this dependency was *not* rebuilt its
+            // blob has not moved, so the object at `blob_base + offset` is by definition
+            // the one every reference to this entry means -- no key, no digest, no
+            // inference involved. Resolution has to reproduce it exactly, and where it
+            // does not the entry is refused outright: the digest gate is structurally
+            // unable to see this class of error (the two objects agree on content, which
+            // is the only thing a digest compares), and every wrong resolution ever found
+            // in this scheme was found here. One pointer comparison per accepted entry is
+            // a price worth paying unconditionally rather than behind a flag.
+            if (ok && !(d < relink_mismatched_ndeps && relink_mismatched_deps[d]) &&
+                d < jl_array_len(s->buildid_depmods_idxs) && 2 * wantblob < jl_linkage_blobs.len) {
+                jl_value_t *want = (jl_value_t*)((uintptr_t)jl_linkage_blobs.items[2 * wantblob] +
+                                                 tbl->e[i].offset * SYS_EXTERNAL_LINK_UNIT);
+                gt_checked++;
+                if (want != got) {
+                    ok = 0;
+                    gt_bad++;
+                    if (gt_verbose && gt_shown < 12) {
+                        gt_shown++;
+                        relink_report_wrong(tbl, i, want, got);
+                    }
+                }
+            }
             if (ok) {
                 accepted++;
                 dep_accepted[d]++;
@@ -4541,6 +4608,7 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
     free(fail_at);
     jl_safe_printf("RELINK_PROBE entries=%zu keyed=%zu resolved=%zu accepted=%zu unresolved=%zu digest_mismatch=%zu uncompiled_extfn=%zu fabricated=%zu\n",
                    tbl->n, keyed, resolved, accepted, unresolved, digest_bad, extfn_bad, fabricated);
+    jl_safe_printf("RELINK_SELFCHECK identical=%zu different=%zu\n", gt_checked - gt_bad, gt_bad);
     // kinds sorted by unresolved count, mismatches alongside; examples for the top two
     int order[RK_MAX];
     for (int q = 0; q < nrk; q++)
@@ -4629,50 +4697,6 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
     if (relink_mismatched_ndeps)
         jl_safe_printf("RELINK_REPOINT rebuilt_deps_imported=%zu blocked=%zu -> %s\n",
                        moved, moved_blocked, relinkable ? "repoint" : "rebuild");
-    // Ground truth, available whenever a dependency was *not* rebuilt: the object at
-    // `blob_base + offset` is by definition the one every reference to this entry means.
-    // Resolution has to reproduce it exactly, and the digest gate is what decides whether
-    // it did -- so comparing the two says whether the gate is strong enough. It costs
-    // nothing to run and needs no rebuild, which is what makes it a usable permanent gate.
-    if (getenv("JULIA_PKGIMAGE_RELINK_SELFCHECK")) {
-        size_t same = 0, differ = 0, shown = 0;
-        for (size_t i = 0; i < tbl->n; i++) {
-            jl_value_t *got = tbl->e[i].resolved;
-            uint32_t d = tbl->e[i].depsidx;
-            if (got == NULL)
-                continue;
-            if (d < relink_mismatched_ndeps && relink_mismatched_deps[d])
-                continue;   // that blob moved; the offset no longer names anything
-            if (d >= jl_array_len(s->buildid_depmods_idxs))
-                continue;
-            size_t bi = jl_array_data(s->buildid_depmods_idxs, uint32_t)[d];
-            if (2 * bi >= jl_linkage_blobs.len)
-                continue;
-            jl_value_t *want = (jl_value_t*)((uintptr_t)jl_linkage_blobs.items[2 * bi] +
-                                             tbl->e[i].offset * SYS_EXTERNAL_LINK_UNIT);
-            if (want == got) {
-                same++;
-                continue;
-            }
-            differ++;
-            if (shown < 12) {
-                shown++;
-                jl_safe_printf("RELINK_WRONG [%s] want=[%s]@%p got=[%s]@%p",
-                               relink_loc_kind(tbl->e[i].loc, tbl->e[i].loclen),
-                               jl_typeof_str(want), (void*)want, jl_typeof_str(got), (void*)got);
-                // only types are printed: everything else can be an arbitrarily deep
-                // graph, and a diagnostic that overflows the stack takes the load with it
-                if (jl_is_type(want)) {
-                    jl_safe_printf("\n    want=");
-                    jl_static_show(JL_STDERR, want);
-                    jl_safe_printf("\n    got =");
-                    jl_static_show(JL_STDERR, got);
-                }
-                jl_safe_printf("\n    loc=%.300s\n", tbl->e[i].loc);
-            }
-        }
-        jl_safe_printf("RELINK_SELFCHECK identical=%zu different=%zu\n", same, differ);
-    }
     free(dep_entries);
     free(dep_keyed);
     free(dep_resolved);
