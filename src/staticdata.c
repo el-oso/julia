@@ -2372,6 +2372,7 @@ static void jl_write_import_table(jl_serializer_state *s, ios_t *f) JL_NOTSAFEPO
     jl_value_t *uk_ex[UK_MAX][UK_NEX];
     size_t uk_nex[UK_MAX];
     int nuk = 0;
+    size_t uk_wrap[4] = {0, 0, 0, 0};   // wrapper body / neither / bare typevar / own-wrapper vars
     for (size_t i = 0; i < n; i++) {
         jl_value_t *v = (jl_value_t*)s->import_objs.items[i];
         uint64_t h = 0;
@@ -2425,6 +2426,46 @@ static void jl_write_import_table(jl_serializer_state *s, ios_t *f) JL_NOTSAFEPO
                 if (uk_nex[q] < UK_NEX)
                     uk_ex[q][uk_nex[q]++] = v;
             }
+            // A free-variable type or type variable may still be anchorable without any
+            // owner in this table: if it is the wrapper of its own type name, unwrapped
+            // some number of times, then the type name plus that depth names it. Count how
+            // many are reachable that way before building anything that depends on it.
+            if (jl_is_datatype(v)) {
+                jl_datatype_t *dv = (jl_datatype_t*)v;
+                jl_value_t *w = dv->name->wrapper;
+                int hit = (w == v);
+                while (!hit && w != NULL && jl_is_unionall(w)) {
+                    w = ((jl_unionall_t*)w)->body;
+                    hit = (w == v);
+                }
+                if (hit) {
+                    uk_wrap[0]++;
+                }
+                else {
+                    // Not the wrapper itself, but its free variables may still be the
+                    // wrapper's own variables -- `Array{T,1}` with `Array`'s own `T`. If
+                    // so, the type name plus each variable's binding depth names them and
+                    // no owner in this table is needed.
+                    int all_own = 1;
+                    size_t np = jl_nparams(dv);
+                    for (size_t pi = 0; pi < np && all_own; pi++) {
+                        jl_value_t *p = jl_tparam(dv, pi);
+                        if (!jl_is_typevar(p))
+                            continue;
+                        int found = 0;
+                        jl_value_t *ww = dv->name->wrapper;
+                        while (ww != NULL && jl_is_unionall(ww)) {
+                            if ((jl_value_t*)((jl_unionall_t*)ww)->var == p) { found = 1; break; }
+                            ww = ((jl_unionall_t*)ww)->body;
+                        }
+                        all_own = found;
+                    }
+                    uk_wrap[all_own ? 3 : 1]++;
+                }
+            }
+            else if (jl_is_typevar(v)) {
+                uk_wrap[2]++;
+            }
         }
     }
     ios_close(&k);
@@ -2435,6 +2476,8 @@ static void jl_write_import_table(jl_serializer_state *s, ios_t *f) JL_NOTSAFEPO
                 jl_safe_printf("IMPORTKEYS_CIFAIL %-16s %zu\n", extkey_ci_reason[r], extkey_ci_fail[r]);
         for (int q = 0; q < extkey_rc_n; q++)
             jl_safe_printf("IMPORTKEYS_RETCONST %-16s %zu\n", extkey_rc_name[q], extkey_rc_count[q]);
+        jl_safe_printf("IMPORTKEYS_WRAPBODY body=%zu ownvars=%zu neither=%zu baretypevar=%zu\n",
+                       uk_wrap[0], uk_wrap[3], uk_wrap[1], uk_wrap[2]);
         for (int q = 0; q < nuk; q++) {
             jl_safe_printf("IMPORTKEYS_UNKEYED %-20s %zu\n", uk_name[q], uk_count[q]);
             for (size_t x = 0; x < uk_nex[q]; x++) {
