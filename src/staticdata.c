@@ -4361,7 +4361,37 @@ static void relink_report_wrong(jl_import_table_t *tbl, size_t i, jl_value_t *wa
 // Returns whether every dependency whose build_id moved came through with its whole edge
 // accepted -- the condition for repointing this image instead of rebuilding it. Fills in
 // `tbl->e[i].resolved` either way.
-static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_array_t *depmods, const uint8_t *extfn) JL_GC_DISABLED
+// A dependency is not only cited by the (deps-index, offset) pairs the import table
+// describes. A constant in compressed IR is stored as an index into `Method.roots`, made
+// relocatable by `get_root_reference` as the pair (build_id.lo of the module that
+// contributed the root, index within that module's block), and `jl_encode_as_indexed_root`
+// writes that build_id into the IR bytes verbatim. Those bytes are all there is: no
+// reference, no key and no digest mentions the number, so the only way to ask whether this
+// image cites a given module's roots is to look for the number itself.
+//
+// A hit over-approximates -- eight bytes of anything can collide -- and costs a refusal. A
+// miss is exact: a citation always writes these eight bytes contiguously, and IR that could
+// not be written relocatably is discarded rather than cached (see `is_relocatable` above),
+// so no other encoding of a root reference reaches an incremental image.
+static int relink_scan_for_key(const char *base, size_t len, uint64_t key) JL_NOTSAFEPOINT
+{
+    if (base == NULL || key == 0 || len < sizeof(key))
+        return 0;
+    const char *pat = (const char*)&key;
+    const char *p = base, *last = base + len - sizeof(key);
+    while (p <= last) {
+        const char *q = (const char*)memchr(p, pat[0], (size_t)(last - p) + 1);
+        if (q == NULL)
+            return 0;
+        if (memcmp(q, pat, sizeof(key)) == 0)
+            return 1;
+        p = q + 1;
+    }
+    return 0;
+}
+
+static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_array_t *depmods, const uint8_t *extfn,
+                           const char *imgdata, size_t imgsize) JL_GC_DISABLED
 {
     // scoped to this image's dependency set, like the type-variable table below
     extkey_reset_paths();
@@ -4386,6 +4416,27 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
     for (size_t i = 0; i < tbl->n; i++)
         if (tbl->e[i].depsidx > maxdep)
             maxdep = tbl->e[i].depsidx;
+    // Which dependencies' method roots this image's own IR addresses by build_id. Scanned
+    // once here rather than per entry: it decides both whether a method may be repointed
+    // at all and, for a dependency that actually moved, whether this image can be loaded
+    // against it -- the citation may sit in IR for a method some *third* module owns, so
+    // importing nothing from the rebuilt dependency does not make it safe.
+    size_t ndep = (size_t)maxdep + 1;
+    if (relink_ndep_buildids > ndep)
+        ndep = relink_ndep_buildids;
+    uint8_t *rootcited = (uint8_t*)calloc(ndep, 1);
+    size_t rootcited_n = 0;
+    for (size_t d = 1; d < relink_ndep_buildids; d++) {
+        if (relink_scan_for_key(imgdata, imgsize, relink_dep_buildid[d])) {
+            rootcited[d] = 1;
+            rootcited_n++;
+            if (verbose && d - 1 < (size_t)jl_array_nrows(depmods)) {
+                jl_value_t *m = jl_array_ptr_ref(depmods, d - 1);
+                jl_safe_printf("RELINK_ROOTCITE_DEP idx=%zu name=%s\n", d,
+                               jl_is_module(m) ? jl_symbol_name(((jl_module_t*)m)->name) : "?");
+            }
+        }
+    }
     size_t *dep_entries = (size_t*)calloc(maxdep + 1, sizeof(size_t));
     size_t *dep_keyed = (size_t*)calloc(maxdep + 1, sizeof(size_t));
     size_t *dep_resolved = (size_t*)calloc(maxdep + 1, sizeof(size_t));
@@ -4402,6 +4453,9 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
     // name what those objects are. The blob offset recorded with each entry is what
     // identifies them here: it is the same (deps-index, offset) a reference carries.
     size_t *dep_unkeyed = (size_t*)calloc(maxdep + 1, sizeof(size_t));
+    // accepted entries that are methods: the population the blanket refusal used to cost,
+    // so an edge that survives only because its dependency is not root-cited is visible
+    size_t *dep_methods = (size_t*)calloc(maxdep + 1, sizeof(size_t));
     memset(kp_ci_miss, 0, sizeof(kp_ci_miss));
     // Pass 1: resolve every locator. The identity checks wait for pass 2, because
     // re-rendering an object that contains a bare TypeVar needs the type-variable table
@@ -4548,36 +4602,25 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
                     }
                 }
             }
-            // A method carries its roots, and a dependent's cached code addresses them by
-            // a number that a rebuild invalidates. `literal_val_id` (ircode.c) encodes a
-            // constant in compressed IR as a reference into `Method.roots`, made
-            // relocatable by `get_root_reference` as a pair (owning module's
-            // `build_id.lo`, index within that module's block) -- and `jl_add_method_root`
-            // takes that key from `mod->build_id.lo`, a per-build counter. So when this
-            // image inferred code for a method the dependency owns, its IR may cite roots
-            // under the dependency's *old* build_id. Repoint the method at the rebuilt
-            // dependency and that key is in no block of the new `root_blocks`, whereupon
-            // `rle_reference_to_index` (support/rle.c) walks off the table and returns a
-            // wrong index with no bounds check and no way to signal failure. The wrong
-            // root is then read as whatever it happens to be: measured here, a Makie image
-            // repointed at a rebuilt Animations segfaults in `jl_decode_value_any`
-            // dereferencing the layout of a "DataType" that is not one.
-            //
-            // Nothing in this scheme can see that: the number is buried in compressed IR
-            // bytes, not in any reference the import table describes, so no key, digest or
-            // blob check touches it. It is the same defect class as world ages -- a
-            // per-build counter that a content key cannot commit to -- and the same answer
-            // applies. Refuse. Importing a method is what makes this image able to hold IR
-            // compressed against that method, so it is the necessary condition; refusing on
-            // it over-refuses (the IR need not actually cite such a root) and that is the
-            // right direction to be wrong in.
-            if (ok && jl_is_method(got)) {
+            // A method carries its roots, and this image's cached code may address them by
+            // a number a rebuild invalidates -- the contributing module's `build_id.lo`,
+            // written into the compressed IR by `jl_encode_as_indexed_root`. Rebuild that
+            // module and the key names no block of the new `root_blocks`, so the reference
+            // is unsatisfiable; before the check in `lookup_root` it was answered with a
+            // stray index and read as whatever happened to be there, which is how a Makie
+            // image repointed at a rebuilt Animations came to segfault in
+            // `jl_decode_value_any`. Refuse the method if this image cites that
+            // dependency's roots at all -- the scan above is what makes that answerable,
+            // and a method whose roots are never cited is safe to repoint.
+            if (ok && jl_is_method(got) && d < ndep && rootcited[d]) {
                 ok = 0;
                 rootkey_bad++;
             }
             if (ok) {
                 accepted++;
                 dep_accepted[d]++;
+                if (jl_is_method(got))
+                    dep_methods[d]++;
                 // The ground-truth check above is vacuous for exactly the dependencies
                 // that moved -- which is the only case repointing is used for. Name what
                 // is about to be repointed so a wrong program has something to bisect.
@@ -4717,8 +4760,9 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
                 }
             }
         }
-        jl_safe_printf("RELINK_DEP idx=%u name=%s entries=%zu keyed=%zu resolved=%zu accepted=%zu\n",
-                       d, name, dep_entries[d], dep_keyed[d], dep_resolved[d], dep_accepted[d]);
+        jl_safe_printf("RELINK_DEP idx=%u name=%s entries=%zu keyed=%zu resolved=%zu accepted=%zu methods=%zu cited=%d\n",
+                       d, name, dep_entries[d], dep_keyed[d], dep_resolved[d], dep_accepted[d],
+                       dep_methods[d], d < ndep ? rootcited[d] : 0);
         if (dep_unkeyed[d])
             jl_safe_printf("RELINK_UNKEYED_DEP idx=%u name=%s entries=%zu unkeyed=%zu\n",
                            d, name, dep_entries[d], dep_unkeyed[d]);
@@ -4743,9 +4787,20 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
     // means this image cannot be repointed at all and the caller falls back to a rebuild.
     // A moved dependency nothing imports from costs nothing.
     int relinkable = 1;
-    size_t moved = 0, moved_blocked = 0;
+    size_t moved = 0, moved_blocked = 0, moved_rootcited = 0;
     for (size_t d = 0; d < relink_mismatched_ndeps; d++) {
-        if (!relink_mismatched_deps[d] || d > maxdep || dep_entries[d] == 0)
+        if (!relink_mismatched_deps[d])
+            continue;
+        // Independent of anything imported: if this image's IR cites a root under the
+        // build_id the rebuilt dependency used to have, that citation is unsatisfiable now
+        // however few objects are repointed -- the root may belong to a method a third
+        // module owns, which this image can reach without importing anything from the
+        // dependency at all. Nothing here can repair it, so refuse the whole image.
+        if (d < ndep && rootcited[d]) {
+            moved_rootcited++;
+            relinkable = 0;
+        }
+        if (d > maxdep || dep_entries[d] == 0)
             continue;
         moved++;
         if (dep_accepted[d] != dep_entries[d]) {
@@ -4753,6 +4808,11 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
             relinkable = 0;
         }
     }
+    if (relink_mismatched_ndeps)
+        jl_safe_printf("RELINK_ROOTCITE deps_cited=%zu of %zu, rebuilt_and_cited=%zu\n",
+                       rootcited_n, relink_ndep_buildids ? relink_ndep_buildids - 1 : 0,
+                       moved_rootcited);
+    free(rootcited);
     if (relink_mismatched_ndeps)
         jl_safe_printf("RELINK_REPOINT rebuilt_deps_imported=%zu blocked=%zu -> %s\n",
                        moved, moved_blocked, relinkable ? "repoint" : "rebuild");
@@ -4765,6 +4825,7 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
     free(dep_kind_unres);
     free(dep_kind_mis);
     free(dep_unkeyed);
+    free(dep_methods);
     return relinkable;
 #undef RK_MAX
 #undef RK_NEX
@@ -7770,7 +7831,10 @@ static int jl_restore_system_image_from_stream_(ios_t *f, jl_image_t *image,
                         extfn[ent->idx] = 1;
                 }
             }
-            relink_ok = jl_relink_probe(&s, itbl, depmods, extfn);
+            // the data and const-data sections, which is every byte of this image's own
+            // objects -- including the compressed IR whose root references are the one
+            // citation of a dependency that no reference records
+            relink_ok = jl_relink_probe(&s, itbl, depmods, extfn, f->buf, sizeof_sysimg);
             free(extfn);
             if (relink_ok && relink_probe_buildid_mismatch) {
                 for (size_t i = 0; i < nimports; i++)
