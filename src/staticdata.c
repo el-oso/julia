@@ -1158,6 +1158,48 @@ static uintptr_t add_external_linkage(jl_serializer_state *s, jl_value_t *v, jl_
 
 static int extkey_write(ios_t *k, jl_value_t *v, int depth) JL_NOTSAFEPOINT;
 
+// Which field defeats a CodeInstance key. They are 44% of the entries the writer cannot
+// key at all, and the field that stops them decides whether that is fixable.
+enum { EK_CI_MI, EK_CI_OWNER, EK_CI_RETTYPE, EK_CI_EDGES, EK_CI_EXCTYPE, EK_CI_RETCONST,
+       EK_CI_NREASON };
+static const char *const extkey_ci_reason[EK_CI_NREASON] = {
+    "methodinstance", "owner", "rettype", "edges", "exctype", "rettype_const" };
+static size_t extkey_ci_fail[EK_CI_NREASON];
+
+// ...and, for the one field that turns out to account for nearly all of them, which kind
+// of constant it is.
+#define EK_RC_MAX 16
+static const char *extkey_rc_name[EK_RC_MAX];
+static size_t extkey_rc_count[EK_RC_MAX];
+static int extkey_rc_n;
+static void extkey_note_retconst(jl_value_t *c) JL_NOTSAFEPOINT
+{
+    const char *nm = jl_typeof_str(c);
+    int q;
+    for (q = 0; q < extkey_rc_n; q++)
+        if (strcmp(extkey_rc_name[q], nm) == 0)
+            break;
+    if (q == extkey_rc_n && extkey_rc_n < EK_RC_MAX) {
+        extkey_rc_name[extkey_rc_n] = nm;
+        extkey_rc_count[extkey_rc_n] = 0;
+        extkey_rc_n++;
+    }
+    if (q < extkey_rc_n)
+        extkey_rc_count[q]++;
+    // the type is what says whether the value is unkeyable in itself or only because its
+    // own type is; print a few
+    static int nshown = 0;
+    if (getenv("JULIA_IMPORT_KEYS") && nshown < 4) {
+        nshown++;
+        ios_t t;
+        ios_mem(&t, 128);
+        int ok = extkey_write(&t, (jl_value_t*)jl_typeof(c), 0);
+        ios_putc('\0', &t);
+        jl_safe_printf("IMPORTKEYS_RETCONST_EX %s type=%s\n", nm, ok ? t.buf : "(unkeyable)");
+        ios_close(&t);
+    }
+}
+
 // Reverse index from an object to a module binding that holds it, so objects with no
 // content identity can still be named by where they live. Built once per serialization.
 typedef struct { jl_module_t *mod; jl_sym_t *name; } extkey_path_t;
@@ -1819,17 +1861,17 @@ static int extkey_write(ios_t *k, jl_value_t *v, int depth) JL_NOTSAFEPOINT
         jl_method_instance_t *mi = jl_get_ci_mi(ci);
         ios_puts("C:", k);
         if (!extkey_write(k, (jl_value_t*)mi, depth + 1))
-            return 0;
+            return extkey_ci_fail[EK_CI_MI]++, 0;
         ios_putc('/', k);
         // the owner distinguishes foreign-interpreter caches sharing one MethodInstance
         if (ci->owner == jl_nothing)
             ios_putc('-', k);
         else if (!extkey_write(k, ci->owner, depth + 1))
-            return 0;
+            return extkey_ci_fail[EK_CI_OWNER]++, 0;
         // and the ABI/rettype distinguishes co-existing entries for one owner
         ios_putc('/', k);
         if (!extkey_type_toplevel(k, ci->rettype))
-            return 0;
+            return extkey_ci_fail[EK_CI_RETTYPE]++, 0;
         // Entries in one method instance's cache chain can agree on all of the above and
         // differ only in their edges, so the edge set has to take part in the identity.
         // The edge digest is identity data even inside a locator: it is a hash, so it can
@@ -1843,7 +1885,7 @@ static int extkey_write(ios_t *k, jl_value_t *v, int depth) JL_NOTSAFEPOINT
         int edges_ok = extkey_edges_hash(ci, &ehash);
         extkey_import_index = saved_refs;
         if (!edges_ok)
-            return 0;
+            return extkey_ci_fail[EK_CI_EDGES]++, 0;
         ios_printf(k, "/E%016" PRIx64, ehash);
         // The remaining inference results a caller can have specialized against. Omitting
         // any of them merges code instances that are not interchangeable: a caller that
@@ -1851,12 +1893,13 @@ static int extkey_write(ios_t *k, jl_value_t *v, int depth) JL_NOTSAFEPOINT
         // `rettype_const`, is not correct against the other.
         ios_putc('/', k);
         if (!extkey_type_toplevel(k, ci->exctype))
-            return 0;
+            return extkey_ci_fail[EK_CI_EXCTYPE]++, 0;
         ios_putc('/', k);
         if (ci->rettype_const == NULL)
             ios_putc('-', k);
         else if (!extkey_write(k, ci->rettype_const, depth + 1))
-            return 0;   // a constant we cannot name is a constant we cannot re-link against
+            // a constant we cannot name is a constant we cannot re-link against
+            return extkey_ci_fail[EK_CI_RETCONST]++, extkey_note_retconst(ci->rettype_const), 0;
         ios_printf(k, "/P%08" PRIx32, jl_atomic_load_relaxed(&ci->ipo_purity_bits));
         // World ages themselves are per-build counters and would never match across a
         // rebuild, but they are not serialized raw either: an incremental image collapses
@@ -2387,6 +2430,11 @@ static void jl_write_import_table(jl_serializer_state *s, ios_t *f) JL_NOTSAFEPO
     ios_close(&k);
     if (getenv("JULIA_IMPORT_KEYS")) {
         jl_safe_printf("IMPORTKEYS_WRITE entries=%zu keybytes=%zu\n", n, keybytes);
+        for (int r = 0; r < EK_CI_NREASON; r++)
+            if (extkey_ci_fail[r])
+                jl_safe_printf("IMPORTKEYS_CIFAIL %-16s %zu\n", extkey_ci_reason[r], extkey_ci_fail[r]);
+        for (int q = 0; q < extkey_rc_n; q++)
+            jl_safe_printf("IMPORTKEYS_RETCONST %-16s %zu\n", extkey_rc_name[q], extkey_rc_count[q]);
         for (int q = 0; q < nuk; q++) {
             jl_safe_printf("IMPORTKEYS_UNKEYED %-20s %zu\n", uk_name[q], uk_count[q]);
             for (size_t x = 0; x < uk_nex[q]; x++) {
