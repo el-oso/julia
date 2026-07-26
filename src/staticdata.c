@@ -4378,6 +4378,7 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
     // decision-relevant number is how many entries block each edge, and of what kind
     size_t *dep_mis = (size_t*)calloc(maxdep + 1, sizeof(size_t));
     size_t *dep_kind_unres = (size_t*)calloc((size_t)(maxdep + 1) * RK_MAX, sizeof(size_t));
+    size_t *dep_kind_mis = (size_t*)calloc((size_t)(maxdep + 1) * RK_MAX, sizeof(size_t));
     // An entry the *writer* could not render carries no locator, so nothing can re-derive
     // it and its edge can never be re-linked however good the parser gets. That makes the
     // unkeyed population, not the failing one, the ceiling on `fully_accepted_all` -- so
@@ -4542,8 +4543,8 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
                     ios_t md;
                     if (ios_file(&md, misdump, 1, 1, 1, 0) != NULL) {
                         ios_seek_end(&md);
-                        ios_printf(&md, "ENTRY %zu digest=%016" PRIx64 "\nLOC %s\nID ",
-                                   i, tbl->e[i].digest, tbl->e[i].loc);
+                        ios_printf(&md, "ENTRY %zu dep=%u digest=%016" PRIx64 "\nLOC %s\nID ",
+                                   i, (unsigned)d, tbl->e[i].digest, tbl->e[i].loc);
                         if (!extkey_write(&md, got, 0))
                             ios_puts("(unrenderable)", &md);
                         ios_putc('\n', &md);
@@ -4594,6 +4595,7 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
                 else {
                     rk_mis[q]++;
                     dep_mis[d]++;
+                    dep_kind_mis[(size_t)d * RK_MAX + q]++;
                 }
             }
         }
@@ -4664,11 +4666,12 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
             // the edge is refused; name exactly what blocks it, by locator kind
             jl_safe_printf("RELINK_BLOCKED idx=%u name=%s keyed=%zu failed=%zu:",
                            d, name, dep_keyed[d], dep_keyed[d] - dep_accepted[d]);
-            for (int q = 0; q < nrk; q++)
+            for (int q = 0; q < nrk; q++) {
                 if (dep_kind_unres[(size_t)d * RK_MAX + q])
-                    jl_safe_printf(" [%s]=%zu", rk_name[q], dep_kind_unres[(size_t)d * RK_MAX + q]);
-            if (dep_mis[d])
-                jl_safe_printf(" [digest_mismatch]=%zu", dep_mis[d]);
+                    jl_safe_printf(" unres[%s]=%zu", rk_name[q], dep_kind_unres[(size_t)d * RK_MAX + q]);
+                if (dep_kind_mis[(size_t)d * RK_MAX + q])
+                    jl_safe_printf(" mis[%s]=%zu", rk_name[q], dep_kind_mis[(size_t)d * RK_MAX + q]);
+            }
             jl_safe_printf("\n");
         }
     }
@@ -4700,6 +4703,7 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
     free(dep_rep);
     free(dep_mis);
     free(dep_kind_unres);
+    free(dep_kind_mis);
     free(dep_unkeyed);
     return relinkable;
 #undef RK_MAX
