@@ -4480,6 +4480,12 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
             resolved++;
             uint64_t h = 0;
             int ok = extkey_hash(got, &h) && h == tbl->e[i].digest;
+            // Why an entry is refused decides what could fix it, and the three reasons want
+            // different answers: a digest mismatch means the key found the wrong object, an
+            // object on the heap means the parser built one instead of finding it, and an
+            // object in another image means it was found but is not the one the reference
+            // names.
+            const char *why = ok ? "otherblob" : "digest";
             // Resolution must *find* the object, not rebuild an equal one. A reference
             // means the specific object the dependency owns, and the digest cannot tell
             // the two apart: `Ref{T} where T` re-renders identically whether it is Core's
@@ -4503,6 +4509,8 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
             if (ok && external_blob_index(got) != wantblob) {
                 ok = 0;
                 fabricated++;
+                if (external_blob_index(got) >= n_linkage_blobs())
+                    why = "heap";
             }
             // an entry consumed as an `external_fns` slot needs a *compiled* member of the
             // equivalence class the key names, not merely a member of it
@@ -4559,8 +4567,9 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
                     ios_t md;
                     if (ios_file(&md, misdump, 1, 1, 1, 0) != NULL) {
                         ios_seek_end(&md);
-                        ios_printf(&md, "ENTRY %zu dep=%u digest=%016" PRIx64 "\nLOC %s\nID ",
-                                   i, (unsigned)d, tbl->e[i].digest, tbl->e[i].loc);
+                        ios_printf(&md, "ENTRY %zu dep=%u why=%s type=%s digest=%016" PRIx64 "\nLOC %s\nID ",
+                                   i, (unsigned)d, why, jl_typeof_str(got),
+                                   tbl->e[i].digest, tbl->e[i].loc);
                         if (!extkey_write(&md, got, 0))
                             ios_puts("(unrenderable)", &md);
                         ios_putc('\n', &md);
