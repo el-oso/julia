@@ -3400,6 +3400,118 @@ static jl_value_t *kp_value(keyparse_t *kp, int depth) JL_GC_DISABLED
         jl_sym_t *s;
         return kp_name(kp, &s) ? (jl_value_t*)s : NULL;
     }
+    if (kp_lit(kp, "F:")) {
+        // The module and name locate the definition site for a reader; what actually finds
+        // the method is the signature, which is what distinguishes the methods of one
+        // generic function, so the lookup goes straight through the method table.
+        jl_sym_t *path[SHADOW_MAX_MODPATH];
+        int n = kp_path(kp, path, SHADOW_MAX_MODPATH);
+        if (n < 2 || !kp_char(kp, '@'))
+            return NULL;
+        jl_value_t *sig = kp_type(kp, depth, 0);
+        if (sig == NULL)
+            return NULL;
+        if (kp_lit(kp, "@F")) {
+            // the body digest is part of the identity, not of the lookup: it decides
+            // whether the method that was found may be used, which the caller checks by
+            // recomputing this key over the result
+            for (int i = 0; i < 16; i++)
+                if (kp->p >= kp->end || kp_hexdigit(*kp->p++) < 0)
+                    return NULL;
+        }
+        jl_value_t *found = jl_methtable_lookup(sig, jl_atomic_load_acquire(&jl_world_counter));
+        return jl_is_method(found) ? found : NULL;
+    }
+    if (kp_lit(kp, "I:")) {
+        jl_value_t *mv = kp_value(kp, depth + 1);
+        if (mv == NULL || !jl_is_method(mv) || !kp_char(kp, '/'))
+            return NULL;
+        jl_value_t *spec = kp_type(kp, depth, 0);
+        if (spec == NULL)
+            return NULL;
+        // The static parameters are not carried in the key: they follow from the method's
+        // signature and the specialization types, which are.
+        jl_svec_t *env = jl_emptysvec;
+        jl_value_t *ti = jl_type_intersection_env(spec, ((jl_method_t*)mv)->sig, &env);
+        if (ti == jl_bottom_type)
+            return NULL;
+        return (jl_value_t*)jl_specializations_get_linfo((jl_method_t*)mv, spec, env);
+    }
+    if (kp_lit(kp, "C:")) {
+        // A code instance has no lookup of its own: it is found by walking the cache chain
+        // of the method instance that owns it and matching on everything the key records.
+        // That the key must record all of it is what the earlier commit established -- the
+        // entries in one chain differ in exactly these fields and nothing else.
+        jl_value_t *miv = kp_value(kp, depth + 1);
+        if (miv == NULL || !jl_is_method_instance(miv) || !kp_char(kp, '/'))
+            return NULL;
+        jl_value_t *owner = jl_nothing;
+        if (!kp_char(kp, '-')) {
+            owner = kp_value(kp, depth + 1);
+            if (owner == NULL)
+                return NULL;
+        }
+        if (!kp_char(kp, '/'))
+            return NULL;
+        jl_value_t *rettype = kp_type(kp, depth, 0);
+        if (rettype == NULL || !kp_lit(kp, "/E"))
+            return NULL;
+        uint64_t ehash = 0;
+        for (int i = 0; i < 16; i++) {
+            int d = kp->p < kp->end ? kp_hexdigit(*kp->p++) : -1;
+            if (d < 0)
+                return NULL;
+            ehash = (ehash << 4) | (uint64_t)d;
+        }
+        if (!kp_char(kp, '/'))
+            return NULL;
+        jl_value_t *exctype = kp_type(kp, depth, 0);
+        if (exctype == NULL || !kp_char(kp, '/'))
+            return NULL;
+        jl_value_t *rtc = NULL;
+        if (!kp_char(kp, '-')) {
+            rtc = kp_value(kp, depth + 1);
+            if (rtc == NULL)
+                return NULL;
+        }
+        if (!kp_lit(kp, "/P"))
+            return NULL;
+        uint32_t purity = 0;
+        for (int i = 0; i < 8; i++) {
+            int d = kp->p < kp->end ? kp_hexdigit(*kp->p++) : -1;
+            if (d < 0)
+                return NULL;
+            purity = (purity << 4) | (uint32_t)d;
+        }
+        int live;
+        if (kp_char(kp, 'L'))
+            live = 1;
+        else if (kp_char(kp, 'D'))
+            live = 0;
+        else
+            return NULL;
+        jl_method_instance_t *mi = (jl_method_instance_t*)miv;
+        for (jl_code_instance_t *ci = jl_atomic_load_relaxed(&mi->cache); ci != NULL;
+             ci = jl_atomic_load_relaxed(&ci->next)) {
+            if (!jl_egal(ci->owner, owner))
+                continue;
+            if (!jl_types_equal(ci->rettype, rettype) || !jl_types_equal(ci->exctype, exctype))
+                continue;
+            if ((rtc == NULL) != (ci->rettype_const == NULL))
+                continue;
+            if (rtc != NULL && !jl_egal(rtc, ci->rettype_const))
+                continue;
+            if (jl_atomic_load_relaxed(&ci->ipo_purity_bits) != purity)
+                continue;
+            if ((jl_atomic_load_relaxed(&ci->max_world) == ~(size_t)0) != live)
+                continue;
+            uint64_t h;
+            if (!extkey_edges_hash(ci, &h) || h != ehash)
+                continue;
+            return (jl_value_t*)ci;
+        }
+        return NULL;
+    }
     if (kp_lit(kp, "O:")) {
         // a singleton is completely determined by its type
         jl_value_t *t = kp_type(kp, depth, 0);
@@ -3466,7 +3578,7 @@ static void jl_check_key_parse(jl_serializer_state *s, jl_array_t *mod_array) JL
         size_t len = (size_t)ios_pos(&k);
         ios_putc('\0', &k);   // the key is not NUL-terminated in the stream; printing needs it
         // only the kinds this parser covers so far; the rest are counted, not guessed at
-        if (len < 2 || strchr("MNBSTOb#UAX", k.buf[0]) == NULL) {
+        if (len < 2 || strchr("MNBSTObFIC#UAX@", k.buf[0]) == NULL) {
             unsupported++;
             continue;
         }
