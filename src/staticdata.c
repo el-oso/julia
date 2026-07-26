@@ -1229,6 +1229,22 @@ typedef struct { jl_module_t *mod; jl_sym_t *name; } extkey_path_t;
 static htable_t extkey_paths;
 static int extkey_paths_ready = 0;
 
+// build_id.lo -> module, over the same module set that scopes `extkey_paths`. Method
+// root blocks are keyed by the contributing module's build_id.lo -- a per-build number
+// that a content key cannot commit to -- so rendering a method's root contributions
+// symbolically needs the module's *name* for its key. Built alongside the path table,
+// reset with it.
+static jl_module_t **extkey_modid_mods = NULL;
+static size_t extkey_modid_n = 0;
+
+static jl_module_t *extkey_module_by_buildid(uint64_t id) JL_NOTSAFEPOINT
+{
+    for (size_t i = 0; i < extkey_modid_n; i++)
+        if (extkey_modid_mods[i]->build_id.lo == id)
+            return extkey_modid_mods[i];
+    return NULL;
+}
+
 static const extkey_path_t *extkey_lookup_path(jl_value_t *v) JL_NOTSAFEPOINT
 {
     if (!extkey_paths_ready)
@@ -1246,10 +1262,13 @@ static void extkey_build_paths(jl_array_t *mod_array) JL_NOTSAFEPOINT
         return;
     htable_new(&extkey_paths, 0);
     extkey_paths_ready = 1;
+    extkey_modid_mods = (jl_module_t**)malloc_s(jl_array_nrows(mod_array) * sizeof(jl_module_t*));
+    extkey_modid_n = 0;
     for (size_t mi = 0; mi < jl_array_nrows(mod_array); mi++) {
         jl_module_t *m = (jl_module_t*)jl_array_ptr_ref(mod_array, mi);
         if (!jl_is_module(m))
             continue;
+        extkey_modid_mods[extkey_modid_n++] = m;
         // (the module set scopes the table: see `extkey_reset_paths`)
         jl_svec_t *table = jl_atomic_load_relaxed(&m->bindings);
         for (size_t i = 0; i < jl_svec_len(table); i++) {
@@ -1294,6 +1313,9 @@ static void extkey_reset_paths(void) JL_NOTSAFEPOINT
             free(extkey_paths.table[i + 1]);
     htable_free(&extkey_paths);
     extkey_paths_ready = 0;
+    free(extkey_modid_mods);
+    extkey_modid_mods = NULL;
+    extkey_modid_n = 0;
 }
 // The chain of `UnionAll` binders in scope while a type is being keyed, innermost first.
 // A bound `TypeVar` has no standalone identity -- only a meaning relative to the binder
@@ -1400,6 +1422,230 @@ static int extkey_file_digest(jl_sym_t *file, uint64_t *out) JL_NOTSAFEPOINT
         return 0;
     *out = h;
     return 1;
+}
+
+// Render a method's root contributions, per contributing module, into its identity.
+//
+// Compressed IR cites a constant in `Method.roots` as (contributing module's build_id.lo,
+// index within that module's blocks), so code compiled against this method commits to the
+// *value at that index* -- a number no reference in the import table describes. A rebuild
+// of the contributor re-appends its roots under a fresh build_id; repointing at it is
+// sound only if every contributor's root sequence is unchanged, and this section is what
+// makes the digest able to decide that. Per contributor: name (a build_id is a per-build
+// counter, so the module's name stands in for it), count, and an FNV-1a digest over
+// `jl_static_show` of each root in citation order. Groups are sorted by name so the text
+// does not depend on which image happened to append first.
+//
+// Key-0 roots are excluded: a citation of one is only written relocatably when its index
+// is below `nroots_sysimg`, which pins it to the sysimage the header check already
+// guards. The writing image's own contributions are excluded too -- they travel inside
+// this image and are appended back under its own (unchanged) build_id at load, and they
+// do not exist yet when the loading process re-renders this method during its probe.
+//
+// A root that cannot be rendered deterministically refuses the whole method key -- no
+// digest can then vouch for the citation, and an unkeyed method is what the probe's
+// `method_unverified` tally is built to catch.
+
+// Render one root's *content*. `extkey_write` already renders everything with a name --
+// symbols, strings, types, methods, code instances, singletons, boxed immutables -- and
+// what it refuses (Expr trees, svecs, arrays, plain structs) is walked structurally:
+// type identity plus per-field content, raw bytes for the bits fields. Failure is
+// acceptable, non-determinism is the only real hazard, and a raw pointer field (a `Ptr`
+// literal, say) renders unstably and costs a permanent refusal -- the safe direction.
+// Both budgets are load-bearing: the depth cap breaks cycles, the output cap stops a
+// wide graph (a CodeInstance's edges, say) from being wandered instead of refused.
+static int extkey_root_value(ios_t *k, jl_value_t *v, int depth) JL_NOTSAFEPOINT
+{
+    if (depth > 32)
+        return 0;
+    if ((size_t)ios_pos(k) > ((size_t)1 << 16))
+        return 0;
+    size_t pos0 = (size_t)ios_pos(k);
+    if (extkey_write(k, v, 0))
+        return 1;
+    // discard whatever a failed attempt wrote, so the fallback text is deterministic
+    ios_seek(k, (int64_t)pos0);
+    ios_trunc(k, pos0);
+    jl_value_t *t = jl_typeof(v);
+    if (jl_is_svec(v)) {
+        ios_puts("(v", k);
+        for (size_t i = 0; i < jl_svec_len(v); i++) {
+            jl_value_t *e = jl_svecref(v, i);
+            ios_putc(',', k);
+            if (e == NULL) {
+                ios_putc('U', k);
+                continue;
+            }
+            if (!extkey_root_value(k, e, depth + 1))
+                return 0;
+        }
+        ios_putc(')', k);
+        return 1;
+    }
+    if (jl_is_array(v)) {
+        jl_array_t *a = (jl_array_t*)v;
+        size_t n = jl_array_nrows(a);
+        ios_printf(k, "(a%zu:", n);
+        if (!extkey_write(k, t, 0))
+            return 0;
+        ios_putc(':', k);
+        const jl_datatype_layout_t *ly = ((jl_datatype_t*)jl_typeof(a->ref.mem))->layout;
+        if (ly->flags.arrayelem_isboxed) {
+            for (size_t i = 0; i < n; i++) {
+                jl_value_t *e = jl_array_ptr_ref(a, i);
+                ios_putc(',', k);
+                if (e == NULL) {
+                    ios_putc('U', k);
+                    continue;
+                }
+                if (!extkey_root_value(k, e, depth + 1))
+                    return 0;
+            }
+        }
+        else if (ly->flags.arrayelem_isunion) {
+            return 0;   // selector bytes follow the data; not worth rendering stably
+        }
+        else {
+            size_t nb = n * ly->size;
+            if ((size_t)ios_pos(k) + nb > ((size_t)1 << 16))
+                return 0;
+            ios_write(k, (const char*)jl_array_data_(a), nb);
+        }
+        ios_putc(')', k);
+        return 1;
+    }
+    if (jl_is_datatype(t) && !jl_is_genericmemory(v)) {
+        jl_datatype_t *dt = (jl_datatype_t*)t;
+        if (dt->layout == NULL)
+            return 0;
+        ios_puts("(f", k);
+        if (!extkey_write(k, t, 0))
+            return 0;
+        size_t nf = jl_datatype_nfields(dt);
+        for (size_t i = 0; i < nf; i++) {
+            ios_putc(',', k);
+            if (jl_field_isptr(dt, i)) {
+                jl_value_t *f = jl_get_nth_field_noalloc(v, i);
+                if (f == NULL) {
+                    ios_putc('U', k);
+                    continue;
+                }
+                if (!extkey_root_value(k, f, depth + 1))
+                    return 0;
+            }
+            else {
+                size_t fsz = jl_field_size(dt, i);
+                ios_write(k, (const char*)v + jl_field_offset(dt, i), fsz);
+            }
+        }
+        ios_putc(')', k);
+        return 1;
+    }
+    return 0;
+}
+
+// Reentered only through a method stored *in* another method's roots; rendering the
+// nested method's own roots there would recurse unboundedly, and the nested identity a
+// citation consumes is the method object, not its root contents -- those are verified
+// through the nested method's own import entry.
+static int extkey_rendering_roots = 0;
+
+static int extkey_method_roots(ios_t *k, jl_method_t *m) JL_NOTSAFEPOINT
+{
+    if (m->root_blocks == NULL || m->roots == NULL)
+        return 1;
+    uint64_t self = jl_precompile_toplevel_module ? jl_precompile_toplevel_module->build_id.lo : 0;
+    uint64_t *blocks = jl_array_data(m->root_blocks, uint64_t);
+    size_t nb = jl_array_nrows(m->root_blocks);
+    size_t nroots = jl_array_nrows(m->roots);
+#define EK_RB_MAX 32
+    struct ek_rb_grp { uint64_t key; uint64_t h; size_t count; };
+    struct ek_rb_grp grp[EK_RB_MAX];
+    size_t ngrp = 0;
+    int overflow = 0;
+    ios_t t;
+    ios_mem(&t, 256);
+    for (size_t j = 0; j + 1 < nb; j += 2) {
+        uint64_t key = blocks[j];
+        size_t start = (size_t)blocks[j + 1];
+        size_t end = (j + 3 < nb) ? (size_t)blocks[j + 3] : nroots;
+        if (key == 0 || key == self)
+            continue;
+        // Only contributors in this image's own dependency set (which is what scopes the
+        // module table on both sides -- see `extkey_build_paths`). A method shared as
+        // widely as Base's accretes blocks from every package a *session* loads, and a
+        // probe session is routinely a superset of the write session; rendering a group
+        // this image's world never contained would refuse methods over contributions its
+        // IR cannot cite. A citation's key is always a module loaded when this image was
+        // written, so the skipped groups are exactly the uncitable ones.
+        if (extkey_module_by_buildid(key) == NULL)
+            continue;
+        size_t g;
+        for (g = 0; g < ngrp; g++)
+            if (grp[g].key == key)
+                break;
+        if (g == ngrp) {
+            if (ngrp == EK_RB_MAX) {
+                overflow = 1;
+                continue;
+            }
+            grp[ngrp].key = key;
+            grp[ngrp].h = 1469598103934665603ULL;
+            grp[ngrp].count = 0;
+            ngrp++;
+        }
+        for (size_t i = start; i < end && i < nroots; i++) {
+            jl_value_t *r = jl_array_ptr_ref(m->roots, i);
+            ios_seek(&t, 0);
+            ios_trunc(&t, 0);
+            extkey_rendering_roots = 1;
+            int rok = extkey_root_value(&t, r, 0);
+            extkey_rendering_roots = 0;
+            if (!rok) {
+                ios_close(&t);
+                return 0;   // an unverifiable root refuses the whole method key
+            }
+            size_t len = (size_t)ios_pos(&t);
+            uint64_t h = grp[g].h;
+            for (size_t b = 0; b < len; b++) {
+                h ^= (unsigned char)t.buf[b];
+                h *= 1099511628211ULL;
+            }
+            h ^= 0x1F;   // separator, so adjacent roots cannot merge
+            h *= 1099511628211ULL;
+            grp[g].h = h;
+            grp[g].count++;
+        }
+    }
+    ios_close(&t);
+    // sort by contributor name, then by raw key for the unmapped (whose order is
+    // unstable anyway -- an unmapped contributor renders as "?" and refuses over-eagerly,
+    // which is the right direction)
+    for (size_t a = 1; a < ngrp; a++) {
+        size_t b = a;
+        while (b > 0) {
+            jl_module_t *ma = extkey_module_by_buildid(grp[b - 1].key);
+            jl_module_t *mb = extkey_module_by_buildid(grp[b].key);
+            const char *na = ma ? jl_symbol_name(ma->name) : "?";
+            const char *nb2 = mb ? jl_symbol_name(mb->name) : "?";
+            int c = strcmp(na, nb2);
+            if (c < 0 || (c == 0 && grp[b - 1].key <= grp[b].key))
+                break;
+            struct ek_rb_grp tmp = grp[b - 1];
+            grp[b - 1] = grp[b];
+            grp[b] = tmp;
+            b--;
+        }
+    }
+    for (size_t g = 0; g < ngrp; g++) {
+        jl_module_t *cm = extkey_module_by_buildid(grp[g].key);
+        ios_printf(k, "|R%s/%zu/%016" PRIx64, cm ? jl_symbol_name(cm->name) : "?",
+                   grp[g].count, grp[g].h);
+    }
+    if (overflow)
+        ios_puts("|R!", k);
+    return 1;
+#undef EK_RB_MAX
 }
 
 // Reverse index from a bound type variable to a binder that introduces it. A `TypeVar`
@@ -1867,6 +2113,18 @@ static int extkey_write(ios_t *k, jl_value_t *v, int depth) JL_NOTSAFEPOINT
                 return 0;
             ios_printf(k, "@F%016" PRIx64, fh);
         }
+        // The digest gate is what answers whether a rebuilt contributor re-appended the
+        // same roots -- the numbers compressed IR cites that no reference records -- so
+        // the section is always part of the identity. It also trails a *top-level*
+        // method locator: the parser stops cleanly at the end of the signature, and the
+        // recorded group names are what let the probe ask "could this method anchor a
+        // citation of the moved dependency?" for a method it failed to verify -- asked
+        // of the write-time record, never of the current state. Not nested inside
+        // MethodInstance/CodeInstance locators, whose parsers expect a '/' next; and
+        // skipped for a method reached *through* another method's roots, whose own roots
+        // are verified through its own import entry -- rendering them here would recurse.
+        if (!extkey_rendering_roots && (extkey_import_index == NULL || depth == 0))
+            return extkey_method_roots(k, m);
         return 1;
     }
     if (jl_is_method_instance(v)) {
@@ -3549,8 +3807,11 @@ static jl_value_t *kp_ref(keyparse_t *kp, size_t idx) JL_GC_DISABLED
         kp->end = loc + loclen;
         kp->nbind = 0;
         got = kp_value(kp, 0);
-        if (got != NULL && kp->p != kp->end)
-            got = NULL;   // a locator that does not consume its own text resolved nothing
+        // a locator that does not consume its own text resolved nothing -- except the
+        // root-contribution record trailing a top-level method locator, which is written
+        // for the unverified-method check, not for the parser (see extkey_method_roots)
+        if (got != NULL && kp->p != kp->end && strncmp(kp->p, "|R", 2) != 0)
+            got = NULL;
         kp->p = savep;
         kp->end = saveend;
         kp->nbind = savenbind;
@@ -4192,7 +4453,9 @@ static void jl_check_key_parse(jl_serializer_state *s, jl_array_t *mod_array) JL
                                (size_t)(kp.p - k.buf), k.buf);
             unparsed++;
         }
-        else if (kp.p != kp.end) {
+        else if (kp.p != kp.end && strncmp(kp.p, "|R", 2) != 0) {
+            // a top-level method locator legitimately trails its root-contribution
+            // record, which the parser does not consume (see extkey_method_roots)
             trailing++;
         }
         else if (got == v || extkey_equiv(got, v)) {
@@ -4387,6 +4650,24 @@ static int relink_scan_for_key(const char *base, size_t len, uint64_t key) JL_NO
     return 0;
 }
 
+// Whether the object an entry's recorded (deps-index, offset) names is a method -- only
+// askable while the dependency's blob has not moved, which is exactly when the offset is
+// still meaningful. Used to tally unverifiable method entries: an unkeyed or refused one
+// may anchor a root citation the digest gate then cannot vouch for.
+static int relink_unmoved_blob_is_method(jl_serializer_state *s, uint32_t d, uint64_t offset) JL_NOTSAFEPOINT
+{
+    if (d < relink_mismatched_ndeps && relink_mismatched_deps[d])
+        return 0;   // moved: the offset means nothing now, and the edge is blocked anyway
+    if (d >= jl_array_len(s->buildid_depmods_idxs))
+        return 0;
+    size_t wb = jl_array_data(s->buildid_depmods_idxs, uint32_t)[d];
+    if (2 * wb >= jl_linkage_blobs.len)
+        return 0;
+    jl_value_t *w = (jl_value_t*)((uintptr_t)jl_linkage_blobs.items[2 * wb] +
+                                  offset * SYS_EXTERNAL_LINK_UNIT);
+    return jl_is_method(w);
+}
+
 static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_array_t *depmods, const uint8_t *extfn,
                            const char *imgdata, size_t imgsize) JL_GC_DISABLED
 {
@@ -4395,7 +4676,31 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
     extkey_build_paths(depmods);
     int verbose = getenv("JULIA_PKGIMAGE_RELINK_VERBOSE") != NULL;
     size_t keyed = 0, resolved = 0, accepted = 0, unresolved = 0, digest_bad = 0, extfn_bad = 0, fabricated = 0;
-    size_t rootkey_bad = 0;
+    // Method entries whose root contributions could not be verified -- refused, or
+    // unkeyed so there was nothing to verify against. Compressed IR can cite any imported
+    // method's roots by (contributor build_id, index), so an unverified method means a
+    // citation of a moved dependency cannot be proven satisfiable -- but only if that
+    // method could anchor one, which its *recorded* locator answers: the writer appends
+    // the method's root-contributor record to it (see `extkey_method_roots`), and a
+    // citation's contributor is always present in the method's blocks by write time.
+    // `method_unverified_moved` counts the ones whose record names a moved dependency
+    // (or that have no record at all); any of them refuses the repoint. Only askable for
+    // entries on unmoved edges, where `blob_base + offset` is still the object; an
+    // unverified entry on a moved edge already blocks that edge outright.
+    size_t method_unverified = 0, method_unverified_moved = 0;
+    // the moved dependencies' names, for matching "|R<name>/" in recorded locators
+#define RK_MOVEDNAMES 64
+    const char *movednames[RK_MOVEDNAMES];
+    size_t nmovednames = 0;
+    for (size_t d2 = 1; d2 < relink_mismatched_ndeps && nmovednames < RK_MOVEDNAMES; d2++) {
+        if (!relink_mismatched_deps[d2])
+            continue;
+        if (d2 - 1 < (size_t)jl_array_nrows(depmods)) {
+            jl_value_t *mm = jl_array_ptr_ref(depmods, d2 - 1);
+            if (jl_is_module(mm))
+                movednames[nmovednames++] = jl_symbol_name(((jl_module_t*)mm)->name);
+        }
+    }
     size_t gt_checked = 0, gt_bad = 0, gt_shown = 0;
     const char *gt_verbose = getenv("JULIA_PKGIMAGE_RELINK_SELFCHECK");
     jl_value_t **memo = (jl_value_t**)calloc(tbl->n ? tbl->n : 1, sizeof(jl_value_t*));
@@ -4520,6 +4825,11 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
             // address can land mid-object. The writer names these instead (RELINK_UNKEYED
             // below, under JULIA_IMPORT_KEYS), where the object is live.
             dep_unkeyed[d]++;
+            if (relink_unmoved_blob_is_method(s, d, tbl->e[i].offset)) {
+                method_unverified++;
+                // no locator, so no record of what it could cite: assume the worst
+                method_unverified_moved++;
+            }
             continue;
         }
         dep_keyed[d]++;
@@ -4599,20 +4909,14 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
                     }
                 }
             }
-            // A method carries its roots, and this image's cached code may address them by
-            // a number a rebuild invalidates -- the contributing module's `build_id.lo`,
-            // written into the compressed IR by `jl_encode_as_indexed_root`. Rebuild that
-            // module and the key names no block of the new `root_blocks`, so the reference
-            // is unsatisfiable; before the check in `lookup_root` it was answered with a
-            // stray index and read as whatever happened to be there, which is how a Makie
-            // image repointed at a rebuilt Animations came to segfault in
-            // `jl_decode_value_any`. Refuse the method if this image cites that
-            // dependency's roots at all -- the scan above is what makes that answerable,
-            // and a method whose roots are never cited is safe to repoint.
-            if (ok && jl_is_method(got) && d < ndep && rootcited[d]) {
-                ok = 0;
-                rootkey_bad++;
-            }
+            // A method's digest commits to each contributor's root sequence (see
+            // `extkey_method_roots`), so acceptance here is what proves the numbers this
+            // image's compressed IR cites -- (contributor build_id, index) pairs no
+            // reference records -- still name the same values in the rebuilt dependency.
+            // A method entry that is *not* accepted leaves that unproven, which is what
+            // `method_unverified` below tallies: any of them forbids registering the
+            // build_id alias, and with it the repoint, whenever this image cites a moved
+            // dependency's roots at all.
             if (ok) {
                 accepted++;
                 dep_accepted[d]++;
@@ -4672,6 +4976,20 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
                                fail_at[i], tbl->e[i].loc);
         }
         if (failed || mismatched) {
+            if (relink_unmoved_blob_is_method(s, d, tbl->e[i].offset)) {
+                method_unverified++;
+                // block only if this method's write-time record says a moved dependency
+                // contributed roots to it -- the necessary condition for its IR-cited
+                // numbers to involve the rebuild at all
+                for (size_t q = 0; q < nmovednames; q++) {
+                    char pat[512];
+                    snprintf(pat, sizeof(pat), "|R%s/", movednames[q]);
+                    if (tbl->e[i].loc != NULL && strstr(tbl->e[i].loc, pat) != NULL) {
+                        method_unverified_moved++;
+                        break;
+                    }
+                }
+            }
             const char *kind = relink_loc_kind(tbl->e[i].loc, tbl->e[i].loclen);
             int q;
             for (q = 0; q < nrk; q++)
@@ -4704,8 +5022,8 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
     free(state);
     free(resolved_objs);
     free(fail_at);
-    jl_safe_printf("RELINK_PROBE entries=%zu keyed=%zu resolved=%zu accepted=%zu unresolved=%zu digest_mismatch=%zu uncompiled_extfn=%zu fabricated=%zu method_rootkey=%zu\n",
-                   tbl->n, keyed, resolved, accepted, unresolved, digest_bad, extfn_bad, fabricated, rootkey_bad);
+    jl_safe_printf("RELINK_PROBE entries=%zu keyed=%zu resolved=%zu accepted=%zu unresolved=%zu digest_mismatch=%zu uncompiled_extfn=%zu fabricated=%zu method_unverified=%zu\n",
+                   tbl->n, keyed, resolved, accepted, unresolved, digest_bad, extfn_bad, fabricated, method_unverified);
     jl_safe_printf("RELINK_SELFCHECK identical=%zu different=%zu\n", gt_checked - gt_bad, gt_bad);
     // kinds sorted by unresolved count, mismatches alongside; examples for the top two
     int order[RK_MAX];
@@ -4788,14 +5106,19 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
     for (size_t d = 0; d < relink_mismatched_ndeps; d++) {
         if (!relink_mismatched_deps[d])
             continue;
-        // Independent of anything imported: if this image's IR cites a root under the
-        // build_id the rebuilt dependency used to have, that citation is unsatisfiable now
-        // however few objects are repointed -- the root may belong to a method a third
-        // module owns, which this image can reach without importing anything from the
-        // dependency at all. Nothing here can repair it, so refuse the whole image.
+        // This image's IR cites a root under the build_id the rebuilt dependency used to
+        // have -- a number no reference records, so no per-entry check sees it. It is
+        // satisfiable against the rebuild exactly when every contributor's root sequence
+        // re-verified, and the method digests are what commit to those (see
+        // `extkey_method_roots`): the citation always anchors at a method this image
+        // imports, possibly one a *third* module owns, so one unverifiable method entry
+        // anywhere in the table -- refused, or unkeyed -- leaves a citation unprovable
+        // and refuses the whole image. Verified citations are answered at decode time by
+        // the build_id alias registered below.
         if (d < ndep && rootcited[d]) {
             moved_rootcited++;
-            relinkable = 0;
+            if (method_unverified_moved)
+                relinkable = 0;
         }
         if (d > maxdep || dep_entries[d] == 0)
             continue;
@@ -4806,9 +5129,32 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
         }
     }
     if (relink_mismatched_ndeps)
-        jl_safe_printf("RELINK_ROOTCITE deps_cited=%zu of %zu, rebuilt_and_cited=%zu\n",
+        jl_safe_printf("RELINK_ROOTCITE deps_cited=%zu of %zu, rebuilt_and_cited=%zu method_unverified_moved=%zu\n",
                        rootcited_n, relink_ndep_buildids ? relink_ndep_buildids - 1 : 0,
-                       moved_rootcited);
+                       moved_rootcited, method_unverified_moved);
+    // The caller repoints exactly under this condition. Register the build_id
+    // translation for each moved dependency whose roots this image cites: every method
+    // entry in the table verified (method_unverified == 0, checked above), so a citation
+    // (old build_id, index) is proven to name the same value under the new build_id.
+    // The table is only ever consulted by `lookup_root` on a key that matches no block,
+    // which cannot happen outside a repointed image's IR.
+    if (relinkable && relink_probe_buildid_mismatch) {
+        for (size_t d = 1; d < relink_mismatched_ndeps && d < ndep; d++) {
+            if (!relink_mismatched_deps[d] || !rootcited[d])
+                continue;
+            if (d - 1 < (size_t)jl_array_nrows(depmods)) {
+                jl_value_t *mm = jl_array_ptr_ref(depmods, d - 1);
+                if (jl_is_module(mm) && d < relink_ndep_buildids) {
+                    jl_relink_register_buildid_alias(relink_dep_buildid[d],
+                                                     ((jl_module_t*)mm)->build_id.lo);
+                    if (verbose)
+                        jl_safe_printf("RELINK_ROOT_ALIAS %s %016" PRIx64 " -> %016" PRIx64 "\n",
+                                       jl_symbol_name(((jl_module_t*)mm)->name),
+                                       relink_dep_buildid[d], ((jl_module_t*)mm)->build_id.lo);
+                }
+            }
+        }
+    }
     free(rootcited);
     if (relink_mismatched_ndeps)
         jl_safe_printf("RELINK_REPOINT rebuilt_deps_imported=%zu blocked=%zu -> %s\n",

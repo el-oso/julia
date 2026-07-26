@@ -796,6 +796,10 @@ void jl_append_method_roots(jl_method_t *m, uint64_t modid, jl_array_t* roots);
 int get_root_reference(rle_reference *rr, jl_method_t *m, size_t i) JL_NOTSAFEPOINT;
 jl_value_t *lookup_root(jl_method_t *m, uint64_t key, int index);
 int nroots_with_key(jl_method_t *m, uint64_t key) JL_NOTSAFEPOINT;
+// pkgimage relinking: a repointed image's IR cites method roots under the build_id its
+// dependency had at write time; the alias maps that to the rebuilt dependency's build_id
+void jl_relink_register_buildid_alias(uint64_t oldid, uint64_t newid);
+uint64_t jl_relink_buildid_alias(uint64_t oldid) JL_NOTSAFEPOINT;
 
 int jl_valid_type_param(jl_value_t *v);
 
