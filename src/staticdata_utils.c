@@ -939,10 +939,19 @@ static int jl_copy_roots(jl_array_t *method_roots_list, uint64_t key)
 // jl_restore_system_image_from_stream_ consumes it to abandon the restore after the
 // probe, so the mismatched cache is still refused and nothing stale ever executes.
 static int relink_probe_buildid_mismatch = 0;
+// Which dependencies mismatched, indexed by the deps-index every external reference
+// carries (`depmod_to_imageidx` numbers depmods[i] as i+1, with 0 reserved for the
+// sysimage). Only these dependencies' blobs have moved, so only references into them
+// have to be repointed; the rest still resolve by the pointer arithmetic they always did.
+static uint8_t *relink_mismatched_deps = NULL;
+static size_t relink_mismatched_ndeps = 0;
 
 static jl_value_t *read_verify_mod_list(ios_t *s, jl_array_t *depmods)
 {
     relink_probe_buildid_mismatch = 0;
+    free(relink_mismatched_deps);
+    relink_mismatched_deps = NULL;
+    relink_mismatched_ndeps = 0;
     if (!jl_main_module->build_id.lo) {
         return jl_get_exceptionf(jl_errorexception_type,
                 "Main module uuid state is invalid for module deserialization.");
@@ -972,6 +981,11 @@ static jl_value_t *read_verify_mod_list(ios_t *s, jl_array_t *depmods)
         if (m->build_id.hi != build_id.hi || m->build_id.lo != build_id.lo) {
             if (getenv("JULIA_PKGIMAGE_RELINK")) {
                 relink_probe_buildid_mismatch = 1;
+                if (relink_mismatched_deps == NULL) {
+                    relink_mismatched_ndeps = l + 1;
+                    relink_mismatched_deps = (uint8_t*)calloc(relink_mismatched_ndeps, 1);
+                }
+                relink_mismatched_deps[i + 1] = 1;
                 continue;
             }
             return jl_get_exceptionf(jl_errorexception_type,
