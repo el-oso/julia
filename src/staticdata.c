@@ -4437,7 +4437,19 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
             // concrete type instantiated from the copy is a duplicate too -- a miscompile,
             // not a wrong answer. Anything the parser fabricated lives in the heap rather
             // than in a loaded image, which is exactly the distinction to gate on.
-            if (ok && external_blob_index(got) >= n_linkage_blobs()) {
+            //
+            // Blob identity is the whole of that test, not merely "in some image". Every
+            // reference to this entry is encoded as (depsidx, offset) and means the object
+            // at that offset in *that* dependency's blob, so an object owned by any other
+            // image is not what the reference names however well it re-renders. Measured
+            // on Makie: 40 of the 42 resolutions that disagreed with ground truth were
+            // sibling code instances found in a different image than the one the reference
+            // cites, and the digest gate cannot see the difference because content is
+            // exactly what the two share.
+            size_t wantblob = ~(size_t)0;
+            if (d < jl_array_len(s->buildid_depmods_idxs))
+                wantblob = jl_array_data(s->buildid_depmods_idxs, uint32_t)[d];
+            if (ok && external_blob_index(got) != wantblob) {
                 ok = 0;
                 fabricated++;
             }
@@ -4445,7 +4457,7 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
             // equivalence class the key names, not merely a member of it
             if (ok && extfn != NULL && extfn[i]) {
                 jl_value_t *fn = relink_compiled_ci(got, tbl->e[i].digest);
-                if (fn == NULL) {
+                if (fn == NULL || external_blob_index(fn) != wantblob) {
                     ok = 0;
                     extfn_bad++;
                 }
