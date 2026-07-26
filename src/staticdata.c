@@ -4298,13 +4298,13 @@ static jl_value_t *relink_compiled_ci(jl_value_t *v, uint64_t digest) JL_NOTSAFE
 // Returns whether every dependency whose build_id moved came through with its whole edge
 // accepted -- the condition for repointing this image instead of rebuilding it. Fills in
 // `tbl->e[i].resolved` either way.
-static int jl_relink_probe(jl_import_table_t *tbl, jl_array_t *depmods, const uint8_t *extfn) JL_GC_DISABLED
+static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_array_t *depmods, const uint8_t *extfn) JL_GC_DISABLED
 {
     // scoped to this image's dependency set, like the type-variable table below
     extkey_reset_paths();
     extkey_build_paths(depmods);
     int verbose = getenv("JULIA_PKGIMAGE_RELINK_VERBOSE") != NULL;
-    size_t keyed = 0, resolved = 0, accepted = 0, unresolved = 0, digest_bad = 0, extfn_bad = 0;
+    size_t keyed = 0, resolved = 0, accepted = 0, unresolved = 0, digest_bad = 0, extfn_bad = 0, fabricated = 0;
     jl_value_t **memo = (jl_value_t**)calloc(tbl->n ? tbl->n : 1, sizeof(jl_value_t*));
     char *state = (char*)calloc(tbl->n ? tbl->n : 1, 1);
     // failures by locator kind, with a few examples of each kept for the report
@@ -4415,6 +4415,18 @@ static int jl_relink_probe(jl_import_table_t *tbl, jl_array_t *depmods, const ui
             resolved++;
             uint64_t h = 0;
             int ok = extkey_hash(got, &h) && h == tbl->e[i].digest;
+            // Resolution must *find* the object, not rebuild an equal one. A reference
+            // means the specific object the dependency owns, and the digest cannot tell
+            // the two apart: `Ref{T} where T` re-renders identically whether it is Core's
+            // wrapper or a fresh UnionAll binding a fresh TypeVar. Repointing at the copy
+            // gives the process two types that are equal and not identical, and every
+            // concrete type instantiated from the copy is a duplicate too -- a miscompile,
+            // not a wrong answer. Anything the parser fabricated lives in the heap rather
+            // than in a loaded image, which is exactly the distinction to gate on.
+            if (ok && external_blob_index(got) >= n_linkage_blobs()) {
+                ok = 0;
+                fabricated++;
+            }
             // an entry consumed as an `external_fns` slot needs a *compiled* member of the
             // equivalence class the key names, not merely a member of it
             if (ok && extfn != NULL && extfn[i]) {
@@ -4507,8 +4519,8 @@ static int jl_relink_probe(jl_import_table_t *tbl, jl_array_t *depmods, const ui
     free(state);
     free(resolved_objs);
     free(fail_at);
-    jl_safe_printf("RELINK_PROBE entries=%zu keyed=%zu resolved=%zu accepted=%zu unresolved=%zu digest_mismatch=%zu uncompiled_extfn=%zu\n",
-                   tbl->n, keyed, resolved, accepted, unresolved, digest_bad, extfn_bad);
+    jl_safe_printf("RELINK_PROBE entries=%zu keyed=%zu resolved=%zu accepted=%zu unresolved=%zu digest_mismatch=%zu uncompiled_extfn=%zu fabricated=%zu\n",
+                   tbl->n, keyed, resolved, accepted, unresolved, digest_bad, extfn_bad, fabricated);
     // kinds sorted by unresolved count, mismatches alongside; examples for the top two
     int order[RK_MAX];
     for (int q = 0; q < nrk; q++)
@@ -4597,6 +4609,44 @@ static int jl_relink_probe(jl_import_table_t *tbl, jl_array_t *depmods, const ui
     if (relink_mismatched_ndeps)
         jl_safe_printf("RELINK_REPOINT rebuilt_deps_imported=%zu blocked=%zu -> %s\n",
                        moved, moved_blocked, relinkable ? "repoint" : "rebuild");
+    // Ground truth, available whenever a dependency was *not* rebuilt: the object at
+    // `blob_base + offset` is by definition the one every reference to this entry means.
+    // Resolution has to reproduce it exactly, and the digest gate is what decides whether
+    // it did -- so comparing the two says whether the gate is strong enough. It costs
+    // nothing to run and needs no rebuild, which is what makes it a usable permanent gate.
+    if (getenv("JULIA_PKGIMAGE_RELINK_SELFCHECK")) {
+        size_t same = 0, differ = 0, shown = 0;
+        for (size_t i = 0; i < tbl->n; i++) {
+            jl_value_t *got = tbl->e[i].resolved;
+            uint32_t d = tbl->e[i].depsidx;
+            if (got == NULL)
+                continue;
+            if (d < relink_mismatched_ndeps && relink_mismatched_deps[d])
+                continue;   // that blob moved; the offset no longer names anything
+            if (d >= jl_array_len(s->buildid_depmods_idxs))
+                continue;
+            size_t bi = jl_array_data(s->buildid_depmods_idxs, uint32_t)[d];
+            if (2 * bi >= jl_linkage_blobs.len)
+                continue;
+            jl_value_t *want = (jl_value_t*)((uintptr_t)jl_linkage_blobs.items[2 * bi] +
+                                             tbl->e[i].offset * SYS_EXTERNAL_LINK_UNIT);
+            if (want == got) {
+                same++;
+                continue;
+            }
+            differ++;
+            if (shown < 12) {
+                shown++;
+                jl_safe_printf("RELINK_WRONG [%s] want=[%s] ", relink_loc_kind(tbl->e[i].loc, tbl->e[i].loclen),
+                               jl_typeof_str(want));
+                jl_static_show(JL_STDERR, want);
+                jl_safe_printf("\n    got=[%s] ", jl_typeof_str(got));
+                jl_static_show(JL_STDERR, got);
+                jl_safe_printf("\n    loc=%.300s\n", tbl->e[i].loc);
+            }
+        }
+        jl_safe_printf("RELINK_SELFCHECK identical=%zu different=%zu\n", same, differ);
+    }
     free(dep_entries);
     free(dep_keyed);
     free(dep_resolved);
@@ -7611,7 +7661,7 @@ static int jl_restore_system_image_from_stream_(ios_t *f, jl_image_t *image,
                         extfn[ent->idx] = 1;
                 }
             }
-            relink_ok = jl_relink_probe(itbl, depmods, extfn);
+            relink_ok = jl_relink_probe(&s, itbl, depmods, extfn);
             free(extfn);
             if (relink_ok && relink_probe_buildid_mismatch) {
                 for (size_t i = 0; i < nimports; i++)
