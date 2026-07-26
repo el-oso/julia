@@ -3461,6 +3461,42 @@ static jl_value_t *kp_value(keyparse_t *kp, int depth) JL_GC_DISABLED
         jl_sym_t *s;
         return kp_name(kp, &s) ? (jl_value_t*)s : NULL;
     }
+    if (kp_lit(kp, "s:")) {
+        // a string is exactly its bytes, and `jl_egal` on strings is content-wise, so a
+        // fresh allocation is the object -- the same re-box the `b:` case does. The hex
+        // run is self-delimiting: no closing delimiter is a hex digit.
+        const char *q = kp->p;
+        while (q + 2 <= kp->end && kp_hexdigit(q[0]) >= 0 && kp_hexdigit(q[1]) >= 0)
+            q += 2;
+        size_t nb = (size_t)(q - kp->p) / 2;
+        jl_value_t *str = jl_alloc_string(nb);
+        char *d = jl_string_data(str);
+        for (size_t i = 0; i < nb; i++) {
+            d[i] = (char)((kp_hexdigit(kp->p[0]) << 4) | kp_hexdigit(kp->p[1]));
+            kp->p += 2;
+        }
+        return str;
+    }
+    if (kp_lit(kp, "V:")) {
+        // element-wise, exactly as written; `jl_egal` on simple vectors is content-wise
+        // (`compare_svec`), so a fresh svec whose elements resolved is the object, the
+        // same way a re-boxed immutable is.
+        size_t n;
+        if (!kp_uint(kp, &n) || !kp_char(kp, '<'))
+            return NULL;
+        jl_svec_t *sv = jl_alloc_svec(n);
+        for (size_t i = 0; i < n; i++) {
+            if (i && !kp_char(kp, ','))
+                return NULL;
+            if (kp_char(kp, '0'))
+                continue;   // a NULL slot, written as `0`; no locator begins with a digit
+            jl_value_t *e = kp_param(kp, depth + 1, 0);
+            if (e == NULL)
+                return NULL;
+            jl_svecset(sv, i, e);
+        }
+        return kp_char(kp, '>') ? (jl_value_t*)sv : NULL;
+    }
     if (kp_lit(kp, "F:")) {
         // The module and name locate the definition site for a reader; what actually finds
         // the method is the signature, which is what distinguishes the methods of one
@@ -3643,7 +3679,7 @@ static void jl_check_key_parse(jl_serializer_state *s, jl_array_t *mod_array) JL
         size_t len = (size_t)ios_pos(&k);
         ios_putc('\0', &k);   // the key is not NUL-terminated in the stream; printing needs it
         // only the kinds this parser covers so far; the rest are counted, not guessed at
-        if (len < 2 || strchr("MNBSTObFIC#UAX@", k.buf[0]) == NULL) {
+        if (len < 2 || strchr("MNBSTObFICVs#UAX@", k.buf[0]) == NULL) {
             unsupported++;
             continue;
         }
@@ -3705,6 +3741,42 @@ static void jl_check_key_parse(jl_serializer_state *s, jl_array_t *mod_array) JL
                    idbytes, locbytes, locbytes ? (double)idbytes / (double)locbytes : 0.0);
 }
 
+// The leading tag of a locator names the kind of object it locates; used only for
+// reporting, so an unknown first byte is a category of its own rather than an error.
+static const char *relink_loc_kind(const char *loc, uint32_t len) JL_NOTSAFEPOINT
+{
+    if (len == 0)
+        return "(empty)";
+    if (len >= 2 && loc[0] == 'M' && loc[1] == 'T')
+        return "MT: methodtable";
+    if (len >= 2 && loc[0] == 'T' && loc[1] == 'V')
+        return "TV typevar";
+    switch (loc[0]) {
+    case 'C': return "C: codeinst";
+    case 'I': return "I: methodinst";
+    case 'F': return "F: method";
+    case 'T': return "T: datatype";
+    case 'M': return "M: module";
+    case 'B': return "B: binding";
+    case 'N': return "N: typename";
+    case 'S': return "S: symbol";
+    case 'O': return "O: singleton";
+    case 'b': return "b: boxed";
+    case 's': return "s: string";
+    case 'v': return "v: struct";
+    case 'D': return "D: debuginfo";
+    case 'V': return "V: simplevec";
+    case 'G': return "G: memory";
+    case 'R': return "R: globalref";
+    case '@': return "@ reference";
+    case '#': return "# binder";
+    case 'A': return "A< unionall";
+    case 'U': return "U union";
+    case 'X': return "X< vararg";
+    }
+    return "(other)";
+}
+
 // ---- The import table as the loader sees it ----
 //
 // At save time the table is a list of live objects. At load time it is this: a deps-index,
@@ -3722,9 +3794,31 @@ static void jl_relink_probe(jl_import_table_t *tbl, jl_array_t *depmods) JL_GC_D
     size_t keyed = 0, resolved = 0, accepted = 0, unresolved = 0, digest_bad = 0;
     jl_value_t **memo = (jl_value_t**)calloc(tbl->n ? tbl->n : 1, sizeof(jl_value_t*));
     char *state = (char*)calloc(tbl->n ? tbl->n : 1, 1);
+    // failures by locator kind, with a few examples of each kept for the report
+#define RK_MAX 24
+#define RK_NEX 5
+    const char *rk_name[RK_MAX];
+    size_t rk_unres[RK_MAX], rk_mis[RK_MAX], rk_nex[RK_MAX];
+    size_t rk_ex[RK_MAX][RK_NEX], rk_exat[RK_MAX][RK_NEX];
+    int nrk = 0;
+    // per-dependency tallies: re-linking is all-or-nothing per edge, so the number that
+    // matters is how many dependencies come through with every entry accepted
+    uint32_t maxdep = 0;
+    for (size_t i = 0; i < tbl->n; i++)
+        if (tbl->e[i].depsidx > maxdep)
+            maxdep = tbl->e[i].depsidx;
+    size_t *dep_entries = (size_t*)calloc(maxdep + 1, sizeof(size_t));
+    size_t *dep_keyed = (size_t*)calloc(maxdep + 1, sizeof(size_t));
+    size_t *dep_resolved = (size_t*)calloc(maxdep + 1, sizeof(size_t));
+    size_t *dep_accepted = (size_t*)calloc(maxdep + 1, sizeof(size_t));
+    jl_value_t **dep_rep = (jl_value_t**)calloc(maxdep + 1, sizeof(jl_value_t*));
+    memset(kp_ci_miss, 0, sizeof(kp_ci_miss));
     for (size_t i = 0; i < tbl->n; i++) {
+        uint32_t d = tbl->e[i].depsidx;
+        dep_entries[d]++;
         if (tbl->e[i].loclen == 0)
             continue;
+        dep_keyed[d]++;
         keyed++;
         keyparse_t kp;
         kp.p = tbl->e[i].loc;
@@ -3737,30 +3831,126 @@ static void jl_relink_probe(jl_import_table_t *tbl, jl_array_t *depmods) JL_GC_D
         kp.nmemo = tbl->n;
         kp.nbind = 0;
         jl_value_t *got = kp_value(&kp, 0);
-        if (got == NULL || kp.p != kp.end) {
+        int failed = got == NULL || kp.p != kp.end;
+        int mismatched = 0;
+        if (!failed) {
+            dep_resolved[d]++;
+            resolved++;
+            uint64_t h = 0;
+            if (extkey_hash(got, &h) && h == tbl->e[i].digest) {
+                accepted++;
+                dep_accepted[d]++;
+                if (dep_rep[d] == NULL)
+                    dep_rep[d] = got;
+                tbl->e[i].resolved = got;
+            }
+            else {
+                digest_bad++;
+                mismatched = 1;
+                if (verbose)
+                    jl_safe_printf("RELINK_DIGEST_MISMATCH [%s] %s\n",
+                                   jl_typeof_str(got), tbl->e[i].loc);
+            }
+        }
+        else {
             unresolved++;
             if (verbose)
                 jl_safe_printf("RELINK_UNRESOLVED at+%zu %s\n",
                                (size_t)(kp.p - tbl->e[i].loc), tbl->e[i].loc);
-            continue;
         }
-        resolved++;
-        uint64_t h = 0;
-        if (extkey_hash(got, &h) && h == tbl->e[i].digest) {
-            accepted++;
-            tbl->e[i].resolved = got;
-        }
-        else {
-            digest_bad++;
-            if (verbose)
-                jl_safe_printf("RELINK_DIGEST_MISMATCH [%s] %s\n",
-                               jl_typeof_str(got), tbl->e[i].loc);
+        if (failed || mismatched) {
+            const char *kind = relink_loc_kind(tbl->e[i].loc, tbl->e[i].loclen);
+            int q;
+            for (q = 0; q < nrk; q++)
+                if (rk_name[q] == kind)
+                    break;
+            if (q == nrk && nrk < RK_MAX) {
+                rk_name[nrk] = kind;
+                rk_unres[nrk] = rk_mis[nrk] = rk_nex[nrk] = 0;
+                nrk++;
+            }
+            if (q < nrk) {
+                if (failed) {
+                    rk_unres[q]++;
+                    if (rk_nex[q] < RK_NEX) {
+                        rk_ex[q][rk_nex[q]] = i;
+                        rk_exat[q][rk_nex[q]] = (size_t)(kp.p - tbl->e[i].loc);
+                        rk_nex[q]++;
+                    }
+                }
+                else {
+                    rk_mis[q]++;
+                }
+            }
         }
     }
     free(memo);
     free(state);
     jl_safe_printf("RELINK_PROBE entries=%zu keyed=%zu resolved=%zu accepted=%zu unresolved=%zu digest_mismatch=%zu\n",
                    tbl->n, keyed, resolved, accepted, unresolved, digest_bad);
+    // kinds sorted by unresolved count, mismatches alongside; examples for the top two
+    int order[RK_MAX];
+    for (int q = 0; q < nrk; q++)
+        order[q] = q;
+    for (int a = 1; a < nrk; a++) {
+        int t = order[a], b = a;
+        while (b > 0 && rk_unres[order[b - 1]] < rk_unres[t]) {
+            order[b] = order[b - 1];
+            b--;
+        }
+        order[b] = t;
+    }
+    for (int q = 0; q < nrk; q++)
+        jl_safe_printf("RELINK_KIND %-16s unresolved=%zu digest_mismatch=%zu\n",
+                       rk_name[order[q]], rk_unres[order[q]], rk_mis[order[q]]);
+    for (int q = 0; q < nrk && q < 2; q++) {
+        int k = order[q];
+        for (size_t x = 0; x < rk_nex[k]; x++) {
+            size_t i = rk_ex[k][x];
+            jl_safe_printf("RELINK_EXAMPLE %-16s at+%zu %.200s\n",
+                           rk_name[k], rk_exat[k][x], tbl->e[i].loc);
+        }
+    }
+    for (int r = 0; r < KP_CI_NREASON; r++)
+        if (kp_ci_miss[r])
+            jl_safe_printf("RELINK_CI %-14s %zu\n", kp_ci_reason[r], kp_ci_miss[r]);
+    memset(kp_ci_miss, 0, sizeof(kp_ci_miss));
+    // per-dependency: an edge survives a rebuild only if every entry from it is accepted,
+    // keyed and unkeyed alike -- an unkeyed entry cannot be re-linked at all
+    size_t ndeps = 0, full_keyed = 0, full_all = 0;
+    for (uint32_t d = 0; d <= maxdep; d++) {
+        if (dep_entries[d] == 0)
+            continue;
+        ndeps++;
+        if (dep_accepted[d] == dep_keyed[d])
+            full_keyed++;
+        if (dep_accepted[d] == dep_entries[d])
+            full_all++;
+        // best-effort name: the blob an accepted object lives in belongs to one dependency
+        const char *name = "?";
+        if (dep_rep[d] != NULL) {
+            size_t blob = external_blob_index(dep_rep[d]);
+            for (size_t mi = 0; mi < jl_array_nrows(depmods); mi++) {
+                jl_value_t *m = jl_array_ptr_ref(depmods, mi);
+                if (jl_is_module(m) && external_blob_index(m) == blob) {
+                    name = jl_symbol_name(((jl_module_t*)m)->name);
+                    break;
+                }
+            }
+        }
+        jl_safe_printf("RELINK_DEP idx=%u name=%s entries=%zu keyed=%zu resolved=%zu accepted=%zu\n",
+                       d, name, dep_entries[d], dep_keyed[d], dep_resolved[d], dep_accepted[d]);
+    }
+    jl_safe_printf("RELINK_DEPS ndeps=%zu fully_accepted_keyed=%zu (%.1f%%) fully_accepted_all=%zu (%.1f%%)\n",
+                   ndeps, full_keyed, ndeps ? 100.0 * (double)full_keyed / (double)ndeps : 0.0,
+                   full_all, ndeps ? 100.0 * (double)full_all / (double)ndeps : 0.0);
+    free(dep_entries);
+    free(dep_keyed);
+    free(dep_resolved);
+    free(dep_accepted);
+    free(dep_rep);
+#undef RK_MAX
+#undef RK_NEX
 }
 
 static void jl_shadow_resolve_imports(jl_serializer_state *s, jl_array_t *mod_array) JL_GC_DISABLED
