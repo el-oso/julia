@@ -2113,12 +2113,26 @@ static int extkey_equiv(jl_value_t *oa, jl_value_t *ob) JL_NOTSAFEPOINT
     return 0;
 }
 
+// Drop the type-variable table so the next build starts from its own object set. The
+// table is scoped to one image's imports -- the writer's at save, one loaded table's at
+// relink -- and letting a previous image's registrations leak into the next would move
+// the deterministic (binder, position) winners and change the keys.
+static void extkey_reset_tvars(void) JL_NOTSAFEPOINT
+{
+    if (!extkey_tvars_ready)
+        return;
+    for (size_t i = 0; i < extkey_tvars.size; i += 2)
+        if (extkey_tvars.table[i + 1] != HT_NOTFOUND)
+            free(extkey_tvars.table[i + 1]);
+    htable_free(&extkey_tvars);
+    extkey_tvars_ready = 0;
+}
+
 // Register every type variable bound by any imported type, so that a type variable
 // reached on its own can still be named. Must run before any key is computed.
 static void extkey_build_tvars(jl_serializer_state *s) JL_NOTSAFEPOINT
 {
-    if (extkey_tvars_ready)
-        return;
+    extkey_reset_tvars();
     htable_new(&extkey_tvars, 0);
     extkey_tvars_ready = 1;
     for (size_t i = 0; i < s->import_objs.len; i++) {
@@ -3396,7 +3410,20 @@ static jl_value_t *kp_type(keyparse_t *kp, int depth, int tdepth) JL_GC_DISABLED
         }
         if (!kp_char(kp, '>'))
             return NULL;
-        return jl_type_union(parts, n);
+        // Rebuild the tree verbatim -- right-nested over the written sequence, which is
+        // the writer object's in-order flattening -- rather than through
+        // `jl_type_union`. The canonicalizer of *today* may simplify what the writer's
+        // object kept: measured on Makie, a union built by the intersection machinery
+        // held two structurally identical components (distinct TypeVar allocations), and
+        // `jl_type_union` collapsed them on rebuild, so the resolved type re-rendered
+        // shorter than the identity the digest was taken over and the gate refused it,
+        // cascading into every TypeVar the collapsed binder introduced. A verbatim
+        // rebuild re-renders to exactly the written sequence, and such trees are legal:
+        // the writer's own live object has this very structure.
+        jl_value_t *u = parts[n - 1];
+        for (size_t i = n - 1; i > 0; i--)
+            u = jl_new_struct(jl_uniontype_type, parts[i - 1], u);
+        return u;
     }
     if (kp_lit(kp, "A<")) {
         jl_value_t *lb = kp_type(kp, depth, tdepth + 1);
@@ -3723,6 +3750,69 @@ static jl_value_t *kp_value(keyparse_t *kp, int depth) JL_GC_DISABLED
         }
         return kp_char(kp, '}') ? v : NULL;
     }
+    if (kp_lit(kp, "R:")) {
+        // a global reference is exactly the module and name it names; the module's
+        // canonical globalref for that name is re-derived rather than reused
+        jl_sym_t *path[SHADOW_MAX_MODPATH];
+        int n = kp_path(kp, path, SHADOW_MAX_MODPATH);
+        if (n < 2)
+            return NULL;
+        jl_module_t *m = shadow_find_module(kp->mod_array, path, n - 1);
+        if (m == NULL)
+            return NULL;
+        return jl_module_globalref(m, path[n - 1]);
+    }
+    if (kp_lit(kp, "G:")) {
+        // a GenericMemory is its type plus its contents: rebuild a fresh one from
+        // re-derived parts, exactly as `V:` rebuilds a simple vector. The element
+        // conditions (boxed recurse; inline bytes only without pointers or padding) are
+        // re-checked so a byte run is only ever interpreted the way it was written.
+        jl_value_t *t = kp_type(kp, depth, 0);
+        if (t == NULL || !jl_is_datatype(t) ||
+            ((jl_datatype_t*)t)->name != jl_genericmemory_typename)
+            return NULL;
+        const jl_datatype_layout_t *lo = ((jl_datatype_t*)t)->layout;
+        // `instance` is the empty-memory singleton, created with the layout; without it
+        // `jl_alloc_genericmemory` would throw rather than allocate
+        if (lo == NULL || ((jl_datatype_t*)t)->instance == NULL || !kp_char(kp, '<'))
+            return NULL;
+        size_t len;
+        if (!kp_uint(kp, &len) || !kp_char(kp, ':'))
+            return NULL;
+        if (len > (size_t)(kp->end - kp->p) + 1)
+            return NULL;   // longer than the remaining text could possibly encode
+        jl_genericmemory_t *m = jl_alloc_genericmemory(t, len);
+        if (lo->flags.arrayelem_isboxed) {
+            // fresh boxed memory is zero-initialized, so a `0` (NULL) slot needs no write
+            for (size_t i = 0; i < len; i++) {
+                if (i && !kp_char(kp, ','))
+                    return NULL;
+                if (kp_char(kp, '0'))
+                    continue;
+                jl_value_t *e = kp_param(kp, depth + 1, 0);
+                if (e == NULL)
+                    return NULL;
+                jl_genericmemory_ptr_set(m, i, e);
+            }
+        }
+        else if (lo->npointers == 0 && !lo->flags.haspadding) {
+            size_t nb = len * lo->size;
+            char *d = (char*)m->ptr;
+            for (size_t b = 0; b < nb; b++) {
+                if (kp->p + 2 > kp->end)
+                    return NULL;
+                int hi = kp_hexdigit(*kp->p++);
+                int l0 = kp_hexdigit(*kp->p++);
+                if (hi < 0 || l0 < 0)
+                    return NULL;
+                d[b] = (char)((hi << 4) | l0);
+            }
+        }
+        else {
+            return NULL;   // inline elements carrying pointers or padding
+        }
+        return kp_char(kp, '>') ? (jl_value_t*)m : NULL;
+    }
     return kp_type(kp, depth, 0);
 }
 
@@ -3758,7 +3848,7 @@ static void jl_check_key_parse(jl_serializer_state *s, jl_array_t *mod_array) JL
         size_t len = (size_t)ios_pos(&k);
         ios_putc('\0', &k);   // the key is not NUL-terminated in the stream; printing needs it
         // only the kinds this parser covers so far; the rest are counted, not guessed at
-        if (len < 2 || strchr("MNBSTObvFICVs#UAX@", k.buf[0]) == NULL) {
+        if (len < 2 || strchr("MNBSTObvFICVsGR#UAX@", k.buf[0]) == NULL) {
             unsupported++;
             continue;
         }
@@ -3892,16 +3982,16 @@ static void jl_relink_probe(jl_import_table_t *tbl, jl_array_t *depmods) JL_GC_D
     size_t *dep_accepted = (size_t*)calloc(maxdep + 1, sizeof(size_t));
     jl_value_t **dep_rep = (jl_value_t**)calloc(maxdep + 1, sizeof(jl_value_t*));
     memset(kp_ci_miss, 0, sizeof(kp_ci_miss));
+    // Pass 1: resolve every locator. The identity checks wait for pass 2, because
+    // re-rendering an object that contains a bare TypeVar needs the type-variable table
+    // below, and that table is built from the resolved objects.
+    jl_value_t **resolved_objs = (jl_value_t**)calloc(tbl->n ? tbl->n : 1, sizeof(jl_value_t*));
+    size_t *fail_at = (size_t*)calloc(tbl->n ? tbl->n : 1, sizeof(size_t));
     for (size_t i = 0; i < tbl->n; i++) {
-        uint32_t d = tbl->e[i].depsidx;
-        dep_entries[d]++;
         if (tbl->e[i].loclen == 0)
             continue;
-        dep_keyed[d]++;
-        keyed++;
         keyparse_t kp;
-        kp.p = tbl->e[i].loc;
-        kp.end = kp.p + tbl->e[i].loclen;
+        kp.p = kp.end = tbl->e[i].loc;
         kp.mod_array = depmods;
         kp.st = NULL;
         kp.tbl = tbl;
@@ -3909,8 +3999,54 @@ static void jl_relink_probe(jl_import_table_t *tbl, jl_array_t *depmods) JL_GC_D
         kp.memo_state = state;
         kp.nmemo = tbl->n;
         kp.nbind = 0;
-        jl_value_t *got = kp_value(&kp, 0);
-        int failed = got == NULL || kp.p != kp.end;
+        // Resolve through the memo, exactly as a citation of this entry would: an entry
+        // must resolve to *one* object however it is reached. A second, direct parse
+        // would rebuild a second copy of anything not interned -- a fresh `UnionAll`
+        // binds fresh variables, so the copy registered in the type-variable table below
+        // would not be the copy a `TV@` citation walks, and every such variable would
+        // fail to re-render.
+        jl_value_t *got = kp_ref(&kp, i + 1);
+        if (got != NULL) {
+            resolved_objs[i] = got;
+        }
+        else {
+            // re-parse only to recover how far the locator got, for the failure report
+            kp.p = tbl->e[i].loc;
+            kp.end = kp.p + tbl->e[i].loclen;
+            kp.nbind = 0;
+            (void)kp_value(&kp, 0);
+            fail_at[i] = (size_t)(kp.p - tbl->e[i].loc);
+        }
+    }
+    // Rebuild the type-variable table from the *resolved* objects, in table order --
+    // exactly the writer's own loop over its import list, so a bare TypeVar re-renders
+    // to the same `TV:binder-digest/position` text the digest was taken over. Without
+    // this the writer-side table (built only at save time) is absent here, every
+    // resolved TypeVar fails to re-render, and the gate refuses it despite the
+    // resolution being correct. The table is scoped to this image: entries another
+    // image registered would move the deterministic winners, so reset first.
+    extkey_reset_tvars();
+    htable_new(&extkey_tvars, 0);
+    extkey_tvars_ready = 1;
+    for (size_t i = 0; i < tbl->n; i++) {
+        jl_value_t *v = resolved_objs[i];
+        if (v == NULL || !jl_is_type(v))
+            continue;
+        uint64_t h = 0;
+        if (extkey_hash(v, &h))
+            { int ord = 0; extkey_register_tvars(v, h, v, &ord, EXTKEY_MAX_TYPEDEPTH); }
+    }
+    // Pass 2: the digest gate, unchanged -- the identity of what was resolved must
+    // reproduce the digest the image recorded, byte for byte.
+    for (size_t i = 0; i < tbl->n; i++) {
+        uint32_t d = tbl->e[i].depsidx;
+        dep_entries[d]++;
+        if (tbl->e[i].loclen == 0)
+            continue;
+        dep_keyed[d]++;
+        keyed++;
+        jl_value_t *got = resolved_objs[i];
+        int failed = got == NULL;
         int mismatched = 0;
         if (!failed) {
             dep_resolved[d]++;
@@ -3926,16 +4062,40 @@ static void jl_relink_probe(jl_import_table_t *tbl, jl_array_t *depmods) JL_GC_D
             else {
                 digest_bad++;
                 mismatched = 1;
-                if (verbose)
-                    jl_safe_printf("RELINK_DIGEST_MISMATCH [%s] %s\n",
-                                   jl_typeof_str(got), tbl->e[i].loc);
+                // full texts survive only in a file: `jl_safe_printf` truncates, and the
+                // interesting mismatches are exactly the giant nested unionalls
+                const char *misdump = getenv("JULIA_PKGIMAGE_RELINK_MISDUMP");
+                if (misdump) {
+                    ios_t md;
+                    if (ios_file(&md, misdump, 1, 1, 1, 0) != NULL) {
+                        ios_seek_end(&md);
+                        ios_printf(&md, "ENTRY %zu digest=%016" PRIx64 "\nLOC %s\nID ",
+                                   i, tbl->e[i].digest, tbl->e[i].loc);
+                        if (!extkey_write(&md, got, 0))
+                            ios_puts("(unrenderable)", &md);
+                        ios_putc('\n', &md);
+                        ios_close(&md);
+                    }
+                }
+                if (verbose) {
+                    // the recomputed identity, so a mismatch shows *what* re-rendered
+                    // differently rather than only that something did
+                    ios_t idbuf;
+                    ios_mem(&idbuf, 256);
+                    int idok = extkey_write(&idbuf, got, 0);
+                    ios_putc('\0', &idbuf);
+                    jl_safe_printf("RELINK_DIGEST_MISMATCH [%s] %s\n    id=%s\n",
+                                   jl_typeof_str(got), tbl->e[i].loc,
+                                   idok ? idbuf.buf : "(unrenderable)");
+                    ios_close(&idbuf);
+                }
             }
         }
         else {
             unresolved++;
             if (verbose)
                 jl_safe_printf("RELINK_UNRESOLVED at+%zu %s\n",
-                               (size_t)(kp.p - tbl->e[i].loc), tbl->e[i].loc);
+                               fail_at[i], tbl->e[i].loc);
         }
         if (failed || mismatched) {
             const char *kind = relink_loc_kind(tbl->e[i].loc, tbl->e[i].loclen);
@@ -3953,7 +4113,7 @@ static void jl_relink_probe(jl_import_table_t *tbl, jl_array_t *depmods) JL_GC_D
                     rk_unres[q]++;
                     if (rk_nex[q] < RK_NEX) {
                         rk_ex[q][rk_nex[q]] = i;
-                        rk_exat[q][rk_nex[q]] = (size_t)(kp.p - tbl->e[i].loc);
+                        rk_exat[q][rk_nex[q]] = fail_at[i];
                         rk_nex[q]++;
                     }
                 }
@@ -3965,6 +4125,8 @@ static void jl_relink_probe(jl_import_table_t *tbl, jl_array_t *depmods) JL_GC_D
     }
     free(memo);
     free(state);
+    free(resolved_objs);
+    free(fail_at);
     jl_safe_printf("RELINK_PROBE entries=%zu keyed=%zu resolved=%zu accepted=%zu unresolved=%zu digest_mismatch=%zu\n",
                    tbl->n, keyed, resolved, accepted, unresolved, digest_bad);
     // kinds sorted by unresolved count, mismatches alongside; examples for the top two
