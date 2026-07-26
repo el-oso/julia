@@ -926,6 +926,12 @@ static int relink_probe_buildid_mismatch = 0;
 // have to be repointed; the rest still resolve by the pointer arithmetic they always did.
 static uint8_t *relink_mismatched_deps = NULL;
 static size_t relink_mismatched_ndeps = 0;
+// The build_id.lo this image recorded for each dependency, indexed the same way. That
+// number is not only how a dependency is identified: compressed IR addresses a method's
+// roots by the build_id of the module that contributed them, so it also appears inside
+// this image's own bytes wherever it cites one. See `relink_scan_for_key`.
+static uint64_t *relink_dep_buildid = NULL;
+static size_t relink_ndep_buildids = 0;
 
 static jl_value_t *read_verify_mod_list(ios_t *s, jl_array_t *depmods)
 {
@@ -933,11 +939,19 @@ static jl_value_t *read_verify_mod_list(ios_t *s, jl_array_t *depmods)
     free(relink_mismatched_deps);
     relink_mismatched_deps = NULL;
     relink_mismatched_ndeps = 0;
+    free(relink_dep_buildid);
+    relink_dep_buildid = NULL;
+    relink_ndep_buildids = 0;
     if (!jl_main_module->build_id.lo) {
         return jl_get_exceptionf(jl_errorexception_type,
                 "Main module uuid state is invalid for module deserialization.");
     }
     size_t i, l = jl_array_nrows(depmods);
+    int want_relink = getenv("JULIA_PKGIMAGE_RELINK") != NULL;
+    if (want_relink) {
+        relink_ndep_buildids = l + 1;
+        relink_dep_buildid = (uint64_t*)calloc(relink_ndep_buildids, sizeof(uint64_t));
+    }
     for (i = 0; ; i++) {
         size_t len = read_int32(s);
         if (len == 0 && i == l)
@@ -959,8 +973,10 @@ static jl_value_t *read_verify_mod_list(ios_t *s, jl_array_t *depmods)
             return jl_get_exceptionf(jl_errorexception_type,
                 "Invalid input in module list: expected %s.", name);
         }
+        if (want_relink && i + 1 < relink_ndep_buildids)
+            relink_dep_buildid[i + 1] = build_id.lo;
         if (m->build_id.hi != build_id.hi || m->build_id.lo != build_id.lo) {
-            if (getenv("JULIA_PKGIMAGE_RELINK")) {
+            if (want_relink) {
                 relink_probe_buildid_mismatch = 1;
                 if (relink_mismatched_deps == NULL) {
                     relink_mismatched_ndeps = l + 1;
