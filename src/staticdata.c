@@ -1212,6 +1212,29 @@ static int extkey_type(ios_t *k, jl_value_t *t, extkey_binder_t *env, int depth,
 // `EXTKEY_MAX_TYPEDEPTH`.
 #define extkey_type_toplevel(k, t) extkey_type(k, t, NULL, 0, 0)
 
+// One string cannot be both the identity and the locator of an object, and trying to make
+// it be both is what left the `TypeVar` keys unresolvable and the keys far larger than they
+// need to be.
+//
+// The *identity* is what two builds compare: it must contain nothing build-specific, so it
+// expands every sub-object in full, and it is what the digest is taken over. The *locator*
+// is what this image reads back at load: it may cite an index into this image's own import
+// table, exactly as every external reference already does, because that table is written
+// and read by the same image. Locator mode is that second rendering; the identity is
+// unchanged, which is why the stability measurements still hold.
+static htable_t *extkey_import_index = NULL;   // jl_value_t* -> 1-based import index
+
+static int extkey_import_ref(jl_value_t *v, size_t *out) JL_NOTSAFEPOINT
+{
+    if (extkey_import_index == NULL)
+        return 0;
+    void *p = ptrhash_get(extkey_import_index, v);
+    if (p == HT_NOTFOUND)
+        return 0;
+    *out = (size_t)(uintptr_t)p;
+    return 1;
+}
+
 // Digest of a source file's contents, cached per file symbol. Used to give method keys a
 // body identity: without one, a rebuilt dependency whose method bodies changed but whose
 // signatures did not would re-link silently, and dispatch-based revalidation cannot catch
@@ -1275,7 +1298,7 @@ static int extkey_file_digest(jl_sym_t *file, uint64_t *out) JL_NOTSAFEPOINT
 // reached on its own -- as a method instance's static parameter, say -- has no identity of
 // its own, but if some imported type binds it, then "the variable introduced by the binder
 // at this depth of that type" names it stably. Built once per serialization.
-typedef struct { uint64_t binder; int depth; } extkey_tvar_t;
+typedef struct { uint64_t binder; int depth; jl_value_t *bobj; } extkey_tvar_t;
 static htable_t extkey_tvars;
 static int extkey_tvars_ready = 0;
 
@@ -1291,7 +1314,7 @@ static const extkey_tvar_t *extkey_lookup_tvar(jl_value_t *v) JL_NOTSAFEPOINT
 // enough: two sibling binders at the same depth, as in `Tuple{Vector{T} where T,
 // Vector{S} where S}`, would share it and merge two distinct variables. Pre-order position
 // is structural, so it is identical in any build of the same type.
-static void extkey_register_tvars(jl_value_t *t, uint64_t binder, int *ord,
+static void extkey_register_tvars(jl_value_t *t, uint64_t binder, jl_value_t *bobj, int *ord,
                                   int fuel) JL_NOTSAFEPOINT
 {
     if (t == NULL || fuel <= 0)
@@ -1304,6 +1327,7 @@ static void extkey_register_tvars(jl_value_t *t, uint64_t binder, int *ord,
             extkey_tvar_t *e = (extkey_tvar_t*)malloc_s(sizeof(extkey_tvar_t));
             e->binder = binder;
             e->depth = here;
+            e->bobj = bobj;
             *bp = e;
         }
         else {
@@ -1313,22 +1337,23 @@ static void extkey_register_tvars(jl_value_t *t, uint64_t binder, int *ord,
             if (binder < e->binder || (binder == e->binder && here < e->depth)) {
                 e->binder = binder;
                 e->depth = here;
+                e->bobj = bobj;
             }
         }
-        extkey_register_tvars(ua->var->lb, binder, ord, fuel - 1);
-        extkey_register_tvars(ua->var->ub, binder, ord, fuel - 1);
-        extkey_register_tvars(ua->body, binder, ord, fuel - 1);
+        extkey_register_tvars(ua->var->lb, binder, bobj, ord, fuel - 1);
+        extkey_register_tvars(ua->var->ub, binder, bobj, ord, fuel - 1);
+        extkey_register_tvars(ua->body, binder, bobj, ord, fuel - 1);
         return;
     }
     if (jl_is_uniontype(t)) {
-        extkey_register_tvars(((jl_uniontype_t*)t)->a, binder, ord, fuel - 1);
-        extkey_register_tvars(((jl_uniontype_t*)t)->b, binder, ord, fuel - 1);
+        extkey_register_tvars(((jl_uniontype_t*)t)->a, binder, bobj, ord, fuel - 1);
+        extkey_register_tvars(((jl_uniontype_t*)t)->b, binder, bobj, ord, fuel - 1);
         return;
     }
     if (jl_is_datatype(t)) {
         jl_svec_t *ps = ((jl_datatype_t*)t)->parameters;
         for (size_t i = 0; i < jl_svec_len(ps); i++)
-            extkey_register_tvars(jl_svecref(ps, i), binder, ord, fuel - 1);
+            extkey_register_tvars(jl_svecref(ps, i), binder, bobj, ord, fuel - 1);
     }
 }
 
@@ -1547,6 +1572,22 @@ static int extkey_type(ios_t *k, jl_value_t *t, extkey_binder_t *env, int depth,
 {
     if (t == NULL || depth > EXTKEY_MAX_DEPTH || tdepth > EXTKEY_MAX_TYPEDEPTH)
         return 0;
+    // Most of a key is nested types, so this is where citing an import instead of
+    // expanding it actually pays. Only outside a binder, though: a type carrying free
+    // variables means them relative to the binder being rebuilt around it, and an entry
+    // resolved by index would carry the original variables instead.
+    // Never cite a bare type variable: resolving one rebuilds a fresh variable rather than
+    // finding the original, so the citing type comes back with a different variable in it --
+    // measured as `DenseArray{T, 1}` resolving to `DenseArray{_, 1}`, six times in
+    // SparseArrays. A type that merely *contains* free variables is safe, because citing it
+    // finds that object itself.
+    if (tdepth > 0 && env == NULL && !jl_is_typevar(t)) {
+        size_t idx;
+        if (extkey_import_ref(t, &idx)) {
+            ios_printf(k, "@%zu", idx);
+            return 1;
+        }
+    }
     if (jl_is_typevar(t)) {
         int i = 0;
         for (extkey_binder_t *b = env; b != NULL; b = b->outer, i++) {
@@ -1629,10 +1670,29 @@ static int extkey_type(ios_t *k, jl_value_t *t, extkey_binder_t *env, int depth,
     return 0;
 }
 
+// One string cannot be both the identity and the locator of an object, and trying to make
+// it be both is what left the `TypeVar` keys unresolvable and the keys ten times larger
+// than they need to be.
+//
+// The *identity* is what two builds compare: it must contain nothing build-specific, so it
+// expands every sub-object in full and is what the digest is taken over. The *locator* is
+// what this image reads back at load: it may cite an index into this image's own import
+// table, exactly as every external reference already does, because that table is written
+// and read by the same image. Locator mode is that second rendering, and it is enabled
+// only while the import table is being written.
 static int extkey_write(ios_t *k, jl_value_t *v, int depth) JL_NOTSAFEPOINT
 {
     if (depth > EXTKEY_MAX_DEPTH)
         return 0;
+    if (depth > 0 && !jl_is_typevar(v)) {
+        // In locator mode a nested object that is itself imported is cited rather than
+        // expanded. At depth 0 this would make every entry a reference to itself.
+        size_t idx;
+        if (extkey_import_ref(v, &idx)) {
+            ios_printf(k, "@%zu", idx);
+            return 1;
+        }
+    }
     if (jl_is_module(v)) {
         ios_puts("M:", k);
         extkey_module(k, (jl_module_t*)v);
@@ -1924,6 +1984,15 @@ static int extkey_write(ios_t *k, jl_value_t *v, int depth) JL_NOTSAFEPOINT
         // binds it then that binder plus the depth at which it is introduced names it.
         const extkey_tvar_t *tv = extkey_lookup_tvar(v);
         if (tv != NULL) {
+            // The identity names the binder by digest, which is stable but cannot be
+            // inverted; the locator cites the binder's import entry, which can. This is
+            // the one place where the two renderings say genuinely different things
+            // rather than the same thing at different lengths.
+            size_t idx;
+            if (tv->bobj != NULL && extkey_import_ref(tv->bobj, &idx)) {
+                ios_printf(k, "TV@%zu/%d", idx, tv->depth);
+                return 1;
+            }
             ios_printf(k, "TV:%016" PRIx64 "/%d", tv->binder, tv->depth);
             return 1;
         }
@@ -2025,7 +2094,7 @@ static void extkey_build_tvars(jl_serializer_state *s) JL_NOTSAFEPOINT
         // The binder is identified by its own structural key, which is already stable.
         uint64_t h = 0;
         if (extkey_hash(v, &h))
-            { int ord = 0; extkey_register_tvars(v, h, &ord, EXTKEY_MAX_TYPEDEPTH); }
+            { int ord = 0; extkey_register_tvars(v, h, v, &ord, EXTKEY_MAX_TYPEDEPTH); }
     }
 }
 
@@ -2197,8 +2266,12 @@ static void jl_write_import_table(jl_serializer_state *s, ios_t *f) JL_NOTSAFEPO
         ios_seek(&k, 0);
         ios_trunc(&k, 0);
         uint32_t len = 0;
+        // the digest above is the identity, taken with references off; what follows is the
+        // locator, which may cite this image's own import entries
+        extkey_import_index = &s->import_index;
         if (h && extkey_write(&k, (jl_value_t*)s->import_objs.items[i], 0))
             len = (uint32_t)ios_pos(&k);
+        extkey_import_index = NULL;
         write_uint32(f, len);
         if (len) {
             ios_write(f, k.buf, len);
@@ -2973,6 +3046,13 @@ typedef struct {
     const char *p;
     const char *end;
     jl_array_t *mod_array;
+    // resolving `@i` means resolving import entry `i` first, so the parser needs the table
+    // and a memo: a locator graph is shared, not a tree, and re-deriving a shared entry
+    // once per citation is what makes a naive resolver quadratic.
+    jl_serializer_state *st;
+    jl_value_t **memo;
+    char *memo_state;   // 0 unvisited, 1 resolved, 2 in progress
+    size_t nmemo;
     // binders in scope, outermost first; a `#i` counts from the innermost, so it indexes
     // this array from the end -- the same walk `extkey_type` does over its binder chain.
     jl_tvar_t *binders[EXTKEY_MAX_TYPEDEPTH];
@@ -3061,6 +3141,79 @@ static jl_value_t *kp_type(keyparse_t *kp, int depth, int tdepth) JL_GC_DISABLED
 
 static jl_value_t *kp_param(keyparse_t *kp, int depth, int tdepth) JL_GC_DISABLED;
 
+static jl_value_t *kp_value(keyparse_t *kp, int depth) JL_GC_DISABLED;
+
+// `@i` -- resolve import entry `i` by resolving its own locator. The recursion terminates
+// because a locator cites only entries it does not itself contain, and an in-progress mark
+// refuses the case where that stops being true rather than looping.
+static jl_value_t *kp_ref(keyparse_t *kp, size_t idx) JL_GC_DISABLED
+{
+    if (idx == 0 || idx > kp->nmemo || kp->st == NULL)
+        return NULL;
+    size_t i = idx - 1;
+    if (kp->memo_state[i] == 1)
+        return kp->memo[i];
+    if (kp->memo_state[i] == 2)
+        return NULL;
+    kp->memo_state[i] = 2;
+    ios_t k;
+    ios_mem(&k, 256);
+    extkey_import_index = &kp->st->import_index;
+    int ok = extkey_write(&k, (jl_value_t*)kp->st->import_objs.items[i], 0);
+    extkey_import_index = NULL;
+    jl_value_t *got = NULL;
+    if (ok) {
+        const char *savep = kp->p, *saveend = kp->end;
+        int savenbind = kp->nbind;
+        kp->p = k.buf;
+        kp->end = k.buf + ios_pos(&k);
+        kp->nbind = 0;
+        got = kp_value(kp, 0);
+        if (got != NULL && kp->p != kp->end)
+            got = NULL;   // a locator that does not consume its own text resolved nothing
+        kp->p = savep;
+        kp->end = saveend;
+        kp->nbind = savenbind;
+    }
+    ios_close(&k);
+    kp->memo[i] = got;
+    kp->memo_state[i] = got != NULL ? 1 : 0;
+    return got;
+}
+
+// Walk a binder root in the same pre-order the writer registered it in, and return the
+// variable introduced at position `want`.
+static jl_tvar_t *kp_binder_at(jl_value_t *t, int *ord, int want, int fuel) JL_NOTSAFEPOINT
+{
+    if (t == NULL || fuel <= 0)
+        return NULL;
+    if (jl_is_unionall(t)) {
+        jl_unionall_t *ua = (jl_unionall_t*)t;
+        int here = (*ord)++;
+        if (here == want)
+            return ua->var;
+        jl_tvar_t *r = kp_binder_at(ua->var->lb, ord, want, fuel - 1);
+        if (r == NULL)
+            r = kp_binder_at(ua->var->ub, ord, want, fuel - 1);
+        if (r == NULL)
+            r = kp_binder_at(ua->body, ord, want, fuel - 1);
+        return r;
+    }
+    if (jl_is_uniontype(t)) {
+        jl_tvar_t *r = kp_binder_at(((jl_uniontype_t*)t)->a, ord, want, fuel - 1);
+        return r ? r : kp_binder_at(((jl_uniontype_t*)t)->b, ord, want, fuel - 1);
+    }
+    if (jl_is_datatype(t)) {
+        jl_svec_t *ps = ((jl_datatype_t*)t)->parameters;
+        for (size_t i = 0; i < jl_svec_len(ps); i++) {
+            jl_tvar_t *r = kp_binder_at(jl_svecref(ps, i), ord, want, fuel - 1);
+            if (r != NULL)
+                return r;
+        }
+    }
+    return NULL;
+}
+
 // `T:mod.path.Name{n:p,...}` -- the type name is the last path component, and the
 // parameters are applied to whatever that name is bound to, exactly as
 // `shadow_resolve_datatype` does, so that every parameter is re-derived rather than reused.
@@ -3113,6 +3266,23 @@ static jl_value_t *kp_type(keyparse_t *kp, int depth, int tdepth) JL_GC_DISABLED
     // nesting, because a type reaches only types and never re-enters the value graph
     if (tdepth > EXTKEY_MAX_TYPEDEPTH || depth > EXTKEY_MAX_DEPTH)
         return NULL;
+    if (kp_lit(kp, "TV@")) {
+        size_t idx;
+        if (!kp_uint(kp, &idx) || !kp_char(kp, '/'))
+            return NULL;
+        size_t pos;
+        if (!kp_uint(kp, &pos))
+            return NULL;
+        jl_value_t *binder = kp_ref(kp, idx);
+        if (binder == NULL)
+            return NULL;
+        int ord = 0;
+        return (jl_value_t*)kp_binder_at(binder, &ord, (int)pos, EXTKEY_MAX_TYPEDEPTH);
+    }
+    if (kp_char(kp, '@')) {
+        size_t idx;
+        return kp_uint(kp, &idx) ? kp_ref(kp, idx) : NULL;
+    }
     if (kp_char(kp, '#')) {
         size_t i;
         if (!kp_uint(kp, &i) || (int)i >= kp->nbind)
@@ -3186,7 +3356,7 @@ static jl_value_t *kp_value(keyparse_t *kp, int depth) JL_GC_DISABLED;
 
 static jl_value_t *kp_param(keyparse_t *kp, int depth, int tdepth) JL_GC_DISABLED
 {
-    if (kp->p < kp->end && strchr("#UAXT", *kp->p) != NULL)
+    if (kp->p < kp->end && strchr("#UAXT@", *kp->p) != NULL)
         return kp_type(kp, depth, tdepth);
     return kp_value(kp, depth + 1);
 }
@@ -3268,15 +3438,27 @@ static void jl_check_key_parse(jl_serializer_state *s, jl_array_t *mod_array) JL
 {
     size_t n = s->import_objs.len;
     size_t keyed = 0, attempted = 0, same = 0, differs = 0, unparsed = 0, trailing = 0;
-    size_t unsupported = 0;
+    size_t unsupported = 0, idbytes = 0, locbytes = 0;
     ios_t k;
     ios_mem(&k, 512);
+    jl_value_t **memo = (jl_value_t**)calloc(n ? n : 1, sizeof(jl_value_t*));
+    char *memo_state = (char*)calloc(n ? n : 1, 1);
     for (size_t i = 0; i < n; i++) {
         jl_value_t *v = (jl_value_t*)s->import_objs.items[i];
+        // size of the identity rendering, for comparison against the locator
         ios_seek(&k, 0);
         ios_trunc(&k, 0);
-        if (!extkey_write(&k, v, 0))
+        if (extkey_write(&k, v, 0))
+            idbytes += (size_t)ios_pos(&k);
+        // what a load-time relink actually reads: the locator
+        ios_seek(&k, 0);
+        ios_trunc(&k, 0);
+        extkey_import_index = &s->import_index;
+        int ok = extkey_write(&k, v, 0);
+        extkey_import_index = NULL;
+        if (!ok)
             continue;
+        locbytes += (size_t)ios_pos(&k);
         keyed++;
         size_t len = (size_t)ios_pos(&k);
         ios_putc('\0', &k);   // the key is not NUL-terminated in the stream; printing needs it
@@ -3290,6 +3472,10 @@ static void jl_check_key_parse(jl_serializer_state *s, jl_array_t *mod_array) JL
         kp.p = k.buf;
         kp.end = k.buf + len;
         kp.mod_array = mod_array;
+        kp.st = s;
+        kp.memo = memo;
+        kp.memo_state = memo_state;
+        kp.nmemo = n;
         kp.nbind = 0;
         jl_value_t *got = kp_value(&kp, 0);
         if (got == NULL) {
@@ -3317,8 +3503,12 @@ static void jl_check_key_parse(jl_serializer_state *s, jl_array_t *mod_array) JL
         }
     }
     ios_close(&k);
+    free(memo);
+    free(memo_state);
     jl_safe_printf("KEYPARSE keyed=%zu covered=%zu same=%zu differs=%zu unparsed=%zu trailing=%zu out_of_scope=%zu\n",
                    keyed, attempted, same, differs, unparsed, trailing, unsupported);
+    jl_safe_printf("KEYSIZE identity=%zu locator=%zu ratio=%.1fx\n",
+                   idbytes, locbytes, locbytes ? (double)idbytes / (double)locbytes : 0.0);
 }
 
 static void jl_shadow_resolve_imports(jl_serializer_state *s, jl_array_t *mod_array) JL_GC_DISABLED
