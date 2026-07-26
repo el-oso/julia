@@ -3489,14 +3489,14 @@ static jl_value_t *kp_value(keyparse_t *kp, int depth) JL_GC_DISABLED;
 // why a code instance was not found, counted per candidate rejected and per lookup that
 // found nothing: "which field disagrees" is the whole question for the chain walk
 enum { KP_CI_OWNER, KP_CI_RETTYPE, KP_CI_EXCTYPE, KP_CI_CONST, KP_CI_PURITY, KP_CI_LIVE,
-       KP_CI_EDGES, KP_CI_EMPTY, KP_CI_NOMATCH, KP_CI_NREASON };
+       KP_CI_EDGES, KP_CI_EMPTY, KP_CI_NOMATCH, KP_CI_AMBIG, KP_CI_NREASON };
 static size_t kp_ci_miss[KP_CI_NREASON];
 // set by `jl_relink_probe` under JULIA_PKGIMAGE_RELINK_VERBOSE so a liveness rejection
 // can show *which* state each side saw, not only that they disagreed
 static int kp_ci_verbose = 0;
 static const char *kp_ci_reason[KP_CI_NREASON] = {
     "owner", "rettype", "exctype", "rettype_const", "purity", "liveness", "edges",
-    "chain_empty", "no_match"
+    "chain_empty", "no_match", "ambiguous"
 };
 
 // `@i` -- resolve import entry `i` by resolving its own locator. The recursion terminates
@@ -3911,7 +3911,8 @@ static jl_value_t *kp_value(keyparse_t *kp, int depth) JL_GC_DISABLED
         else
             return NULL;
         jl_method_instance_t *mi = (jl_method_instance_t*)miv;
-        size_t nchain = 0;
+        size_t nchain = 0, nmatch = 0;
+        jl_code_instance_t *match = NULL;
         for (jl_code_instance_t *ci = jl_atomic_load_relaxed(&mi->cache); ci != NULL;
              ci = jl_atomic_load_relaxed(&ci->next)) {
             nchain++;
@@ -3947,7 +3948,19 @@ static jl_value_t *kp_value(keyparse_t *kp, int depth) JL_GC_DISABLED
             uint64_t h;
             if (!extkey_edges_hash(ci, &h) || h != ehash)
                 { kp_ci_miss[KP_CI_EDGES]++; continue; }
-            return (jl_value_t*)ci;
+            // Do not stop at the first match. A key that two members of one chain both
+            // satisfy names a set, not an object, and picking a member of that set is
+            // guessing -- measured on Makie, 135 of the entries that resolved to the wrong
+            // object were exactly this. Refusing is the conservative answer, and it costs
+            // a rebuild rather than the wrong compiled code attached to a MethodInstance.
+            nmatch++;
+            match = ci;
+        }
+        if (nmatch == 1)
+            return (jl_value_t*)match;
+        if (nmatch > 1) {
+            kp_ci_miss[KP_CI_AMBIG]++;
+            return NULL;
         }
         kp_ci_miss[nchain == 0 ? KP_CI_EMPTY : KP_CI_NOMATCH]++;
         return NULL;
@@ -4284,15 +4297,19 @@ static jl_value_t *relink_compiled_ci(jl_value_t *v, uint64_t digest) JL_NOTSAFE
     if (relink_ci_compiled((jl_code_instance_t*)v))
         return v;
     jl_method_instance_t *mi = jl_get_ci_mi((jl_code_instance_t*)v);
+    jl_value_t *found = NULL;
     for (jl_code_instance_t *c = jl_atomic_load_relaxed(&mi->cache); c != NULL;
          c = jl_atomic_load_relaxed(&c->next)) {
         if (!relink_ci_compiled(c))
             continue;
         uint64_t h = 0;
-        if (extkey_hash((jl_value_t*)c, &h) && h == digest)
-            return (jl_value_t*)c;
+        if (extkey_hash((jl_value_t*)c, &h) && h == digest) {
+            if (found != NULL)
+                return NULL;   // two compiled members of one class: which one is a guess
+            found = (jl_value_t*)c;
+        }
     }
-    return NULL;
+    return found;
 }
 
 // Returns whether every dependency whose build_id moved came through with its whole edge
@@ -4637,11 +4654,17 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
             differ++;
             if (shown < 12) {
                 shown++;
-                jl_safe_printf("RELINK_WRONG [%s] want=[%s] ", relink_loc_kind(tbl->e[i].loc, tbl->e[i].loclen),
-                               jl_typeof_str(want));
-                jl_static_show(JL_STDERR, want);
-                jl_safe_printf("\n    got=[%s] ", jl_typeof_str(got));
-                jl_static_show(JL_STDERR, got);
+                jl_safe_printf("RELINK_WRONG [%s] want=[%s]@%p got=[%s]@%p",
+                               relink_loc_kind(tbl->e[i].loc, tbl->e[i].loclen),
+                               jl_typeof_str(want), (void*)want, jl_typeof_str(got), (void*)got);
+                // only types are printed: everything else can be an arbitrarily deep
+                // graph, and a diagnostic that overflows the stack takes the load with it
+                if (jl_is_type(want)) {
+                    jl_safe_printf("\n    want=");
+                    jl_static_show(JL_STDERR, want);
+                    jl_safe_printf("\n    got =");
+                    jl_static_show(JL_STDERR, got);
+                }
                 jl_safe_printf("\n    loc=%.300s\n", tbl->e[i].loc);
             }
         }
