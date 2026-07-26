@@ -65,10 +65,8 @@ size_t rle_reference_to_index(rle_reference *rr, uint64_t *rletable, size_t npai
 {
     uint64_t key = rr->key;
     size_t index = rr->index, i = index;
-    if (!rletable) {
-        assert(key == key0);
-        return i;
-    }
+    if (!rletable)
+        return key == key0 ? i : RLE_NOTFOUND;
     uint64_t ckey = key0;
     size_t j, start = 0, n;
     for (j = 0; j < npairs; j+=2) {
@@ -83,6 +81,14 @@ size_t rle_reference_to_index(rle_reference *rr, uint64_t *rletable, size_t npai
         ckey = rletable[j];
         start = rletable[j+1];
     }
+    // Falling off the end without the reference having been satisfied leaves the trailing
+    // run, whose key is `ckey` and whose length only the caller knows. If that run has some
+    // other key then the reference names an item that is not in this table at all -- either
+    // the key appears nowhere, or it does not have this many items -- and returning `i`
+    // would be an index past the end. The caller still has to bound-check `i` against the
+    // number of items, which is the one thing this table does not record.
+    if (j >= npairs && key != ckey)
+        return RLE_NOTFOUND;
     return i;
 }
 

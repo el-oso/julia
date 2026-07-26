@@ -39,6 +39,9 @@ typedef struct {
 } rle_reference;
 
 void rle_index_to_reference(rle_reference *rr, /* item index */ size_t i, uint64_t *rletable, size_t npairs, uint64_t key0) JL_NOTSAFEPOINT;
+/* returns RLE_NOTFOUND if the table has no such item: either the key names no run at all,
+   or the key does not have `rr->index + 1` items */
+#define RLE_NOTFOUND (~(size_t)0)
 size_t rle_reference_to_index(rle_reference *rr, uint64_t *rletable, size_t npairs, uint64_t key0) JL_NOTSAFEPOINT;
 
 

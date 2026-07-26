@@ -1650,6 +1650,13 @@ jl_value_t *lookup_root(jl_method_t *m, uint64_t key, int index)
     }
     rle_reference rr = {key, index};
     size_t i = rle_reference_to_index(&rr, jl_array_data(m->root_blocks, uint64_t), jl_array_nrows(m->root_blocks), 0);
+    // The key is the build_id of the module that contributed the root, so a reference
+    // written against a different build of that module names a block this method does not
+    // have. Reading `m->roots` at whatever index came back would hand out an unrelated
+    // object, or one past the end.
+    if (i == RLE_NOTFOUND || i >= jl_array_nrows(m->roots))
+        jl_errorf("Method %s has no root %d with key 0x%016" PRIx64 ".",
+                  jl_symbol_name(m->name), index, key);
     return jl_array_ptr_ref(m->roots, i);
 }
 
