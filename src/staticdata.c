@@ -3576,7 +3576,7 @@ static void jl_check_key_parse(jl_serializer_state *s, jl_array_t *mod_array) JL
 {
     size_t n = s->import_objs.len;
     size_t keyed = 0, attempted = 0, same = 0, differs = 0, unparsed = 0, trailing = 0;
-    size_t unsupported = 0, idbytes = 0, locbytes = 0;
+    size_t unsupported = 0, idbytes = 0, locbytes = 0, digest_mismatch = 0;
     ios_t k;
     ios_mem(&k, 512);
     jl_value_t **memo = (jl_value_t**)calloc(n ? n : 1, sizeof(jl_value_t*));
@@ -3626,6 +3626,15 @@ static void jl_check_key_parse(jl_serializer_state *s, jl_array_t *mod_array) JL
             trailing++;
         }
         else if (got == v || extkey_equiv(got, v)) {
+            // The loader has no `v` to compare against -- that is the whole point of a
+            // relink -- so the acceptance test it will actually run is: recompute the
+            // identity of what was resolved, and require it to reproduce the digest the
+            // image recorded. Check that here too, against the object comparison, so the
+            // two cannot silently disagree.
+            uint64_t want = 0, gotdigest = 0;
+            extkey_hash(v, &want);
+            if (!extkey_hash(got, &gotdigest) || want != gotdigest)
+                digest_mismatch++;
             same++;
         }
         else {
@@ -3643,8 +3652,8 @@ static void jl_check_key_parse(jl_serializer_state *s, jl_array_t *mod_array) JL
     ios_close(&k);
     free(memo);
     free(memo_state);
-    jl_safe_printf("KEYPARSE keyed=%zu covered=%zu same=%zu differs=%zu unparsed=%zu trailing=%zu out_of_scope=%zu\n",
-                   keyed, attempted, same, differs, unparsed, trailing, unsupported);
+    jl_safe_printf("KEYPARSE keyed=%zu covered=%zu same=%zu differs=%zu unparsed=%zu trailing=%zu out_of_scope=%zu digest_mismatch=%zu\n",
+                   keyed, attempted, same, differs, unparsed, trailing, unsupported, digest_mismatch);
     for (int r = 0; r < KP_CI_NREASON; r++)
         if (kp_ci_miss[r])
             jl_safe_printf("KEYPARSE_CI %-14s %zu\n", kp_ci_reason[r], kp_ci_miss[r]);
