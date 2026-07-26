@@ -338,6 +338,16 @@ typedef struct {
     arraylist_t fixup_objs;     // a list of locations of objects requiring (re)caching
     // mapping from a buildid_idx to a depmods_idx
     jl_array_t *buildid_depmods_idxs;
+    // Re-linking against a rebuilt dependency (JULIA_PKGIMAGE_RELINK). `relink_map` is the
+    // image's import table sorted by the (deps-index, offset) pair that every external
+    // reference already carries, with the object each entry resolved to; `relink_deps`
+    // marks the dependencies whose blob moved, which are the only ones that need it.
+    // Sorted-plus-binary-search rather than a hash table: which entry owns a reference is
+    // then settled by construction, at no cost to the references that do not need it.
+    struct jl_relink_ent_t *relink_map;
+    size_t relink_nmap;
+    const uint8_t *relink_deps;
+    size_t relink_ndeps;
     // record of build_ids for all external linkages, in order of serialization for the current sysimg/pkgimg
     // conceptually, the base pointer for the jth externally-linked item is determined from
     //     i = findfirst(==(link_ids[j]), build_ids)
@@ -2377,7 +2387,12 @@ static void jl_write_import_table(jl_serializer_state *s, ios_t *f) JL_NOTSAFEPO
         jl_value_t *v = (jl_value_t*)s->import_objs.items[i];
         uint64_t h = 0;
         extkey_hash(v, &h);
-        write_uint32(f, (uint32_t)(uintptr_t)s->import_deps.items[i]);
+        // The deps-index, not the blob index: this is the same number `add_external_linkage`
+        // packs into every reference to `v`, and it is what a loader can recompute. The
+        // blob index is a per-process load order that means nothing in another session.
+        size_t blobidx = (size_t)(uintptr_t)s->import_deps.items[i];
+        uint32_t depsidx = (uint32_t)jl_array_data(s->buildid_depmods_idxs, int32_t)[blobidx];
+        write_uint32(f, depsidx);
         write_uint64(f, h);
         // The offset this object has in its owning blob, which is what every reference to
         // it in this image carries. Recording it is what lets a relink find the entry a
@@ -3276,6 +3291,88 @@ typedef struct jl_import_table_t {
     jl_import_entry_t *e;
 } jl_import_table_t;
 
+// The import table keyed the way a reference is: by the (deps-index, offset) pair
+// `add_external_linkage` encodes. Sorted once at load; see `relink_lookup`.
+typedef struct jl_relink_ent_t {
+    uint32_t depsidx;
+    uint32_t idx;        // back into the import table, before `obj` is filled in
+    uint64_t offset;
+    jl_value_t *obj;     // what the entry resolved to, or NULL
+} jl_relink_ent_t;
+
+static int relink_ent_cmp(const void *a, const void *b) JL_NOTSAFEPOINT
+{
+    const jl_relink_ent_t *x = (const jl_relink_ent_t*)a, *y = (const jl_relink_ent_t*)b;
+    if (x->depsidx != y->depsidx)
+        return x->depsidx < y->depsidx ? -1 : 1;
+    if (x->offset != y->offset)
+        return x->offset < y->offset ? -1 : 1;
+    return 0;
+}
+
+// A reference into a dependency carries (deps-index, offset), and an import-table entry
+// records the same pair for the object it names -- so when that dependency's blob has
+// moved, the pair is the only thing still tying the two together. Binary search over the
+// sorted table, so no runtime map is built and the entry a reference belongs to is decided
+// by the sort rather than by lookup order.
+static inline jl_relink_ent_t *relink_lookup(jl_serializer_state *s, size_t depsidx, size_t offset) JL_NOTSAFEPOINT
+{
+    size_t lo = 0, hi = s->relink_nmap;
+    jl_relink_ent_t *m = s->relink_map;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (m[mid].depsidx < depsidx || (m[mid].depsidx == depsidx && m[mid].offset < offset))
+            lo = mid + 1;
+        else if (m[mid].depsidx == depsidx && m[mid].offset == offset)
+            return &m[mid];
+        else
+            hi = mid;
+    }
+    return NULL;
+}
+
+// True for exactly the dependencies whose blob moved and whose whole edge was accepted;
+// NULL `relink_deps` (every load with the feature off) makes this one predictable branch.
+static inline int relink_active(jl_serializer_state *s, size_t depsidx) JL_NOTSAFEPOINT
+{
+    return s->relink_deps != NULL && depsidx < s->relink_ndeps && s->relink_deps[depsidx];
+}
+
+static size_t relink_repointed = 0;   // references actually repointed, for the report
+
+static inline uintptr_t relink_resolve(jl_serializer_state *s, size_t depsidx, size_t offset) JL_NOTSAFEPOINT
+{
+    jl_relink_ent_t *ent = relink_lookup(s, depsidx, offset);
+    relink_repointed++;
+    // Cannot happen: `add_external_linkage` records an import entry for every object it
+    // encodes a reference to, and the edge was only marked relinkable after every one of
+    // its entries resolved. Falling through to the offset arithmetic would compute an
+    // address in the rebuilt blob, so fail loudly instead of silently wrongly.
+    if (ent == NULL || ent->obj == NULL) {
+        jl_safe_printf("relink: no resolved import entry for (%zu, %zu)\n", depsidx, offset);
+        abort();
+    }
+    return (uintptr_t)ent->obj;
+}
+
+static void relink_free(jl_serializer_state *s, jl_import_table_t *tbl) JL_NOTSAFEPOINT
+{
+    if (relink_repointed)
+        jl_safe_printf("RELINK_REPOINTED refs=%zu\n", relink_repointed);
+    relink_repointed = 0;
+    free(s->relink_map);
+    s->relink_map = NULL;
+    s->relink_nmap = 0;
+    s->relink_deps = NULL;
+    s->relink_ndeps = 0;
+    if (tbl != NULL) {
+        for (size_t i = 0; i < tbl->n; i++)
+            free(tbl->e[i].loc);
+        free(tbl->e);
+        free(tbl);
+    }
+}
+
 // ---- Reading a key back into the object it names ----
 //
 // The shadow pass above re-derives an import from the *live object*, which shows the
@@ -4165,13 +4262,46 @@ static const char *relink_loc_kind(const char *loc, uint32_t len) JL_NOTSAFEPOIN
 // and accept an entry only when the object found reproduces the digest recorded for it.
 // This is the load-time half of the scheme, doing the work but not yet consuming the
 // answer: no reference is repointed, so a wrong answer here cannot become a wrong program.
-static void jl_relink_probe(jl_import_table_t *tbl, jl_array_t *depmods) JL_GC_DISABLED
+static int relink_ci_compiled(jl_code_instance_t *ci) JL_NOTSAFEPOINT
+{
+    return (jl_atomic_load_relaxed(&ci->flags) & JL_CI_FLAGS_SPECPTR_SPECIALIZED) &&
+           jl_atomic_load_relaxed(&ci->specptr.fptr) != NULL;
+}
+
+// An `external_fns` slot is consumed as a machine-code entry point: `jl_root_new_gvars`
+// takes the CodeInstance's `specptr.fptr` and asserts it exists. A CodeInstance key names
+// an *equivalence class* whose members may differ in compilation state -- right for a data
+// reference, wrong here -- so pick a member that is actually compiled, and treat "the
+// rebuilt dependency compiled none of them" as unresolvable rather than repointing at a
+// slot with no code behind it.
+static jl_value_t *relink_compiled_ci(jl_value_t *v, uint64_t digest) JL_NOTSAFEPOINT
+{
+    if (!jl_is_code_instance(v))
+        return NULL;
+    if (relink_ci_compiled((jl_code_instance_t*)v))
+        return v;
+    jl_method_instance_t *mi = jl_get_ci_mi((jl_code_instance_t*)v);
+    for (jl_code_instance_t *c = jl_atomic_load_relaxed(&mi->cache); c != NULL;
+         c = jl_atomic_load_relaxed(&c->next)) {
+        if (!relink_ci_compiled(c))
+            continue;
+        uint64_t h = 0;
+        if (extkey_hash((jl_value_t*)c, &h) && h == digest)
+            return (jl_value_t*)c;
+    }
+    return NULL;
+}
+
+// Returns whether every dependency whose build_id moved came through with its whole edge
+// accepted -- the condition for repointing this image instead of rebuilding it. Fills in
+// `tbl->e[i].resolved` either way.
+static int jl_relink_probe(jl_import_table_t *tbl, jl_array_t *depmods, const uint8_t *extfn) JL_GC_DISABLED
 {
     // scoped to this image's dependency set, like the type-variable table below
     extkey_reset_paths();
     extkey_build_paths(depmods);
     int verbose = getenv("JULIA_PKGIMAGE_RELINK_VERBOSE") != NULL;
-    size_t keyed = 0, resolved = 0, accepted = 0, unresolved = 0, digest_bad = 0;
+    size_t keyed = 0, resolved = 0, accepted = 0, unresolved = 0, digest_bad = 0, extfn_bad = 0;
     jl_value_t **memo = (jl_value_t**)calloc(tbl->n ? tbl->n : 1, sizeof(jl_value_t*));
     char *state = (char*)calloc(tbl->n ? tbl->n : 1, 1);
     // failures by locator kind, with a few examples of each kept for the report
@@ -4281,7 +4411,20 @@ static void jl_relink_probe(jl_import_table_t *tbl, jl_array_t *depmods) JL_GC_D
             dep_resolved[d]++;
             resolved++;
             uint64_t h = 0;
-            if (extkey_hash(got, &h) && h == tbl->e[i].digest) {
+            int ok = extkey_hash(got, &h) && h == tbl->e[i].digest;
+            // an entry consumed as an `external_fns` slot needs a *compiled* member of the
+            // equivalence class the key names, not merely a member of it
+            if (ok && extfn != NULL && extfn[i]) {
+                jl_value_t *fn = relink_compiled_ci(got, tbl->e[i].digest);
+                if (fn == NULL) {
+                    ok = 0;
+                    extfn_bad++;
+                }
+                else {
+                    got = fn;
+                }
+            }
+            if (ok) {
                 accepted++;
                 dep_accepted[d]++;
                 // the name below comes from the representative's blob, so a rebuilt
@@ -4361,8 +4504,8 @@ static void jl_relink_probe(jl_import_table_t *tbl, jl_array_t *depmods) JL_GC_D
     free(state);
     free(resolved_objs);
     free(fail_at);
-    jl_safe_printf("RELINK_PROBE entries=%zu keyed=%zu resolved=%zu accepted=%zu unresolved=%zu digest_mismatch=%zu\n",
-                   tbl->n, keyed, resolved, accepted, unresolved, digest_bad);
+    jl_safe_printf("RELINK_PROBE entries=%zu keyed=%zu resolved=%zu accepted=%zu unresolved=%zu digest_mismatch=%zu uncompiled_extfn=%zu\n",
+                   tbl->n, keyed, resolved, accepted, unresolved, digest_bad, extfn_bad);
     // kinds sorted by unresolved count, mismatches alongside; examples for the top two
     int order[RK_MAX];
     for (int q = 0; q < nrk; q++)
@@ -4433,6 +4576,24 @@ static void jl_relink_probe(jl_import_table_t *tbl, jl_array_t *depmods) JL_GC_D
     jl_safe_printf("RELINK_DEPS ndeps=%zu fully_accepted_keyed=%zu (%.1f%%) fully_accepted_all=%zu (%.1f%%)\n",
                    ndeps, full_keyed, ndeps ? 100.0 * (double)full_keyed / (double)ndeps : 0.0,
                    full_all, ndeps ? 100.0 * (double)full_all / (double)ndeps : 0.0);
+    // Only the dependencies that actually moved have to be repointed, and repointing is
+    // all-or-nothing per edge: one entry of a rebuilt dependency that did not resolve
+    // means this image cannot be repointed at all and the caller falls back to a rebuild.
+    // A moved dependency nothing imports from costs nothing.
+    int relinkable = 1;
+    size_t moved = 0, moved_blocked = 0;
+    for (size_t d = 0; d < relink_mismatched_ndeps; d++) {
+        if (!relink_mismatched_deps[d] || d > maxdep || dep_entries[d] == 0)
+            continue;
+        moved++;
+        if (dep_accepted[d] != dep_entries[d]) {
+            moved_blocked++;
+            relinkable = 0;
+        }
+    }
+    if (relink_mismatched_ndeps)
+        jl_safe_printf("RELINK_REPOINT rebuilt_deps_imported=%zu blocked=%zu -> %s\n",
+                       moved, moved_blocked, relinkable ? "repoint" : "rebuild");
     free(dep_entries);
     free(dep_keyed);
     free(dep_resolved);
@@ -4442,6 +4603,7 @@ static void jl_relink_probe(jl_import_table_t *tbl, jl_array_t *depmods) JL_GC_D
     free(dep_kind_unres);
     free(dep_unkeyed);
     kp_ci_verbose = 0;
+    return relinkable;
 #undef RK_MAX
 #undef RK_NEX
 }
@@ -5466,6 +5628,8 @@ static inline uintptr_t get_item_for_reloc(jl_serializer_state *s, uintptr_t bas
 #else
         size_t depsidx = 0;
 #endif
+        if (relink_active(s, depsidx))
+            return relink_resolve(s, depsidx, offset);
         assert(s->buildid_depmods_idxs && depsidx < jl_array_len(s->buildid_depmods_idxs));
         size_t i = jl_array_data(s->buildid_depmods_idxs, uint32_t)[depsidx];
         assert(2*i < jl_linkage_blobs.len);
@@ -5477,6 +5641,8 @@ static inline uintptr_t get_item_for_reloc(jl_serializer_state *s, uintptr_t bas
         assert(0 <= *link_index && *link_index < jl_array_len(link_ids));
         uint32_t depsidx = jl_array_data(link_ids, uint32_t)[*link_index];
         *link_index += 1;
+        if (relink_active(s, depsidx))
+            return relink_resolve(s, depsidx, offset);
         assert(depsidx < jl_array_len(s->buildid_depmods_idxs));
         size_t i = jl_array_data(s->buildid_depmods_idxs, uint32_t)[depsidx];
         assert(2*i < jl_linkage_blobs.len);
@@ -7368,6 +7534,8 @@ static int jl_restore_system_image_from_stream_(ios_t *f, jl_image_t *image,
         ios_read(f, (char*)jl_array_data(s.link_ids_external_fnvars, uint32_t), nlinks_external_fnvars * sizeof(uint32_t));
     }
     uint32_t external_fns_begin = read_uint32(f);
+    jl_import_table_t *relink_tbl = NULL;
+    int relink_ok = 0;
     {   // import table, written by jl_write_import_table
         size_t nimports = read_uint32(f);
         size_t nkeyed = 0, keybytes = 0;
@@ -7403,17 +7571,76 @@ static int jl_restore_system_image_from_stream_(ios_t *f, jl_image_t *image,
                 ios_skip(f, len);
             }
         }
-        if (itbl)
-            jl_relink_probe(itbl, depmods);
+        if (itbl) {
+            // Index the table by the (deps-index, offset) pair every reference carries.
+            // Built before resolution because the `external_fns` gvars are named by the
+            // same pair, and what those entries may resolve to is narrower.
+            jl_relink_ent_t *map = (jl_relink_ent_t*)malloc_s(nimports * sizeof(jl_relink_ent_t));
+            for (size_t i = 0; i < nimports; i++) {
+                map[i].depsidx = itbl->e[i].depsidx;
+                map[i].idx = (uint32_t)i;
+                map[i].offset = itbl->e[i].offset;
+                map[i].obj = NULL;
+            }
+            qsort(map, nimports, sizeof(jl_relink_ent_t), relink_ent_cmp);
+            s.relink_map = map;
+            s.relink_nmap = nimports;
+            uint8_t *extfn = NULL;
+            if (image->gvars_base != NULL) {
+                // Which entries a gvar slot past `external_fns_begin` names -- decoded the
+                // way `jl_update_all_gvars` will decode them, including the side table, so
+                // the link index stays in step.
+                extfn = (uint8_t*)calloc(nimports, 1);
+                reloc_t *gvars = (reloc_t*)gvar_record.buf;
+                size_t ngvars = gvar_record.size / sizeof(reloc_t);
+                int li = 0;
+                for (size_t i = external_fns_begin; i < ngvars; i++) {
+                    uintptr_t rid = gvars[i];
+                    enum RefTags tag = (enum RefTags)(rid >> RELOC_TAG_OFFSET);
+                    size_t off = rid & (((uintptr_t)1 << RELOC_TAG_OFFSET) - 1);
+                    size_t d;
+                    if (tag == SysimageLinkage) {
+#ifdef _P64
+                        d = off >> DEPS_IDX_OFFSET;
+                        off &= ((size_t)1 << DEPS_IDX_OFFSET) - 1;
+#else
+                        d = 0;
+#endif
+                    }
+                    else if (tag == ExternalLinkage) {
+                        assert(s.link_ids_external_fnvars && li < jl_array_len(s.link_ids_external_fnvars));
+                        d = jl_array_data(s.link_ids_external_fnvars, uint32_t)[li++];
+                    }
+                    else {
+                        continue;   // an entry point of this image's own; not an import
+                    }
+                    jl_relink_ent_t *ent = relink_lookup(&s, d, off);
+                    if (ent != NULL)
+                        extfn[ent->idx] = 1;
+                }
+            }
+            relink_ok = jl_relink_probe(itbl, depmods, extfn);
+            free(extfn);
+            if (relink_ok && relink_probe_buildid_mismatch) {
+                for (size_t i = 0; i < nimports; i++)
+                    map[i].obj = itbl->e[map[i].idx].resolved;
+                // arming this is what turns an accepted entry into an avoided rebuild
+                s.relink_deps = relink_mismatched_deps;
+                s.relink_ndeps = relink_mismatched_ndeps;
+            }
+            relink_tbl = itbl;
+        }
         if (getenv("JULIA_IMPORT_KEYS"))
             jl_safe_printf("IMPORTKEYS_READ entries=%zu keyed=%zu keybytes=%zu\n",
                            nimports, nkeyed, keybytes);
     }
-    if (s.incremental && relink_probe_buildid_mismatch) {
-        // A dependency was rebuilt with a different build_id. The probe above has
-        // already measured what it needed; the relocations below would be applied
-        // against the wrong blob layout, so abandon the restore before touching any
-        // global state. The caller refuses the cache and Julia recompiles.
+    if (s.incremental && relink_probe_buildid_mismatch && !relink_ok) {
+        // A dependency was rebuilt with a different build_id, and at least one object this
+        // image imports from it could not be found again. The relocations below would be
+        // applied against the wrong blob layout, so abandon the restore before touching any
+        // global state -- resolution is a pre-pass precisely so this is still possible.
+        // The caller refuses the cache and Julia recompiles.
+        relink_free(&s, relink_tbl);
         ios_close(&sysimg);
         ios_close(&const_data);
         ios_close(&symbols);
@@ -7830,6 +8057,7 @@ static int jl_restore_system_image_from_stream_(ios_t *f, jl_image_t *image,
     }
     jl_timing_counter_inc(JL_TIMING_COUNTER_ImageSize, sizeof_sysimg + sizeof(uintptr_t));
     rebuild_image_blob_tree();
+    relink_free(&s, relink_tbl);   // every relocation that could consult it has run
 
     // jl_printf(JL_STDOUT, "%ld blobs to link against\n", jl_linkage_blobs.len >> 1);
     jl_gc_enable(en);
