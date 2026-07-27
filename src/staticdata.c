@@ -3008,6 +3008,36 @@ static void jl_write_import_table(jl_serializer_state *s, ios_t *f) JL_NOTSAFEPO
         if (h && extkey_write(&k, (jl_value_t*)s->import_objs.items[i], 0))
             len = (uint32_t)ios_pos(&k);
         extkey_import_index = NULL;
+        if (len == 0 && jl_is_method(v)) {
+            // An unkeyed method still gets a degenerate record: "F!" plus the names of
+            // the modules that contributed its roots. The probe cannot resolve or verify
+            // it, but the citing test -- "could this method anchor a root citation of the
+            // moved dependency?" -- only needs the contributor names, and block keys
+            // render even when root contents cannot. Without this every unkeyed method
+            // blocks every repoint as worst case; Makie carries about fifty of them.
+            jl_method_t *um = (jl_method_t*)v;
+            // a bare "F!" -- no groups -- is itself information: a method with no
+            // contributed root blocks cannot anchor a citation of anything
+            ios_puts("F!", &k);
+            if (um->root_blocks != NULL && um->roots != NULL) {
+                uint64_t uself = jl_precompile_toplevel_module ?
+                                 jl_precompile_toplevel_module->build_id.lo : 0;
+                uint64_t *ublocks = jl_array_data(um->root_blocks, uint64_t);
+                size_t unb = jl_array_nrows(um->root_blocks);
+                for (size_t j = 0; j + 1 < unb; j += 2) {
+                    uint64_t key = ublocks[j];
+                    if (key == 0 || key == uself)
+                        continue;
+                    jl_module_t *cm = extkey_module_by_buildid(key);
+                    if (cm != NULL)
+                        ios_printf(&k, "|R%s/", jl_symbol_name(cm->name));
+                    else
+                        ios_puts("|R?/", &k);   // unnameable contributor: the probe
+                                                // treats this as citing everything
+                }
+            }
+            len = (uint32_t)ios_pos(&k);
+        }
         write_uint32(f, len);
         if (len) {
             ios_write(f, k.buf, len);
@@ -5507,7 +5537,12 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
     for (size_t i = 0; i < tbl->n; i++) {
         uint32_t d = tbl->e[i].depsidx;
         dep_entries[d]++;
-        if (tbl->e[i].loclen == 0) {
+        // "F!" marks an unkeyed method carrying only its root-contributor record: not
+        // resolvable, not verifiable, but it names what the method could anchor a
+        // citation of, which is all the repoint gate needs to ask.
+        int unkeyed = tbl->e[i].loclen == 0 ||
+                      (tbl->e[i].loclen >= 2 && tbl->e[i].loc[0] == 'F' && tbl->e[i].loc[1] == '!');
+        if (unkeyed) {
             // What *kind* of object this is cannot be asked here: the recorded offset is
             // only meaningful against the layout the image was written against, and the
             // probe runs precisely when that dependency may have been rebuilt, so the
@@ -5517,8 +5552,23 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
             eclass[i] = RSW_UNKEYED;
             if (relink_unmoved_blob_is_method(s, d, tbl->e[i].offset)) {
                 method_unverified++;
-                // no locator, so no record of what it could cite: assume the worst
-                method_unverified_moved++;
+                if (tbl->e[i].loclen == 0) {
+                    // no record of what it could cite: assume the worst
+                    method_unverified_moved++;
+                }
+                else {
+                    // the F! record: block only if a moved dependency contributed roots
+                    // to this method, or a contributor could not even be named
+                    int cites = strstr(tbl->e[i].loc, "|R?/") != NULL;
+                    for (size_t q = 0; !cites && q < nmovednames; q++) {
+                        char pat[512];
+                        snprintf(pat, sizeof(pat), "|R%s/", movednames[q]);
+                        if (strstr(tbl->e[i].loc, pat) != NULL)
+                            cites = 1;
+                    }
+                    if (cites)
+                        method_unverified_moved++;
+                }
             }
             continue;
         }
