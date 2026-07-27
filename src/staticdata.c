@@ -1457,29 +1457,58 @@ static int extkey_file_digest(jl_sym_t *file, uint64_t *out) JL_NOTSAFEPOINT
 // literal, say) renders unstably and costs a permanent refusal -- the safe direction.
 // Both budgets are load-bearing: the depth cap breaks cycles, the output cap stops a
 // wide graph (a CodeInstance's edges, say) from being wandered instead of refused.
-// Does this inline type carry a raw pointer anywhere inside it? A `Ptr` field holds a heap
-// address, which differs between two sessions of the same build, so folding its bytes into
-// an identity makes the identity session-dependent -- the defect the determinism harness
-// found. A bare `Ptr` renders as an opaque marker; one buried inside a bits struct makes
-// the whole field unrenderable, because its bytes cannot be emitted stably and picking
-// them apart field-by-field is not worth it. Refusing costs a rebuild, which is safe.
-static int extkey_bits_has_pointer(jl_datatype_t *dt, int depth) JL_NOTSAFEPOINT
+static int extkey_root_value(ios_t *k, jl_value_t *v, int depth) JL_NOTSAFEPOINT;
+
+// Render the inline storage of type `ft` at `base`. No byte that could hold an address
+// may be folded verbatim: a `Ptr` renders as an opaque marker (its value is a heap
+// address, different in every session), and an inline immutable that carries references
+// -- `jl_field_isptr` of the *parent* is false for it, yet its region contains pointer
+// slots -- is walked subfield by subfield instead of being folded. The layout's
+// `npointers` is the authority on whether any such slot exists; recursing over field
+// *types* was tried and measured wrong (a `CodeUnits{UInt8,String}` field folded an
+// embedded String pointer because String itself has no fields to recurse into).
+static int extkey_root_bytes(ios_t *k, const char *base, jl_datatype_t *ft, int depth) JL_NOTSAFEPOINT
 {
-    if (depth > 8)
-        return 1;   // too deep to be sure: treat as containing one
-    if (jl_is_cpointer_type((jl_value_t*)dt))
+    if (depth > 32)
+        return 0;
+    if ((size_t)ios_pos(k) > ((size_t)1 << 16))
+        return 0;
+    if (jl_is_cpointer_type((jl_value_t*)ft)) {
+        ios_putc('*', k);   // a pointer's value is session-meaningless
         return 1;
-    if (!jl_is_datatype(dt) || dt->layout == NULL)
-        return 1;
-    size_t nf = jl_datatype_nfields(dt);
-    for (size_t i = 0; i < nf; i++) {
-        jl_value_t *ft = jl_field_type_concrete(dt, i);
-        if (!jl_is_datatype(ft))
-            return 1;
-        if (extkey_bits_has_pointer((jl_datatype_t*)ft, depth + 1))
-            return 1;
     }
-    return 0;
+    if (!jl_is_datatype(ft) || ft->layout == NULL)
+        return 0;
+    if (ft->layout->npointers == 0) {
+        size_t sz = jl_datatype_size(ft);
+        if ((size_t)ios_pos(k) + sz > ((size_t)1 << 16))
+            return 0;
+        ios_write(k, base, sz);
+        return 1;
+    }
+    size_t nf = jl_datatype_nfields(ft);
+    ios_putc('(', k);
+    for (size_t i = 0; i < nf; i++) {
+        ios_putc(',', k);
+        if (jl_field_isptr(ft, i)) {
+            jl_value_t *f = *(jl_value_t**)(base + jl_field_offset(ft, i));
+            if (f == NULL) {
+                ios_putc('U', k);
+                continue;
+            }
+            if (!extkey_root_value(k, f, depth + 1))
+                return 0;
+        }
+        else {
+            jl_value_t *sft = jl_field_type_concrete(ft, i);
+            if (!jl_is_datatype(sft))
+                return 0;   // an inline union carries a selector byte; refuse
+            if (!extkey_root_bytes(k, base + jl_field_offset(ft, i), (jl_datatype_t*)sft, depth + 1))
+                return 0;
+        }
+    }
+    ios_putc(')', k);
+    return 1;
 }
 
 static int extkey_root_value(ios_t *k, jl_value_t *v, int depth) JL_NOTSAFEPOINT
@@ -1531,21 +1560,45 @@ static int extkey_root_value(ios_t *k, jl_value_t *v, int depth) JL_NOTSAFEPOINT
             }
         }
         else if (ly->flags.arrayelem_isunion) {
-            return 0;   // selector bytes follow the data; not worth rendering stably
+            // Per element, the selector picks the live union member and only its bytes
+            // are rendered: the rest of the slot holds whatever was there before, which
+            // is exactly the kind of byte an identity must not fold.
+            jl_value_t *et = jl_tparam0(jl_typeof(a));
+            // for a bits-union array `ptr_or_offset` is an element offset, not a pointer
+            const char *data = (const char*)a->ref.mem->ptr +
+                               (uintptr_t)a->ref.ptr_or_offset * ly->size;
+            const uint8_t *tags = (const uint8_t*)(jl_genericmemory_typetagdata(a->ref.mem) +
+                                                   (uintptr_t)a->ref.ptr_or_offset);
+            for (size_t i = 0; i < n; i++) {
+                uint8_t sel = tags[i];
+                jl_value_t *ct = jl_nth_union_component(et, sel);
+                if (ct == NULL || !jl_is_datatype(ct))
+                    return 0;
+                ios_printf(k, "(u%u:", (unsigned)sel);
+                if (!extkey_root_bytes(k, data + i * ly->size, (jl_datatype_t*)ct, depth + 1))
+                    return 0;
+                ios_putc(')', k);
+            }
         }
         else {
             jl_value_t *et = jl_tparam0(jl_typeof(a));
-            if (jl_is_cpointer_type(et)) {
-                for (size_t i = 0; i < n; i++)
-                    ios_putc('*', k);   // addresses, meaningless outside this session
-            }
-            else {
-                if (!jl_is_datatype(et) || extkey_bits_has_pointer((jl_datatype_t*)et, 0))
-                    return 0;
+            if (!jl_is_datatype(et))
+                return 0;
+            if (((jl_datatype_t*)et)->layout != NULL &&
+                ((jl_datatype_t*)et)->layout->npointers == 0 && !jl_is_cpointer_type(et)) {
+                // pure bits: fold the whole buffer in one write
                 size_t nb = n * ly->size;
                 if ((size_t)ios_pos(k) + nb > ((size_t)1 << 16))
                     return 0;
                 ios_write(k, (const char*)jl_array_data_(a), nb);
+            }
+            else {
+                // elements stored inline but carrying references (or bare pointers):
+                // walk each one so no address byte reaches the identity
+                const char *data = (const char*)jl_array_data_(a);
+                for (size_t i = 0; i < n; i++)
+                    if (!extkey_root_bytes(k, data + i * ly->size, (jl_datatype_t*)et, depth + 1))
+                        return 0;
             }
         }
         ios_putc(')', k);
@@ -1572,14 +1625,11 @@ static int extkey_root_value(ios_t *k, jl_value_t *v, int depth) JL_NOTSAFEPOINT
             }
             else {
                 jl_value_t *ft = jl_field_type_concrete(dt, i);
-                if (jl_is_cpointer_type(ft)) {
-                    ios_putc('*', k);   // a pointer's value is session-meaningless
-                    continue;
-                }
-                if (!jl_is_datatype(ft) || extkey_bits_has_pointer((jl_datatype_t*)ft, 0))
+                if (!jl_is_datatype(ft))
+                    return 0;   // inline union: a selector byte follows, refuse
+                if (!extkey_root_bytes(k, (const char*)v + jl_field_offset(dt, i),
+                                       (jl_datatype_t*)ft, depth + 1))
                     return 0;
-                size_t fsz = jl_field_size(dt, i);
-                ios_write(k, (const char*)v + jl_field_offset(dt, i), fsz);
             }
         }
         ios_putc(')', k);
@@ -1668,6 +1718,23 @@ static int extkey_method_roots(ios_t *k, jl_method_t *m) JL_NOTSAFEPOINT
             int rok = extkey_root_value(&t, r, 0);
             extkey_rendering_roots = 0;
             if (!rok) {
+                if (getenv("JULIA_EKRB_WHY")) {
+                    jl_safe_printf("EKRB_REFUSE method=%s.%s root=%zu type=%s ci=",
+                                   jl_symbol_name(m->module->name), jl_symbol_name(m->name),
+                                   i, jl_typeof_str(r));
+                    if (jl_is_code_instance(r)) {
+                        // re-render just to see which CI key component refuses
+                        size_t before[EK_CI_NREASON];
+                        memcpy(before, extkey_ci_fail, sizeof(before));
+                        ios_seek(&t, 0);
+                        ios_trunc(&t, 0);
+                        extkey_write(&t, r, 0);
+                        for (int q = 0; q < EK_CI_NREASON; q++)
+                            if (extkey_ci_fail[q] != before[q])
+                                jl_safe_printf("%s ", extkey_ci_reason[q]);
+                    }
+                    jl_safe_printf("\n");
+                }
                 ios_close(&t);
                 return 0;   // an unverifiable root refuses the whole method key
             }
@@ -2276,11 +2343,25 @@ static int extkey_write(ios_t *k, jl_value_t *v, int depth) JL_NOTSAFEPOINT
         if (!extkey_type_toplevel(k, ci->exctype))
             return extkey_ci_fail[EK_CI_EXCTYPE]++, 0;
         ios_putc('/', k);
+        size_t rtcpos = (size_t)ios_pos(k);
         if (ci->rettype_const == NULL)
             ios_putc('-', k);
-        else if (!extkey_write(k, ci->rettype_const, depth + 1))
-            // a constant we cannot name is a constant we cannot re-link against
-            return extkey_ci_fail[EK_CI_RETCONST]++, extkey_note_retconst(ci->rettype_const), 0;
+        else if (!extkey_write(k, ci->rettype_const, depth + 1)) {
+            // discard the failed attempt's partial text: it can cite session state (the
+            // type-variable table), which is exactly what a root render must never do
+            ios_seek(k, (int64_t)rtcpos);
+            ios_trunc(k, rtcpos);
+            // A constant we cannot name is a constant we cannot re-link against -- as a
+            // locator. Inside a method's root record the text is never parsed back, only
+            // digested, so a content walk serves where a name cannot: the dominant
+            // population here is constant-folded Tuples holding Arrays (1340 of 1384
+            // refused method-root renders on Makie), which walk fine. Without this,
+            // every method holding such a CodeInstance as a root is unkeyed, and an
+            // unkeyed method blocks repointing any dependency whose roots the image
+            // cites -- these 135 unkeyed methods were the whole remaining blocker.
+            if (!extkey_rendering_roots || !extkey_root_value(k, ci->rettype_const, depth + 1))
+                return extkey_ci_fail[EK_CI_RETCONST]++, extkey_note_retconst(ci->rettype_const), 0;
+        }
         ios_printf(k, "/P%08" PRIx32, jl_atomic_load_relaxed(&ci->ipo_purity_bits));
         // The world range is deliberately NOT part of the identity, not even collapsed to
         // live-or-dead. Rendering an identity must be a pure function of the object, and
@@ -2462,7 +2543,7 @@ static int extkey_write(ios_t *k, jl_value_t *v, int depth) JL_NOTSAFEPOINT
     if (jl_is_typevar(v)) {
         // A type variable reached on its own has no identity, but if some imported type
         // binds it then that binder plus the depth at which it is introduced names it.
-        const extkey_tvar_t *tv = extkey_lookup_tvar(v);
+        const extkey_tvar_t *tv = extkey_rendering_roots ? NULL : extkey_lookup_tvar(v);
         if (tv != NULL) {
             // The identity names the binder by digest, which is stable but cannot be
             // inverted; the locator cites the binder's import entry, which can. This is
@@ -5233,9 +5314,9 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
         }
     }
     if (relink_mismatched_ndeps)
-        jl_safe_printf("RELINK_ROOTCITE deps_cited=%zu of %zu, rebuilt_and_cited=%zu method_unverified_moved=%zu\n",
+        jl_safe_printf("RELINK_ROOTCITE deps_cited=%zu of %zu, rebuilt_and_cited=%zu method_unverified=%zu method_unverified_moved=%zu\n",
                        rootcited_n, relink_ndep_buildids ? relink_ndep_buildids - 1 : 0,
-                       moved_rootcited, method_unverified_moved);
+                       moved_rootcited, method_unverified, method_unverified_moved);
     // The caller repoints exactly under this condition. Register the build_id
     // translation for each moved dependency whose roots this image cites: every method
     // entry in the table verified (method_unverified == 0, checked above), so a citation
