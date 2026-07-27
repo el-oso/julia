@@ -2816,6 +2816,142 @@ static void jl_report_idhash_taint(jl_serializer_state *s) JL_NOTSAFEPOINT
                    n_id, n_id_tainted, n_hash, n_hash_tainted, n_hits);
 }
 
+// Emit the export index: (digest, offset-from-image-base) for every uninterned object
+// this image owns, sorted by digest. The offset formula mirrors the reader's section
+// layout exactly: a data-section object's stream position IS its image offset (the
+// initial pad becomes the section length word), and the const section begins at
+// LLT_ALIGN(sysimg_size + 8, JL_CACHE_BYTE_ALIGNMENT). The ground-truth gate at load
+// verifies this arithmetic on every unmoved entry, so an error here cannot be silent.
+static int relink_export_cmp(const void *a, const void *b) JL_NOTSAFEPOINT
+{
+    uint64_t ha, hb;
+    memcpy(&ha, a, sizeof(ha));
+    memcpy(&hb, b, sizeof(hb));
+    return ha < hb ? -1 : ha > hb ? 1 : 0;
+}
+
+// Is this a pure type-land object of bounded size? Family kinds recurse; the only leaves
+// allowed are symbols, modules and pointer-free immutables. Everything else -- a
+// DebugInfo, a CodeInstance, a Method, any struct with references -- is rejected, because
+// rendering one from inside an svec measured as a writer that could not finish Makie in
+// ten minutes (an svec of DebugInfos reaches code instances, whose keys render their
+// method's whole root record, unmemoized, once per containing svec). The refused entries
+// the index exists for are parameter svecs and signature types; those are pure type-land.
+// Skipping costs an edge at worst, never a wrong program. The budget caps the node count
+// so no single giant type is rendered either.
+static int export_index_indexable(jl_value_t *v, int *budget) JL_NOTSAFEPOINT
+{
+    if (v == NULL)
+        return 1;
+    if (--*budget <= 0)
+        return 0;
+    if (jl_is_svec(v)) {
+        for (size_t i = 0; i < jl_svec_len(v); i++)
+            if (!export_index_indexable(jl_svecref(v, i), budget))
+                return 0;
+        return 1;
+    }
+    if (jl_is_datatype(v)) {
+        jl_svec_t *p = ((jl_datatype_t*)v)->parameters;
+        return p == NULL || export_index_indexable((jl_value_t*)p, budget);
+    }
+    if (jl_is_unionall(v))
+        return export_index_indexable((jl_value_t*)((jl_unionall_t*)v)->var, budget) &&
+               export_index_indexable(((jl_unionall_t*)v)->body, budget);
+    if (jl_is_uniontype(v))
+        return export_index_indexable(((jl_uniontype_t*)v)->a, budget) &&
+               export_index_indexable(((jl_uniontype_t*)v)->b, budget);
+    if (jl_is_typevar(v))
+        return export_index_indexable(((jl_tvar_t*)v)->lb, budget) &&
+               export_index_indexable(((jl_tvar_t*)v)->ub, budget);
+    if (jl_is_vararg(v))
+        return export_index_indexable(((jl_vararg_t*)v)->T, budget) &&
+               export_index_indexable(((jl_vararg_t*)v)->N, budget);
+    if (jl_is_symbol(v) || jl_is_module(v))
+        return 1;
+    jl_datatype_t *t = (jl_datatype_t*)jl_typeof(v);
+    return jl_is_datatype(t) && !t->name->mutabl && t->layout != NULL &&
+           t->layout->npointers == 0;
+}
+
+static void jl_write_export_index(jl_serializer_state *s, ios_t *f, size_t sysimg_size) JL_NOTSAFEPOINT
+{
+    if (!s->incremental) {
+        // the sysimage cannot be rebuilt without invalidating every cache through the
+        // header check, so an index over its objects would only cost space
+        write_uint32(f, 0);
+        return;
+    }
+    size_t constbase = LLT_ALIGN(sysimg_size + sizeof(uintptr_t), JL_CACHE_BYTE_ALIGNMENT);
+    size_t cap = 4096, n = 0;
+    char *pairs = (char*)malloc_s(cap * 16);
+    for (size_t i = 0; i < serialization_order.size; i += 2) {
+        jl_value_t *obj = (jl_value_t*)serialization_order.table[i];
+        void *val = serialization_order.table[i + 1];
+        if (val == HT_NOTFOUND || val == (void*)(uintptr_t)-1 || val == (void*)(uintptr_t)-2)
+            continue;
+        // exactly the kinds the runtime does not intern, which is what makes an index
+        // necessary at all; everything else already has a table to be found in. A
+        // *concrete* type is cached and resolvable today -- never in the refused family
+        // -- and concrete types dominate an image, so indexing them would cost most of
+        // the writer time and index size for entries nothing needs.
+        if (!(jl_is_svec(obj) || jl_is_unionall(obj) || jl_is_uniontype(obj) ||
+              jl_is_typevar(obj) || jl_is_vararg(obj) ||
+              (jl_is_datatype(obj) && !jl_is_concrete_type(obj))))
+            continue;
+        int budget = 300;
+        if (!export_index_indexable(obj, &budget))
+            continue;
+        size_t id = from_seroder_entry(val);
+        if (id >= layout_table.len)
+            continue;
+        uintptr_t pos = (uintptr_t)layout_table.items[id];
+        if (pos == 0)
+            continue;   // queued but never laid out
+        uint64_t off = (pos & 1) ? (uint64_t)constbase + (pos & ~(uintptr_t)1)
+                                 : (uint64_t)pos;
+        uint64_t h = 0;
+        if (!extkey_hash(obj, &h) || h == 0)
+            continue;
+        if (n == cap) {
+            cap *= 2;
+            pairs = (char*)realloc_s(pairs, cap * 16);
+        }
+        memcpy(pairs + n * 16, &h, 8);
+        memcpy(pairs + n * 16 + 8, &off, 8);
+        n++;
+    }
+    qsort(pairs, n, 16, relink_export_cmp);
+    // a duplicated digest cannot name one object: delete the whole run
+    size_t out = 0, dropped = 0, i = 0;
+    while (i < n) {
+        size_t j = i + 1;
+        uint64_t hi_, hj;
+        memcpy(&hi_, pairs + i * 16, 8);
+        while (j < n) {
+            memcpy(&hj, pairs + j * 16, 8);
+            if (hj != hi_)
+                break;
+            j++;
+        }
+        if (j == i + 1) {
+            if (out != i)
+                memcpy(pairs + out * 16, pairs + i * 16, 16);
+            out++;
+        }
+        else {
+            dropped += j - i;
+        }
+        i = j;
+    }
+    write_uint32(f, (uint32_t)out);
+    ios_write(f, pairs, out * 16);
+    free(pairs);
+    if (getenv("JULIA_IMPORT_KEYS"))
+        jl_safe_printf("EXPORT_INDEX entries=%zu dropped_collisions=%zu bytes=%zu\n",
+                       out, dropped, out * 16 + 4);
+}
+
 static void jl_write_import_table(jl_serializer_state *s, ios_t *f) JL_NOTSAFEPOINT
 {
     size_t n = s->import_objs.len;
@@ -3826,6 +3962,75 @@ static void relink_free(jl_serializer_state *s, jl_import_table_t *tbl) JL_NOTSA
     }
 }
 
+// ---- The per-image export index ----
+//
+// Julia interns a tuple type only when every parameter is concrete, and never interns a
+// SimpleVector, UnionAll, Union, TypeVar or Vararg -- so for these there is no runtime
+// table a locator can find them in, only the means to construct an equal copy, which the
+// blob-identity gate rightly refuses. The counterfactual sweep priced that: the family is
+// necessary on 67 of Makie's 70 blocked edges. So each incremental image publishes an
+// index over its *own* uninterned objects -- digest -> offset from the image base, sorted
+// by digest -- and a relink resolves such a reference by searching the rebuilt
+// dependency's index for the digest the entry recorded. What comes back is genuinely
+// resident in that dependency's blob, so it passes the blob-identity gate by
+// construction; it is found, never built. Index membership proves nothing by itself:
+// every candidate still re-renders to the recorded digest and passes the ground-truth
+// check where the dependency did not move.
+//
+// Registered per loaded image, aligned with `jl_linkage_blobs` (two slots per blob:
+// pairs pointer into the mapped image, entry count). A collision inside one image --
+// two objects, one digest -- deletes the whole run at write time: the two cannot be told
+// apart, and refusing costs a rebuild while guessing costs a wrong program.
+static arraylist_t relink_export_registry;
+static int relink_export_registry_ready = 0;
+static const char *relink_pending_export = NULL;
+static size_t relink_pending_export_n = 0;
+
+static void relink_export_register(void) JL_NOTSAFEPOINT
+{
+    if (!relink_export_registry_ready) {
+        arraylist_new(&relink_export_registry, 0);
+        relink_export_registry_ready = 1;
+    }
+    arraylist_push(&relink_export_registry, (void*)relink_pending_export);
+    arraylist_push(&relink_export_registry, (void*)relink_pending_export_n);
+    relink_pending_export = NULL;
+    relink_pending_export_n = 0;
+}
+
+static jl_value_t *relink_export_lookup(size_t blob, uint64_t digest) JL_NOTSAFEPOINT
+{
+    if (!relink_export_registry_ready || digest == 0 ||
+        2 * blob + 1 >= relink_export_registry.len)
+        return NULL;
+    const char *pairs = (const char*)relink_export_registry.items[2 * blob];
+    size_t n = (size_t)relink_export_registry.items[2 * blob + 1];
+    if (pairs == NULL || n == 0)
+        return NULL;
+    size_t lo = 0, hi = n;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        uint64_t h;
+        memcpy(&h, pairs + mid * 16, sizeof(h));
+        if (h < digest)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    if (lo >= n)
+        return NULL;
+    uint64_t h, off;
+    memcpy(&h, pairs + lo * 16, sizeof(h));
+    if (h != digest)
+        return NULL;
+    memcpy(&off, pairs + lo * 16 + 8, sizeof(off));
+    uintptr_t base = (uintptr_t)jl_linkage_blobs.items[2 * blob];
+    uintptr_t end = (uintptr_t)jl_linkage_blobs.items[2 * blob + 1];
+    if (base + off >= end)
+        return NULL;   // corrupt offset: refuse rather than read past the blob
+    return (jl_value_t*)(base + off);
+}
+
 // ---- Reading a key back into the object it names ----
 //
 // The shadow pass above re-derives an import from the *live object*, which shows the
@@ -3843,6 +4048,10 @@ typedef struct {
     // once per citation is what makes a naive resolver quadratic.
     jl_serializer_state *st;
     struct jl_import_table_t *tbl;   // set instead of `st` when reading a loaded table
+    // deps-index -> external blob index, for consulting a dependency's export index when
+    // a locator fails to parse; NULL outside the load-time probe
+    const uint32_t *dep2blob;
+    size_t ndep2blob;
     jl_value_t **memo;
     char *memo_state;   // 0 unvisited, 1 resolved, 2 in progress
     size_t nmemo;
@@ -3994,6 +4203,15 @@ static jl_value_t *kp_ref(keyparse_t *kp, size_t idx) JL_GC_DISABLED
         // for the unverified-method check, not for the parser (see extkey_method_roots)
         if (got != NULL && kp->p != kp->end && strncmp(kp->p, "|R", 2) != 0)
             got = NULL;
+        // What the parser cannot rebuild, the owning dependency's export index may
+        // simply have: look the entry's digest up there. The result is a candidate like
+        // any other -- pass 2 still demands the digest re-render, the blob identity and
+        // the ground truth -- but unlike a parsed copy it can actually pass them.
+        if (got == NULL && kp->tbl != NULL && kp->dep2blob != NULL) {
+            jl_import_entry_t *e = &kp->tbl->e[i];
+            if (e->digest != 0 && e->depsidx < kp->ndep2blob)
+                got = relink_export_lookup(kp->dep2blob[e->depsidx], e->digest);
+        }
         kp->p = savep;
         kp->end = saveend;
         kp->nbind = savenbind;
@@ -4624,6 +4842,8 @@ static void jl_check_key_parse(jl_serializer_state *s, jl_array_t *mod_array) JL
         kp.mod_array = mod_array;
         kp.st = s;
         kp.tbl = NULL;
+        kp.dep2blob = NULL;
+        kp.ndep2blob = 0;
         kp.memo = memo;
         kp.memo_state = memo_state;
         kp.nmemo = n;
@@ -5239,6 +5459,8 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
         kp.mod_array = depmods;
         kp.st = NULL;
         kp.tbl = tbl;
+        kp.dep2blob = jl_array_data(s->buildid_depmods_idxs, uint32_t);
+        kp.ndep2blob = jl_array_len(s->buildid_depmods_idxs);
         kp.memo = memo;
         kp.memo_state = state;
         kp.nmemo = tbl->n;
@@ -5303,6 +5525,19 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
         dep_keyed[d]++;
         keyed++;
         jl_value_t *got = resolved_objs[i];
+        // A parsed object that lives outside the cited blob is a rebuilt copy about to be
+        // refused as fabricated; the dependency's export index may name the genuine one.
+        // Substituting *before* the gates means every gate below -- digest re-render,
+        // blob identity, extfn, ground truth -- runs on the substitute; nothing is waived.
+        if (got != NULL && tbl->e[i].digest != 0 &&
+            d < jl_array_len(s->buildid_depmods_idxs)) {
+            size_t wb0 = jl_array_data(s->buildid_depmods_idxs, uint32_t)[d];
+            if (external_blob_index(got) != wb0) {
+                jl_value_t *exp = relink_export_lookup(wb0, tbl->e[i].digest);
+                if (exp != NULL)
+                    got = exp;
+            }
+        }
         int failed = got == NULL;
         int mismatched = 0;
         if (!failed) {
@@ -7929,6 +8164,7 @@ static void jl_save_system_image_to_stream(ios_t *f, jl_array_t *mod_array,
         extkey_build_paths(mod_array);
         extkey_build_tvars(&s);
         jl_write_import_table(&s, f);
+        jl_write_export_index(&s, f, sysimg_size);
     }
 
     if (getenv("JULIA_IMPORT_KEYS"))
@@ -8616,6 +8852,27 @@ static int jl_restore_system_image_from_stream_(ios_t *f, jl_image_t *image,
                 ios_skip(f, len);
             }
         }
+        {   // export index, written by jl_write_export_index: digest -> image offset for
+            // this image's own uninterned objects. The pairs stay resident in the mapped
+            // image; registration against this image's blob happens where the blob is,
+            // so the registry stays aligned with jl_linkage_blobs.
+            size_t nexp = read_uint32(f);
+            relink_pending_export = NULL;
+            relink_pending_export_n = 0;
+            if (nexp) {
+                if (want_relink) {
+                    // copied, not pointed-to: a cache restored without a pkgimage frees
+                    // its read buffer, and a dangling index is a wrong program waiting
+                    char *pairs = (char*)malloc_s(nexp * 16);
+                    ios_readall(f, pairs, nexp * 16);
+                    relink_pending_export = pairs;
+                    relink_pending_export_n = nexp;
+                }
+                else {
+                    ios_skip(f, nexp * 16);
+                }
+            }
+        }
         if (itbl) {
             // Index the table by the (deps-index, offset) pair every reference carries.
             // Built before resolution because the `external_fns` gvars are named by the
@@ -9090,6 +9347,7 @@ static int jl_restore_system_image_from_stream_(ios_t *f, jl_image_t *image,
     // Also sets up images for protection against garbage collection
     arraylist_push(&jl_linkage_blobs, (void*)image_base);
     arraylist_push(&jl_linkage_blobs, (void*)(image_base + sizeof_sysimg));
+    relink_export_register();   // keeps the export-index registry aligned with the blobs
     arraylist_push(&jl_image_relocs, (void*)relocs_base);
     if (restored == NULL) {
         arraylist_push(&jl_top_mods, (void*)jl_top_module);
