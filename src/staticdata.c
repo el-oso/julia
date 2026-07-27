@@ -5048,6 +5048,94 @@ static void relink_borrow_probe(jl_serializer_state *s, jl_import_table_t *tbl) 
     arraylist_free(&work);
 }
 
+// Per-entry refusal class, recorded during pass 2 for the counterfactual sweep below.
+enum { RSW_OK = 0, RSW_UNKEYED, RSW_UNRES, RSW_FAB, RSW_MIS, RSW_EXTFN, RSW_GT };
+
+// The counterfactual sweep, learned from the borrowing measurement: entry counts predict
+// nothing, because acceptance is all-or-nothing per dependency edge. For every edge with
+// failures, emit the *set of failure classes* on it as a bitmask; which single class --
+// or which cumulative combination -- would clear how many edges is then arithmetic over
+// the log, and "fix class X" can be priced in edges before anyone builds it. Enabled by
+// JULIA_RELINK_SWEEP; measurement only, nothing is fixed or changed.
+static void relink_sweep(jl_serializer_state *s, jl_import_table_t *tbl, jl_array_t *depmods,
+                         const uint8_t *eclass) JL_NOTSAFEPOINT
+{
+#define SB_UNKEYED  1
+#define SB_UNRES_CI 2
+#define SB_UNRES_MI 4
+#define SB_UNRES_TY 8
+#define SB_UNRES_OT 16
+#define SB_FAB_TY   32
+#define SB_FAB_OT   64
+#define SB_MIS_ME   128
+#define SB_MIS_OT   256
+#define SB_OTHER    512
+    uint32_t maxdep = 0;
+    for (size_t i = 0; i < tbl->n; i++)
+        if (tbl->e[i].depsidx > maxdep)
+            maxdep = tbl->e[i].depsidx;
+    size_t nd = (size_t)maxdep + 1;
+    uint32_t *mask = (uint32_t*)calloc(nd, sizeof(uint32_t));
+    size_t *nfail = (size_t*)calloc(nd, sizeof(size_t));
+    size_t *nent = (size_t*)calloc(nd, sizeof(size_t));
+    for (size_t i = 0; i < tbl->n; i++) {
+        uint32_t d = tbl->e[i].depsidx;
+        nent[d]++;
+        if (eclass[i] == RSW_OK)
+            continue;
+        nfail[d]++;
+        uint32_t b = SB_OTHER;
+        if (eclass[i] == RSW_UNKEYED)
+            b = SB_UNKEYED;
+        else {
+            // classify by the ground-truth object, which exists wherever the dependency
+            // did not move -- and the sweep is only meaningful in such a session
+            jl_value_t *w = NULL;
+            if (!(d < relink_mismatched_ndeps && relink_mismatched_deps[d]) &&
+                d < jl_array_len(s->buildid_depmods_idxs)) {
+                size_t wb = jl_array_data(s->buildid_depmods_idxs, uint32_t)[d];
+                if (2 * wb < jl_linkage_blobs.len)
+                    w = (jl_value_t*)((uintptr_t)jl_linkage_blobs.items[2 * wb] +
+                                      tbl->e[i].offset * SYS_EXTERNAL_LINK_UNIT);
+            }
+            int family = w != NULL && (jl_is_svec(w) || jl_is_datatype(w) || jl_is_unionall(w) ||
+                                       jl_is_typevar(w) || jl_is_uniontype(w) || jl_is_vararg(w));
+            if (eclass[i] == RSW_UNRES)
+                b = w == NULL ? SB_OTHER :
+                    jl_is_code_instance(w) ? SB_UNRES_CI :
+                    jl_is_method_instance(w) ? SB_UNRES_MI :
+                    family ? SB_UNRES_TY : SB_UNRES_OT;
+            else if (eclass[i] == RSW_FAB)
+                b = family ? SB_FAB_TY : SB_FAB_OT;
+            else if (eclass[i] == RSW_MIS)
+                b = (w != NULL && jl_is_method(w)) ? SB_MIS_ME : SB_MIS_OT;
+        }
+        mask[d] |= b;
+    }
+    size_t edges = 0, failedges = 0;
+    for (size_t d = 0; d < nd; d++) {
+        if (nent[d] == 0)
+            continue;
+        edges++;
+        if (nfail[d] == 0)
+            continue;
+        failedges++;
+        const char *name = "Core";
+        if (d >= 1 && d - 1 < (size_t)jl_array_nrows(depmods)) {
+            jl_value_t *m = jl_array_ptr_ref(depmods, d - 1);
+            if (jl_is_module(m))
+                name = jl_symbol_name(((jl_module_t*)m)->name);
+        }
+        jl_safe_printf("SWEEP_EDGE dep=%s mask=0x%x nfail=%zu nentries=%zu\n",
+                       name, mask[d], nfail[d], nent[d]);
+    }
+    jl_safe_printf("SWEEP_IMAGE entries=%zu edges=%zu clean=%zu failedges=%zu\n",
+                   tbl->n, edges, edges - failedges, failedges);
+    free(mask);
+    free(nfail);
+    free(nent);
+}
+
 static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_array_t *depmods, const uint8_t *extfn,
                            const char *imgdata, size_t imgsize) JL_GC_DISABLED
 {
@@ -5084,6 +5172,8 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
     size_t gt_checked = 0, gt_bad = 0, gt_shown = 0;
     const char *gt_verbose = getenv("JULIA_PKGIMAGE_RELINK_SELFCHECK");
     jl_value_t **memo = (jl_value_t**)calloc(tbl->n ? tbl->n : 1, sizeof(jl_value_t*));
+    // why each entry was refused, for the counterfactual sweep (RSW_*)
+    uint8_t *eclass = (uint8_t*)calloc(tbl->n ? tbl->n : 1, 1);
     char *state = (char*)calloc(tbl->n ? tbl->n : 1, 1);
     // failures by locator kind, with a few examples of each kept for the report
 #define RK_MAX 24
@@ -5205,6 +5295,7 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
             // address can land mid-object. The writer names these instead (RELINK_UNKEYED
             // below, under JULIA_IMPORT_KEYS), where the object is live.
             dep_unkeyed[d]++;
+            eclass[i] = RSW_UNKEYED;
             if (relink_unmoved_blob_is_method(s, d, tbl->e[i].offset)) {
                 method_unverified++;
                 // no locator, so no record of what it could cite: assume the worst
@@ -5228,6 +5319,7 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
             // object in another image means it was found but is not the one the reference
             // names.
             const char *why = ok ? "otherblob" : "digest";
+            uint8_t rcls = ok ? RSW_OK : RSW_MIS;
             // Resolution must *find* the object, not rebuild an equal one. A reference
             // means the specific object the dependency owns, and the digest cannot tell
             // the two apart: `Ref{T} where T` re-renders identically whether it is Core's
@@ -5251,6 +5343,7 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
             if (ok && external_blob_index(got) != wantblob) {
                 ok = 0;
                 fabricated++;
+                rcls = RSW_FAB;
                 if (external_blob_index(got) >= n_linkage_blobs())
                     why = "heap";
             }
@@ -5261,6 +5354,7 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
                 if (fn == NULL || external_blob_index(fn) != wantblob) {
                     ok = 0;
                     extfn_bad++;
+                    rcls = RSW_EXTFN;
                 }
                 else {
                     got = fn;
@@ -5283,6 +5377,7 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
                 if (want != got) {
                     ok = 0;
                     gt_bad++;
+                    rcls = RSW_GT;
                     if (gt_verbose && gt_shown < 12) {
                         gt_shown++;
                         relink_report_wrong(tbl, i, want, got);
@@ -5319,6 +5414,7 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
             else {
                 digest_bad++;
                 mismatched = 1;
+                eclass[i] = rcls;
                 // full texts survive only in a file: `jl_safe_printf` truncates, and the
                 // interesting mismatches are exactly the giant nested unionalls
                 const char *misdump = getenv("JULIA_PKGIMAGE_RELINK_MISDUMP");
@@ -5351,6 +5447,7 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
         }
         else {
             unresolved++;
+            eclass[i] = RSW_UNRES;
             if (verbose)
                 jl_safe_printf("RELINK_UNRESOLVED at+%zu %s\n",
                                fail_at[i], tbl->e[i].loc);
@@ -5537,6 +5634,9 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
     }
     if (getenv("JULIA_RELINK_BORROW_PROBE"))
         relink_borrow_probe(s, tbl);
+    if (getenv("JULIA_RELINK_SWEEP"))
+        relink_sweep(s, tbl, depmods, eclass);
+    free(eclass);
     free(rootcited);
     if (relink_mismatched_ndeps)
         jl_safe_printf("RELINK_REPOINT rebuilt_deps_imported=%zu blocked=%zu -> %s\n",
