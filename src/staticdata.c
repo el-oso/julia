@@ -1454,6 +1454,31 @@ static int extkey_file_digest(jl_sym_t *file, uint64_t *out) JL_NOTSAFEPOINT
 // literal, say) renders unstably and costs a permanent refusal -- the safe direction.
 // Both budgets are load-bearing: the depth cap breaks cycles, the output cap stops a
 // wide graph (a CodeInstance's edges, say) from being wandered instead of refused.
+// Does this inline type carry a raw pointer anywhere inside it? A `Ptr` field holds a heap
+// address, which differs between two sessions of the same build, so folding its bytes into
+// an identity makes the identity session-dependent -- the defect the determinism harness
+// found. A bare `Ptr` renders as an opaque marker; one buried inside a bits struct makes
+// the whole field unrenderable, because its bytes cannot be emitted stably and picking
+// them apart field-by-field is not worth it. Refusing costs a rebuild, which is safe.
+static int extkey_bits_has_pointer(jl_datatype_t *dt, int depth) JL_NOTSAFEPOINT
+{
+    if (depth > 8)
+        return 1;   // too deep to be sure: treat as containing one
+    if (jl_is_cpointer_type((jl_value_t*)dt))
+        return 1;
+    if (!jl_is_datatype(dt) || dt->layout == NULL)
+        return 1;
+    size_t nf = jl_datatype_nfields(dt);
+    for (size_t i = 0; i < nf; i++) {
+        jl_value_t *ft = jl_field_type_concrete(dt, i);
+        if (!jl_is_datatype(ft))
+            return 1;
+        if (extkey_bits_has_pointer((jl_datatype_t*)ft, depth + 1))
+            return 1;
+    }
+    return 0;
+}
+
 static int extkey_root_value(ios_t *k, jl_value_t *v, int depth) JL_NOTSAFEPOINT
 {
     if (depth > 32)
@@ -1506,10 +1531,19 @@ static int extkey_root_value(ios_t *k, jl_value_t *v, int depth) JL_NOTSAFEPOINT
             return 0;   // selector bytes follow the data; not worth rendering stably
         }
         else {
-            size_t nb = n * ly->size;
-            if ((size_t)ios_pos(k) + nb > ((size_t)1 << 16))
-                return 0;
-            ios_write(k, (const char*)jl_array_data_(a), nb);
+            jl_value_t *et = jl_tparam0(jl_typeof(a));
+            if (jl_is_cpointer_type(et)) {
+                for (size_t i = 0; i < n; i++)
+                    ios_putc('*', k);   // addresses, meaningless outside this session
+            }
+            else {
+                if (!jl_is_datatype(et) || extkey_bits_has_pointer((jl_datatype_t*)et, 0))
+                    return 0;
+                size_t nb = n * ly->size;
+                if ((size_t)ios_pos(k) + nb > ((size_t)1 << 16))
+                    return 0;
+                ios_write(k, (const char*)jl_array_data_(a), nb);
+            }
         }
         ios_putc(')', k);
         return 1;
@@ -1534,6 +1568,13 @@ static int extkey_root_value(ios_t *k, jl_value_t *v, int depth) JL_NOTSAFEPOINT
                     return 0;
             }
             else {
+                jl_value_t *ft = jl_field_type_concrete(dt, i);
+                if (jl_is_cpointer_type(ft)) {
+                    ios_putc('*', k);   // a pointer's value is session-meaningless
+                    continue;
+                }
+                if (!jl_is_datatype(ft) || extkey_bits_has_pointer((jl_datatype_t*)ft, 0))
+                    return 0;
                 size_t fsz = jl_field_size(dt, i);
                 ios_write(k, (const char*)v + jl_field_offset(dt, i), fsz);
             }
