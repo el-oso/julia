@@ -2874,6 +2874,89 @@ static int export_index_indexable(jl_value_t *v, int *budget) JL_NOTSAFEPOINT
            t->layout->npointers == 0;
 }
 
+// A cheap content key over the family structure, used only WITHIN one writer session to
+// group content-equal family objects. Interned leaves (symbols, modules, typenames) fold
+// by pointer -- unique per session, so equal content still folds equally -- and opaque
+// leaves fold by object pointer, which can only split groups whose members could never
+// share a digest with an indexable object anyway (an indexed object is pure type-land;
+// so is anything content-equal to it). Equal content therefore implies an equal key, and
+// a key group of one proves the object is content-unique in the whole image.
+static void export_cheap_key(jl_value_t *v, uint64_t *h, int *budget) JL_NOTSAFEPOINT
+{
+#define ECK_FOLD(x) do { *h ^= (uint64_t)(x); *h *= 1099511628211ULL; } while (0)
+    if (v == NULL) {
+        ECK_FOLD(1);
+        return;
+    }
+    if (--*budget <= 0) {
+        ECK_FOLD(2);
+        return;
+    }
+    if (jl_is_svec(v)) {
+        ECK_FOLD(3);
+        ECK_FOLD(jl_svec_len(v));
+        for (size_t i = 0; i < jl_svec_len(v); i++)
+            export_cheap_key(jl_svecref(v, i), h, budget);
+        return;
+    }
+    if (jl_is_datatype(v)) {
+        ECK_FOLD(4);
+        ECK_FOLD((uintptr_t)((jl_datatype_t*)v)->name);
+        jl_svec_t *p = ((jl_datatype_t*)v)->parameters;
+        if (p != NULL)
+            export_cheap_key((jl_value_t*)p, h, budget);
+        return;
+    }
+    if (jl_is_unionall(v)) {
+        ECK_FOLD(5);
+        export_cheap_key((jl_value_t*)((jl_unionall_t*)v)->var, h, budget);
+        export_cheap_key(((jl_unionall_t*)v)->body, h, budget);
+        return;
+    }
+    if (jl_is_uniontype(v)) {
+        ECK_FOLD(6);
+        export_cheap_key(((jl_uniontype_t*)v)->a, h, budget);
+        export_cheap_key(((jl_uniontype_t*)v)->b, h, budget);
+        return;
+    }
+    if (jl_is_typevar(v)) {
+        // deliberately NOT folding the name: the identity digest renders variables by
+        // position, never by their (gensym-unstable) names, and the cheap key must group
+        // exactly what the digest cannot tell apart -- folding names let `DatePart{letter}
+        // where letter` and its renamed `_A` copy each look unique while sharing one
+        // digest, and the ground-truth gate caught the index returning the wrong one
+        ECK_FOLD(7);
+        export_cheap_key(((jl_tvar_t*)v)->lb, h, budget);
+        export_cheap_key(((jl_tvar_t*)v)->ub, h, budget);
+        return;
+    }
+    if (jl_is_vararg(v)) {
+        ECK_FOLD(8);
+        export_cheap_key(((jl_vararg_t*)v)->T, h, budget);
+        export_cheap_key(((jl_vararg_t*)v)->N, h, budget);
+        return;
+    }
+    if (jl_is_symbol(v) || jl_is_module(v)) {
+        ECK_FOLD(9);
+        ECK_FOLD((uintptr_t)v);
+        return;
+    }
+    jl_datatype_t *t = (jl_datatype_t*)jl_typeof(v);
+    if (jl_is_datatype(t) && !t->name->mutabl && t->layout != NULL &&
+        t->layout->npointers == 0) {
+        ECK_FOLD(10);
+        ECK_FOLD((uintptr_t)t);
+        size_t sz = jl_datatype_size(t);
+        const char *b = (const char*)v;
+        for (size_t i = 0; i < sz; i++)
+            ECK_FOLD((unsigned char)b[i]);
+        return;
+    }
+    ECK_FOLD(11);
+    ECK_FOLD((uintptr_t)v);
+#undef ECK_FOLD
+}
+
 static void jl_write_export_index(jl_serializer_state *s, ios_t *f, size_t sysimg_size) JL_NOTSAFEPOINT
 {
     if (!s->incremental) {
@@ -2883,6 +2966,35 @@ static void jl_write_export_index(jl_serializer_state *s, ios_t *f, size_t sysim
         return;
     }
     size_t constbase = LLT_ALIGN(sysimg_size + sizeof(uintptr_t), JL_CACHE_BYTE_ALIGNMENT);
+    // Pass A: group EVERY family object by cheap content key, filtered or not. The
+    // duplicate rule must see the whole image: uniqueness within the emitted index alone
+    // let a reference resolve to an object that was content-unique among index entries
+    // while an equal-but-distinct sibling -- excluded by the kind or budget filters --
+    // was the one its sharing structure actually pointed at. Repointing then gave the
+    // process two equal copies of one object, and code compiled against their identity
+    // hit ud2: the equal-not-identical wrong-program class, one level up.
+    htable_t groups;
+    htable_new(&groups, 1 << 16);
+    for (size_t i = 0; i < serialization_order.size; i += 2) {
+        jl_value_t *obj = (jl_value_t*)serialization_order.table[i];
+        void *val = serialization_order.table[i + 1];
+        if (val == HT_NOTFOUND || val == (void*)(uintptr_t)-1 || val == (void*)(uintptr_t)-2)
+            continue;
+        if (!(jl_is_svec(obj) || jl_is_unionall(obj) || jl_is_uniontype(obj) ||
+              jl_is_typevar(obj) || jl_is_vararg(obj) ||
+              (jl_is_datatype(obj) && !jl_is_concrete_type(obj))))
+            continue;
+        uint64_t ck = 1469598103934665603ULL;
+        int ckbudget = 2048;
+        export_cheap_key(obj, &ck, &ckbudget);
+        // stored as count+1: HT_NOTFOUND is (void*)1, so a raw count of one would read
+        // back as absent -- measured as an index of zero entries
+        void **slot = ptrhash_bp(&groups, (void*)(uintptr_t)(ck | 1));
+        if (*slot == HT_NOTFOUND)
+            *slot = (void*)2;
+        else
+            *slot = (void*)((uintptr_t)*slot + 1);
+    }
     size_t cap = 4096, n = 0;
     char *pairs = (char*)malloc_s(cap * 16);
     for (size_t i = 0; i < serialization_order.size; i += 2) {
@@ -2902,6 +3014,15 @@ static void jl_write_export_index(jl_serializer_state *s, ios_t *f, size_t sysim
         int budget = 300;
         if (!export_index_indexable(obj, &budget))
             continue;
+        // content-unique across the WHOLE image, not merely among emitted entries
+        {
+            uint64_t ck = 1469598103934665603ULL;
+            int ckbudget = 2048;
+            export_cheap_key(obj, &ck, &ckbudget);
+            void *cnt = ptrhash_get(&groups, (void*)(uintptr_t)(ck | 1));
+            if ((uintptr_t)cnt != 2)   // count+1: exactly one content-equal object image-wide
+                continue;
+        }
         size_t id = from_seroder_entry(val);
         if (id >= layout_table.len)
             continue;
@@ -2947,6 +3068,7 @@ static void jl_write_export_index(jl_serializer_state *s, ios_t *f, size_t sysim
     write_uint32(f, (uint32_t)out);
     ios_write(f, pairs, out * 16);
     free(pairs);
+    htable_free(&groups);
     if (getenv("JULIA_IMPORT_KEYS"))
         jl_safe_printf("EXPORT_INDEX entries=%zu dropped_collisions=%zu bytes=%zu\n",
                        out, dropped, out * 16 + 4);
@@ -8294,6 +8416,14 @@ static void jl_save_system_image_to_stream(ios_t *f, jl_array_t *mod_array,
         write_uint32(f, jl_array_len(s.link_ids_external_fnvars));
         ios_write(f, (char*)jl_array_data(s.link_ids_external_fnvars, uint32_t), jl_array_len(s.link_ids_external_fnvars) * sizeof(uint32_t));
         write_uint32(f, external_fns_begin);
+        // Force-rebuild the renderer's session tables from THIS writer's module set. A
+        // load-time probe earlier in this process -- any dependency loaded under
+        // JULIA_PKGIMAGE_RELINK -- built them from ITS image's dependency list and left
+        // them marked ready, and a writer that renders against the last probed image's
+        // tables digests everything slightly wrong: measured as ~15k spurious digest
+        // mismatches in any image produced by an in-session or fallback rebuild.
+        extkey_reset_paths();
+        extkey_reset_tvars();
         extkey_build_paths(mod_array);
         extkey_build_tvars(&s);
         jl_write_import_table(&s, f);
