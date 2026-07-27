@@ -1015,6 +1015,11 @@ static jl_value_t *read_verify_mod_list(ios_t *s, jl_array_t *depmods)
             relink_dep_buildid[i + 1] = build_id.lo;
         if (m->build_id.hi != build_id.hi || m->build_id.lo != build_id.lo) {
             if (want_relink) {
+                // name the dependency: a refusal that only says "build_id mismatch"
+                // cost a debugging session before this line existed
+                jl_safe_printf("RELINK_MISMATCH dep=%s recorded=%016" PRIx64 "%016" PRIx64
+                               " loaded=%016" PRIx64 "%016" PRIx64 "\n",
+                               name, build_id.hi, build_id.lo, m->build_id.hi, m->build_id.lo);
                 relink_probe_buildid_mismatch = 1;
                 if (relink_mismatched_deps == NULL) {
                     relink_mismatched_ndeps = l + 1;
