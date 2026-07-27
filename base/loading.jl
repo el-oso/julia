@@ -1288,12 +1288,29 @@ cachefile_from_ocachefile(cachefile) = string(chopsuffix(cachefile, ".$(Libc.Lib
 # use an Int counter so that nested @time_imports calls all remain open
 const TIMING_IMPORTS = Threads.Atomic{Int}(0)
 
-# Cache files the relink probe refused this session. Under JULIA_PKGIMAGE_RELINK,
-# stale_cachefile accepts dependency build_id mismatches on the promise that the C-side
-# probe decides; once the probe has refused a cache, this is how that verdict reaches
-# stale_cachefile, so compilecache rebuilds instead of handing the refused file back.
-# Only ever populated when relinking is enabled; compilecache clears a path it replaces.
-const RELINK_REFUSED_CACHES = Set{String}()
+# Cache files the relink probe refused this session, remembered as "path|build_id;" in
+# an environment variable. Under JULIA_PKGIMAGE_RELINK, stale_cachefile accepts dependency
+# build_id mismatches on the promise that the C-side probe decides; once the probe has
+# refused a cache, this is how that verdict reaches stale_cachefile, so compilecache
+# rebuilds instead of handing the refused file back. It must be the environment, not a
+# process-local set: Precompilation's freshness checks run in worker processes, and a
+# fresh worker that cannot see the verdict reports the refused cache as usable, returns
+# it, and the load degrades to running the package from source -- measured, twice.
+# Keying on build_id makes the entry self-healing: a fresh cache landing on the same slot
+# path has a new build_id and is not tarred with the old one's verdict.
+function relink_remember_refused(cachefile::String, build_id::UInt128, ex)
+    if ex isa ErrorException && occursin("after relink probe", ex.msg)
+        cur = get(ENV, "JULIA_PKGIMAGE_RELINK_REFUSED", "")
+        ent = string(cachefile, '|', UUID(build_id), ';')
+        occursin(ent, cur) || (ENV["JULIA_PKGIMAGE_RELINK_REFUSED"] = cur * ent)
+    end
+    nothing
+end
+
+function relink_cache_refused(cachefile::String, build_id::UInt128)
+    cur = get(ENV, "JULIA_PKGIMAGE_RELINK_REFUSED", "")
+    return !isempty(cur) && occursin(string(cachefile, '|', UUID(build_id), ';'), cur)
+end
 
 # loads a precompile cache file, ignoring stale_cachefile tests
 # assuming all depmods are already loaded and everything is valid
@@ -1353,10 +1370,12 @@ function _include_from_serialized(pkg::PkgId, path::String, ocachepath::Union{No
             # nothing to do, hands the refused cache straight back, and the load degrades
             # to running the package from source instead of rebuilding it.
             if sv isa ErrorException && occursin("after relink probe", sv.msg)
-                # plain path membership: the loader touches cache mtimes as it searches,
-                # so an mtime qualifier here misses its own entry. A fresh cache landing
-                # on the same slot clears the entry when compilecache installs it.
-                push!(RELINK_REFUSED_CACHES, path)
+                bid, _ = try
+                    parse_cache_buildid(path)
+                catch
+                    (UInt128(0), nothing)
+                end
+                bid == UInt128(0) || relink_remember_refused(path, bid, sv)
             end
             return sv
         end
@@ -3474,9 +3493,6 @@ function compilecache(pkg::PkgId, path::String, internal_stderr::IO = stderr, in
             # but force=true means it will fall back to non atomic
             # move if the initial rename fails.
             mv(tmppath, cachefile; force=true)
-            # a fresh cache landing on this slot supersedes any relink-probe refusal
-            # recorded against the file that used to live there
-            delete!(RELINK_REFUSED_CACHES, cachefile)
             return cachefile, ocachefile
         end
     finally
@@ -4217,15 +4233,6 @@ end
                                           ignore_loaded::Bool=false, requested_flags::CacheFlags=CacheFlags(),
                                           reasons::Union{Dict{String,Int},Nothing}=nothing, stalecheck::Bool=true)
     # n.b.: this function does nearly all of the file validation, not just those checks related to stale, so the name is potentially unclear
-    if cachefile in RELINK_REFUSED_CACHES
-        # The relink probe already refused this very cache this session: a rebuilt
-        # dependency could not be repointed to. Reporting it usable again would only hand
-        # it back to compilecache as "nothing to do" and loop until the load degrades to
-        # running the package from source.
-        @debug "Rejecting cache file $cachefile for $modkey: refused by the relink probe this session"
-        record_reason(reasons, "refused by relink probe")
-        return true
-    end
     io = try
         open(cachefile, "r")
     catch ex
@@ -4287,6 +4294,16 @@ end
         end
         id_build = id.second
         id_build = (UInt128(checksum) << 64) | (id_build % UInt64)
+        if get_bool_env("JULIA_PKGIMAGE_RELINK", false) === true && relink_cache_refused(cachefile, id_build)
+            # The relink probe already refused this very build this session: a rebuilt
+            # dependency could not be repointed to. Reporting it usable again would only
+            # hand it back to compilecache as "nothing to do" and loop until the load
+            # degrades to running the package from source. The memory lives in the
+            # environment so Precompilation's worker processes see the verdict too.
+            @debug "Rejecting cache file $cachefile for $modkey: refused by the relink probe this session"
+            record_reason(reasons, "refused by relink probe")
+            return true
+        end
         if build_id != UInt128(0)
             if id_build != build_id
                 # A dependent pins each dependency by build_id, so a cold `using` asks for
