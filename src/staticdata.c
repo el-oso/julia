@@ -4030,6 +4030,23 @@ static void relink_export_register(void) JL_NOTSAFEPOINT
 
 static jl_value_t *relink_export_lookup(size_t blob, uint64_t digest) JL_NOTSAFEPOINT
 {
+    // Consultation is opt-in beyond relinking itself, and the reason is arithmetic rather
+    // than doubt. Everything this index can supply is a type-family object owned by the
+    // dependency, and the type-hash gate below now refuses every type borrowed from a
+    // dependency that moved -- which is the only case a relink ever consults it. So with
+    // that gate in place the index unlocks exactly zero edges that survive to a repoint.
+    // Measured on Makie's image, 94 edges: it takes clean edges 25 -> 40, but 13 of the
+    // 25 and 28 of the 40 carry a type or svec import, so the count that survives a
+    // dependency actually moving is 12 either way. It becomes worth switching on the day
+    // owned types are re-hashed after a repoint instead of refused.
+    static int consult = -1;
+    static const char *kinds = NULL;
+    if (consult == -1) {
+        kinds = getenv("JULIA_PKGIMAGE_RELINK_INDEX");
+        consult = kinds != NULL;
+    }
+    if (!consult)
+        return NULL;
     if (!relink_export_registry_ready || digest == 0 ||
         2 * blob + 1 >= relink_export_registry.len)
         return NULL;
@@ -4058,7 +4075,17 @@ static jl_value_t *relink_export_lookup(size_t blob, uint64_t digest) JL_NOTSAFE
     uintptr_t end = (uintptr_t)jl_linkage_blobs.items[2 * blob + 1];
     if (base + off >= end)
         return NULL;   // corrupt offset: refuse rather than read past the blob
-    return (jl_value_t*)(base + off);
+    jl_value_t *v = (jl_value_t*)(base + off);
+    // bisecting handle: the env var's value may name which kinds the index is allowed to
+    // answer for, so a wrong program can be attributed to one kind without a rebuild
+    if (kinds != NULL && kinds[0] != '\0' && kinds[1] != '\0') {
+        char c = jl_is_svec(v) ? 's' : jl_is_unionall(v) ? 'u' : jl_is_uniontype(v) ? 'U'
+               : jl_is_typevar(v) ? 't' : jl_is_vararg(v) ? 'v'
+               : jl_is_datatype(v) ? 'd' : 'o';
+        if (strchr(kinds, c) == NULL)
+            return NULL;
+    }
+    return v;
 }
 
 // ---- Reading a key back into the object it names ----
@@ -5296,7 +5323,7 @@ static void relink_borrow_probe(jl_serializer_state *s, jl_import_table_t *tbl) 
 }
 
 // Per-entry refusal class, recorded during pass 2 for the counterfactual sweep below.
-enum { RSW_OK = 0, RSW_UNKEYED, RSW_UNRES, RSW_FAB, RSW_MIS, RSW_EXTFN, RSW_GT };
+enum { RSW_OK = 0, RSW_UNKEYED, RSW_UNRES, RSW_FAB, RSW_MIS, RSW_EXTFN, RSW_GT, RSW_TYPEHASH };
 
 // The counterfactual sweep, learned from the borrowing measurement: entry counts predict
 // nothing, because acceptance is all-or-nothing per dependency edge. For every edge with
@@ -5391,6 +5418,10 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
     extkey_build_paths(depmods);
     int verbose = getenv("JULIA_PKGIMAGE_RELINK_VERBOSE") != NULL;
     size_t keyed = 0, resolved = 0, accepted = 0, unresolved = 0, digest_bad = 0, extfn_bad = 0, fabricated = 0;
+    size_t typehash_bad = 0;
+    // measurement escape hatch: counts the population the type-hash gate refuses without
+    // refusing it, so the gate's cost in edges is a number rather than an argument
+    int typehash_gate_off = getenv("JULIA_PKGIMAGE_RELINK_NO_TYPEHASH_GATE") != NULL;
     // Method entries whose root contributions could not be verified -- refused, or
     // unkeyed so there was nothing to verify against. Compressed IR can cite any imported
     // method's roots by (contributor build_id, index), so an unverified method means a
@@ -5475,6 +5506,7 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
     // accepted entries that are methods: the population the blanket refusal used to cost,
     // so an edge that survives only because its dependency is not root-cited is visible
     size_t *dep_methods = (size_t*)calloc(maxdep + 1, sizeof(size_t));
+    size_t *dep_types = (size_t*)calloc(maxdep + 1, sizeof(size_t));
     memset(kp_ci_miss, 0, sizeof(kp_ci_miss));
     // Pass 1: resolve every locator. The identity checks wait for pass 2, because
     // re-rendering an object that contains a bare TypeVar needs the type-variable table
@@ -5584,8 +5616,17 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
             size_t wb0 = jl_array_data(s->buildid_depmods_idxs, uint32_t)[d];
             if (external_blob_index(got) != wb0) {
                 jl_value_t *exp = relink_export_lookup(wb0, tbl->e[i].digest);
-                if (exp != NULL)
+                if (exp != NULL) {
                     got = exp;
+                    if (verbose && d < relink_mismatched_ndeps && relink_mismatched_deps[d]) {
+                        jl_safe_printf("RELINK_INDEXED dep=%u off=%zu [%s] exp=%p\n    obj=",
+                                       (unsigned)d, (size_t)tbl->e[i].offset,
+                                       jl_typeof_str(exp), (void*)exp);
+                        if (jl_is_type(exp))
+                            jl_static_show(JL_STDERR, exp);
+                        jl_safe_printf("\n    loc=%.400s\n", tbl->e[i].loc);
+                    }
+                }
             }
         }
         int failed = got == NULL;
@@ -5628,6 +5669,47 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
                 rcls = RSW_FAB;
                 if (external_blob_index(got) >= n_linkage_blobs())
                     why = "heap";
+            }
+            // A type object borrowed from a *rebuilt* dependency poisons this image's own
+            // types, and no reference describes the damage. `jl_new_typename_in`
+            // (src/datatype.c:84) folds the defining module's `build_id.lo` into
+            // `TypeName.hash`, `typekey_hash` folds `~tn->hash` and each parameter's
+            // `hash` into every instantiation's, and that number is *baked into the
+            // serialized DataType* and decides where it sits in the sorted type cache.
+            // Rebuild the dependency and every type this image owns that mentions one of
+            // its types keeps a hash the new build no longer computes. `lookup_type_set`
+            // (src/jltypes.c:1051) rejects a candidate on `val->hash == hv` before it ever
+            // compares the key, so such a type sits in the cache invisible, and the next
+            // request for it instantiates a second copy. An assertions-enabled build would
+            // have caught the same thing one step earlier: `jl_cache_type_` asserts
+            // `hv == type->hash` over exactly this recomputation.
+            // Measured -- Makie/ComputePipeline against a rebuilt Observables: the
+            // ComputeGraph constructor's `Observable{Set{Symbol}}` field type was `==` but
+            // not `===` to a freshly requested one, and codegen, which had proved a branch
+            // on their identity, executed the `ud2` it had emitted for the impossible case.
+            //
+            // This is the `Method.roots` defect again -- a build_id baked into data no key
+            // commits to -- and it takes the same answer. Importing a type from the moved
+            // dependency is the necessary condition for owning an instantiation hashed
+            // against it (the owned type's `name`, or a parameter, is that very reference),
+            // so refusing on the import refuses every image that could be damaged. It
+            // over-refuses, since the image need not instantiate anything over the borrowed
+            // type, and that is the safe direction.
+            // svecs are in the list because a `DataType`'s `parameters` may itself be the
+            // borrowed object, and then its elements are types this image never imported
+            // under their own entry -- the type reference would be invisible to a check
+            // that looked only for types.
+            if (ok && (jl_is_type(got) || jl_is_typename(got) || jl_is_typevar(got) ||
+                       jl_is_vararg(got) || jl_is_svec(got))) {
+                // counted for every dependency, so a session where nothing moved still
+                // prices the gate: `types=` on RELINK_DEP is what this edge would lose
+                dep_types[d]++;
+                if (!typehash_gate_off && d < relink_mismatched_ndeps &&
+                    relink_mismatched_deps[d]) {
+                    ok = 0;
+                    typehash_bad++;
+                    rcls = RSW_TYPEHASH;
+                }
             }
             // an entry consumed as an `external_fns` slot needs a *compiled* member of the
             // equivalence class the key names, not merely a member of it
@@ -5781,8 +5863,8 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
     free(state);
     free(resolved_objs);
     free(fail_at);
-    jl_safe_printf("RELINK_PROBE entries=%zu keyed=%zu resolved=%zu accepted=%zu unresolved=%zu digest_mismatch=%zu uncompiled_extfn=%zu fabricated=%zu method_unverified=%zu\n",
-                   tbl->n, keyed, resolved, accepted, unresolved, digest_bad, extfn_bad, fabricated, method_unverified);
+    jl_safe_printf("RELINK_PROBE entries=%zu keyed=%zu resolved=%zu accepted=%zu unresolved=%zu digest_mismatch=%zu uncompiled_extfn=%zu fabricated=%zu method_unverified=%zu typehash=%zu\n",
+                   tbl->n, keyed, resolved, accepted, unresolved, digest_bad, extfn_bad, fabricated, method_unverified, typehash_bad);
     jl_safe_printf("RELINK_SELFCHECK identical=%zu different=%zu\n", gt_checked - gt_bad, gt_bad);
     // kinds sorted by unresolved count, mismatches alongside; examples for the top two
     int order[RK_MAX];
@@ -5834,9 +5916,9 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
                 }
             }
         }
-        jl_safe_printf("RELINK_DEP idx=%u name=%s entries=%zu keyed=%zu resolved=%zu accepted=%zu methods=%zu cited=%d\n",
+        jl_safe_printf("RELINK_DEP idx=%u name=%s entries=%zu keyed=%zu resolved=%zu accepted=%zu methods=%zu types=%zu cited=%d\n",
                        d, name, dep_entries[d], dep_keyed[d], dep_resolved[d], dep_accepted[d],
-                       dep_methods[d], d < ndep ? rootcited[d] : 0);
+                       dep_methods[d], dep_types[d], d < ndep ? rootcited[d] : 0);
         if (dep_unkeyed[d])
             jl_safe_printf("RELINK_UNKEYED_DEP idx=%u name=%s entries=%zu unkeyed=%zu\n",
                            d, name, dep_entries[d], dep_unkeyed[d]);
@@ -5933,6 +6015,7 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
     free(dep_kind_mis);
     free(dep_unkeyed);
     free(dep_methods);
+    free(dep_types);
     return relinkable;
 #undef RK_MAX
 #undef RK_NEX
