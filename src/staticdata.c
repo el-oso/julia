@@ -1553,6 +1553,12 @@ static int extkey_root_value(ios_t *k, jl_value_t *v, int depth) JL_NOTSAFEPOINT
 // through the nested method's own import entry.
 static int extkey_rendering_roots = 0;
 
+// Determinism-harness dedup: identities are re-rendered thousands of times per session,
+// and an unbounded dump measured in the gigabytes -- it filled the tmpfs and took the
+// session down. One dump per method per process is what a cross-session diff needs.
+static htable_t ekrb_dumped;
+static int ekrb_dumped_ready = 0;
+
 static int extkey_method_roots(ios_t *k, jl_method_t *m) JL_NOTSAFEPOINT
 {
     if (m->root_blocks == NULL || m->roots == NULL)
@@ -1566,6 +1572,22 @@ static int extkey_method_roots(ios_t *k, jl_method_t *m) JL_NOTSAFEPOINT
     struct ek_rb_grp grp[EK_RB_MAX];
     size_t ngrp = 0;
     int overflow = 0;
+    const char *ekdump = getenv("JULIA_EKRB_DUMP");
+    if (ekdump) {
+        if (!ekrb_dumped_ready) {
+            htable_new(&ekrb_dumped, 0);
+            ekrb_dumped_ready = 1;
+        }
+        const char *only = getenv("JULIA_EKRB_DUMP_METHOD");
+        if (only && strcmp(only, jl_symbol_name(m->name)) == 0) {
+            // targeted: every render of this method dumps in full, dupes and all --
+            // an intra-session divergence needs both texts
+        }
+        else if (ptrhash_get(&ekrb_dumped, m) != HT_NOTFOUND)
+            ekdump = NULL;   // this method's roots were already dumped this process
+        else
+            ptrhash_put(&ekrb_dumped, m, (void*)1);
+    }
     ios_t t;
     ios_mem(&t, 256);
     for (size_t j = 0; j + 1 < nb; j += 2) {
@@ -1609,6 +1631,40 @@ static int extkey_method_roots(ios_t *k, jl_method_t *m) JL_NOTSAFEPOINT
                 return 0;   // an unverifiable root refuses the whole method key
             }
             size_t len = (size_t)ios_pos(&t);
+            // The determinism harness: rendering an identity must be a pure function of
+            // the object, so the same dump from two sessions of one build must be
+            // byte-identical. One line per (method, root): join key plus a digest of the
+            // render -- the full text only under JULIA_EKRB_DUMP_METHOD, because a full
+            // hex dump of every root measured in the gigabytes and filled the tmpfs.
+            if (ekdump) {
+                ios_t dio;
+                if (ios_file(&dio, ekdump, 1, 1, 1, 0) != NULL) {
+                    ios_seek_end(&dio);
+                    jl_module_t *gm = extkey_module_by_buildid(key);
+                    uint64_t rh = 1469598103934665603ULL;
+                    for (size_t b = 0; b < len; b++) {
+                        rh ^= (unsigned char)t.buf[b];
+                        rh *= 1099511628211ULL;
+                    }
+                    // the signature's object id disambiguates overloads sharing a line;
+                    // for a type it is content-derived, so it joins across sessions
+                    // index *within the contributor's group*, not absolute: absolute
+                    // positions interleave by session load order, the citation index and
+                    // the digest do not
+                    ios_printf(&dio, "%s.%s:%d/%016" PRIx64 "|%s[%zu] %016" PRIx64,
+                               jl_symbol_name(m->module->name), jl_symbol_name(m->name),
+                               m->line, (uint64_t)jl_object_id((jl_value_t*)m->sig),
+                               gm ? jl_symbol_name(gm->name) : "?", grp[g].count, rh);
+                    const char *only = getenv("JULIA_EKRB_DUMP_METHOD");
+                    if (only && strcmp(only, jl_symbol_name(m->name)) == 0) {
+                        ios_putc(' ', &dio);
+                        for (size_t b = 0; b < len; b++)
+                            ios_printf(&dio, "%02x", (unsigned char)t.buf[b]);
+                    }
+                    ios_putc('\n', &dio);
+                    ios_close(&dio);
+                }
+            }
             uint64_t h = grp[g].h;
             for (size_t b = 0; b < len; b++) {
                 h ^= (unsigned char)t.buf[b];
@@ -2185,13 +2241,17 @@ static int extkey_write(ios_t *k, jl_value_t *v, int depth) JL_NOTSAFEPOINT
             // a constant we cannot name is a constant we cannot re-link against
             return extkey_ci_fail[EK_CI_RETCONST]++, extkey_note_retconst(ci->rettype_const), 0;
         ios_printf(k, "/P%08" PRIx32, jl_atomic_load_relaxed(&ci->ipo_purity_bits));
-        // World ages themselves are per-build counters and would never match across a
-        // rebuild, but they are not serialized raw either: an incremental image collapses
-        // every code instance to one of two states on write (staticdata.c, `jl_is_code_instance`
-        // in the fixup pass) -- live, and so subject to revalidation, or dead. That
-        // distinction is the only part of the world range that survives, so it is the only
-        // part the key can carry.
-        ios_putc(jl_atomic_load_relaxed(&ci->max_world) == ~(size_t)0 ? 'L' : 'D', k);
+        // The world range is deliberately NOT part of the identity, not even collapsed to
+        // live-or-dead. Rendering an identity must be a pure function of the object, and
+        // liveness is a property of the session moment: the determinism harness caught
+        // the same code instance rendering `...P00001509L` in one session and
+        // `...P00001509D` in another (invalidation had advanced), which poisoned every
+        // digest built over it -- a method root holding a code instance made the whole
+        // method refuse. This is the same lesson the resolver already learned: the
+        // invalidated instance *is* that object. The letter stays in the locator, where
+        // the parser expects it and resolution already ignores it.
+        if (extkey_import_index != NULL)
+            ios_putc(jl_atomic_load_relaxed(&ci->max_world) == ~(size_t)0 ? 'L' : 'D', k);
         // Deliberately excluded: `analysis_results` (a derived cache with no stable
         // identity of its own; the effects it summarizes are already in the purity bits),
         // and every compilation-state field -- `invoke`, `specptr`, `precompile`, the
