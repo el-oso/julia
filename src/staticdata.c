@@ -5542,6 +5542,19 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
     extkey_reset_paths();
     extkey_build_paths(depmods);
     int verbose = getenv("JULIA_PKGIMAGE_RELINK_VERBOSE") != NULL;
+    // Resolving every entry is measurement, not work. A dependency whose build_id matches
+    // what this image recorded has not moved a byte, so every reference into it resolves
+    // by the same pointer arithmetic as today and there is nothing to re-derive; only the
+    // entries of a dependency that actually moved have to be found again. That is the
+    // fast path the design always specified ("P's build_id matches what Q recorded ->
+    // index the export table directly ... this is the common path and must not regress"),
+    // and it is not a weakened gate: every entry that IS resolved passes exactly the
+    // checks it passed before. `JULIA_PKGIMAGE_RELINK_PROBE_ALL` restores exhaustive
+    // resolution, which is what the coverage measurements (RELINK_DEPS, RELINK_PROBE, the
+    // sweep, the borrow probe, and the ground-truth self-check on unmoved edges) need.
+    int probe_all = getenv("JULIA_PKGIMAGE_RELINK_PROBE_ALL") != NULL ||
+                    getenv("JULIA_RELINK_SWEEP") != NULL ||
+                    getenv("JULIA_RELINK_BORROW_PROBE") != NULL;
     size_t keyed = 0, resolved = 0, accepted = 0, unresolved = 0, digest_bad = 0, extfn_bad = 0, fabricated = 0;
     // Method entries whose root contributions could not be verified -- refused, or
     // unkeyed so there was nothing to verify against. Compressed IR can cite any imported
@@ -5598,6 +5611,10 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
     uint8_t *rootcited = (uint8_t*)calloc(ndep, 1);
     size_t rootcited_n = 0;
     for (size_t d = 1; d < relink_ndep_buildids; d++) {
+        // `rootcited` is only ever asked about a dependency that moved, so scanning the
+        // whole image for the other 93 build_ids is the same waste as resolving them.
+        if (!probe_all && !(d < relink_mismatched_ndeps && relink_mismatched_deps[d]))
+            continue;
         if (relink_scan_for_key(imgdata, imgsize, relink_dep_buildid[d])) {
             rootcited[d] = 1;
             rootcited_n++;
@@ -5628,14 +5645,44 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
     // so an edge that survives only because its dependency is not root-cited is visible
     size_t *dep_methods = (size_t*)calloc(maxdep + 1, sizeof(size_t));
     size_t *dep_types = (size_t*)calloc(maxdep + 1, sizeof(size_t));
+    size_t *dep_skipped = (size_t*)calloc(maxdep + 1, sizeof(size_t));
     memset(kp_ci_miss, 0, sizeof(kp_ci_miss));
-    // Pass 1: resolve every locator. The identity checks wait for pass 2, because
-    // re-rendering an object that contains a bare TypeVar needs the type-variable table
-    // below, and that table is built from the resolved objects.
+    // Which entries have to be resolved at all. An entry of a dependency that moved, and
+    // -- because the method-root gate below reads its verdict off entries of *unmoved*
+    // dependencies -- an entry that could contribute to `method_unverified_moved`. That
+    // contribution needs the entry to be a method and its recorded locator to name a moved
+    // dependency as a root contributor, both of which are decided from bytes already in
+    // hand, so the population is named without resolving anything. Everything else keeps
+    // today's pointer arithmetic and is not looked at again.
+    uint8_t *need = (uint8_t*)calloc(tbl->n ? tbl->n : 1, 1);
+    size_t nneed = 0, nskip = 0;
+    for (size_t i = 0; i < tbl->n; i++) {
+        uint32_t d = tbl->e[i].depsidx;
+        int moved = d < relink_mismatched_ndeps && relink_mismatched_deps[d];
+        if (probe_all || moved)
+            need[i] = 1;
+        else if (tbl->e[i].loclen != 0 && relink_unmoved_blob_is_method(s, d, tbl->e[i].offset)) {
+            for (size_t q = 0; q < nmovednames; q++) {
+                char pat[512];
+                snprintf(pat, sizeof(pat), "|R%s/", movednames[q]);
+                if (strstr(tbl->e[i].loc, pat) != NULL) {
+                    need[i] = 1;
+                    break;
+                }
+            }
+        }
+        if (need[i])
+            nneed++;
+        else if (tbl->e[i].loclen != 0)
+            nskip++;
+    }
+    // Pass 1: resolve every locator that has to be resolved. The identity checks wait for
+    // pass 2, because re-rendering an object that contains a bare TypeVar needs the
+    // type-variable table below, and that table is built from the resolved objects.
     jl_value_t **resolved_objs = (jl_value_t**)calloc(tbl->n ? tbl->n : 1, sizeof(jl_value_t*));
     size_t *fail_at = (size_t*)calloc(tbl->n ? tbl->n : 1, sizeof(size_t));
     for (size_t i = 0; i < tbl->n; i++) {
-        if (tbl->e[i].loclen == 0)
+        if (tbl->e[i].loclen == 0 || !need[i])
             continue;
         keyparse_t kp;
         kp.p = kp.end = tbl->e[i].loc;
@@ -5723,6 +5770,13 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
                         method_unverified_moved++;
                 }
             }
+            continue;
+        }
+        if (!need[i]) {
+            // This dependency's build_id is the one the image recorded, so its blob is
+            // where it was and `blob_base + offset` is still the object every reference
+            // to this entry means. Nothing to find, nothing to verify.
+            dep_skipped[d]++;
             continue;
         }
         dep_keyed[d]++;
@@ -5977,8 +6031,12 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
     free(state);
     free(resolved_objs);
     free(fail_at);
-    jl_safe_printf("RELINK_PROBE entries=%zu keyed=%zu resolved=%zu accepted=%zu unresolved=%zu digest_mismatch=%zu uncompiled_extfn=%zu fabricated=%zu method_unverified=%zu\n",
-                   tbl->n, keyed, resolved, accepted, unresolved, digest_bad, extfn_bad, fabricated, method_unverified);
+    // `mode=fast` means the coverage columns describe only the entries a moved dependency
+    // made it necessary to look at; they are not acceptance rates for the image. Anything
+    // measuring coverage wants JULIA_PKGIMAGE_RELINK_PROBE_ALL.
+    jl_safe_printf("RELINK_PROBE mode=%s entries=%zu resolved_entries=%zu skipped=%zu keyed=%zu resolved=%zu accepted=%zu unresolved=%zu digest_mismatch=%zu uncompiled_extfn=%zu fabricated=%zu method_unverified=%zu\n",
+                   probe_all ? "all" : "fast", tbl->n, nneed, nskip,
+                   keyed, resolved, accepted, unresolved, digest_bad, extfn_bad, fabricated, method_unverified);
     jl_safe_printf("RELINK_SELFCHECK identical=%zu different=%zu\n", gt_checked - gt_bad, gt_bad);
     // kinds sorted by unresolved count, mismatches alongside; examples for the top two
     int order[RK_MAX];
@@ -6030,8 +6088,8 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
                 }
             }
         }
-        jl_safe_printf("RELINK_DEP idx=%u name=%s entries=%zu keyed=%zu resolved=%zu accepted=%zu methods=%zu types=%zu cited=%d\n",
-                       d, name, dep_entries[d], dep_keyed[d], dep_resolved[d], dep_accepted[d],
+        jl_safe_printf("RELINK_DEP idx=%u name=%s entries=%zu skipped=%zu keyed=%zu resolved=%zu accepted=%zu methods=%zu types=%zu cited=%d\n",
+                       d, name, dep_entries[d], dep_skipped[d], dep_keyed[d], dep_resolved[d], dep_accepted[d],
                        dep_methods[d], dep_types[d], d < ndep ? rootcited[d] : 0);
         if (dep_unkeyed[d])
             jl_safe_printf("RELINK_UNKEYED_DEP idx=%u name=%s entries=%zu unkeyed=%zu\n",
@@ -6130,6 +6188,8 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
     free(dep_unkeyed);
     free(dep_methods);
     free(dep_types);
+    free(dep_skipped);
+    free(need);
     return relinkable;
 #undef RK_MAX
 #undef RK_NEX
