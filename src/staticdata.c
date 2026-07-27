@@ -5445,7 +5445,7 @@ static void relink_borrow_probe(jl_serializer_state *s, jl_import_table_t *tbl) 
 }
 
 // Per-entry refusal class, recorded during pass 2 for the counterfactual sweep below.
-enum { RSW_OK = 0, RSW_UNKEYED, RSW_UNRES, RSW_FAB, RSW_MIS, RSW_EXTFN, RSW_GT, RSW_TYPEHASH };
+enum { RSW_OK = 0, RSW_UNKEYED, RSW_UNRES, RSW_FAB, RSW_MIS, RSW_EXTFN, RSW_GT };
 
 // The counterfactual sweep, learned from the borrowing measurement: entry counts predict
 // nothing, because acceptance is all-or-nothing per dependency edge. For every edge with
@@ -5540,10 +5540,6 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
     extkey_build_paths(depmods);
     int verbose = getenv("JULIA_PKGIMAGE_RELINK_VERBOSE") != NULL;
     size_t keyed = 0, resolved = 0, accepted = 0, unresolved = 0, digest_bad = 0, extfn_bad = 0, fabricated = 0;
-    size_t typehash_bad = 0;
-    // measurement escape hatch: counts the population the type-hash gate refuses without
-    // refusing it, so the gate's cost in edges is a number rather than an argument
-    int typehash_gate_off = getenv("JULIA_PKGIMAGE_RELINK_NO_TYPEHASH_GATE") != NULL;
     // Method entries whose root contributions could not be verified -- refused, or
     // unkeyed so there was nothing to verify against. Compressed IR can cite any imported
     // method's roots by (contributor build_id, index), so an unverified method means a
@@ -5792,46 +5788,39 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
                 if (external_blob_index(got) >= n_linkage_blobs())
                     why = "heap";
             }
-            // A type object borrowed from a *rebuilt* dependency poisons this image's own
-            // types, and no reference describes the damage. `jl_new_typename_in`
-            // (src/datatype.c:84) folds the defining module's `build_id.lo` into
-            // `TypeName.hash`, `typekey_hash` folds `~tn->hash` and each parameter's
-            // `hash` into every instantiation's, and that number is *baked into the
-            // serialized DataType* and decides where it sits in the sorted type cache.
-            // Rebuild the dependency and every type this image owns that mentions one of
-            // its types keeps a hash the new build no longer computes. `lookup_type_set`
-            // (src/jltypes.c:1051) rejects a candidate on `val->hash == hv` before it ever
-            // compares the key, so such a type sits in the cache invisible, and the next
-            // request for it instantiates a second copy. An assertions-enabled build would
-            // have caught the same thing one step earlier: `jl_cache_type_` asserts
-            // `hv == type->hash` over exactly this recomputation.
-            // Measured -- Makie/ComputePipeline against a rebuilt Observables: the
-            // ComputeGraph constructor's `Observable{Set{Symbol}}` field type was `==` but
-            // not `===` to a freshly requested one, and codegen, which had proved a branch
-            // on their identity, executed the `ud2` it had emitted for the impossible case.
+            // Borrowing a type from a *rebuilt* dependency used to poison this image's own
+            // types, and no reference described the damage: `jl_new_typename_in` folded the
+            // defining module's `build_id.lo` -- session entropy, `bitmix(jl_hrtime(),
+            // jl_rand())` -- into `TypeName.hash`, `typekey_hash` folded `~tn->hash` into
+            // every instantiation's `hash`, and that number is baked into every serialized
+            // `Foo{...}` and decides its slot in the type cache. Rebuild the dependency and
+            // the number moved, so `lookup_type_set` (src/jltypes.c:1051), which rejects a
+            // candidate on `val->hash == hv` before it compares keys, could not see this
+            // image's own types: the next request allocated a second copy, `==` and not
+            // `===`, and codegen executed the `ud2` it had emitted for the branch it had
+            // proved impossible.
             //
-            // This is the `Method.roots` defect again -- a build_id baked into data no key
-            // commits to -- and it takes the same answer. Importing a type from the moved
-            // dependency is the necessary condition for owning an instantiation hashed
-            // against it (the owned type's `name`, or a parameter, is that very reference),
-            // so refusing on the import refuses every image that could be damaged. It
-            // over-refuses, since the image need not instantiate anything over the borrowed
-            // type, and that is the safe direction.
-            // svecs are in the list because a `DataType`'s `parameters` may itself be the
-            // borrowed object, and then its elements are types this image never imported
-            // under their own entry -- the type reference would be invisible to a check
-            // that looked only for types.
+            // The refusal that stood here -- an entry citing a moved dependency that
+            // resolves to a type -- is gone because its premise is gone. `TypeName.hash`
+            // now derives from the module *path* (src/datatype.c), so a rebuild does not
+            // move it and no derived hash anywhere goes stale. Recomputing `dt->hash` at
+            // restore time instead was measured to be the wrong repair, and not only for
+            // its consumers: there is no enumeration of the image's DataTypes at that
+            // point, and the populations it could walk (`uniquing_types`, `fixup_types`)
+            // exclude by construction both the entries of the image's own `TypeName.cache`
+            // sets -- 130 of Makie's mention a type from a package a proof target rebuilds
+            // -- and the `specTypes` behind `Method.speckeyset`, of which 2 397 do. Those
+            // are serialized hash tables whose slots were computed from the same number,
+            // so moving the field without rehashing them trades one invisible object for
+            // another, and `dt->hash` is also `jl_object_id` of a concrete type and the
+            // seed of `jl_object_id` for every immutable value, which reaches any `Dict`
+            // or `IdDict` the image happens to hold.
+            //
+            // Counted, not gated: `types=` on RELINK_DEP still reports how many of an
+            // edge's entries are types, which is what this cost before.
             if (ok && (jl_is_type(got) || jl_is_typename(got) || jl_is_typevar(got) ||
                        jl_is_vararg(got) || jl_is_svec(got))) {
-                // counted for every dependency, so a session where nothing moved still
-                // prices the gate: `types=` on RELINK_DEP is what this edge would lose
                 dep_types[d]++;
-                if (!typehash_gate_off && d < relink_mismatched_ndeps &&
-                    relink_mismatched_deps[d]) {
-                    ok = 0;
-                    typehash_bad++;
-                    rcls = RSW_TYPEHASH;
-                }
             }
             // an entry consumed as an `external_fns` slot needs a *compiled* member of the
             // equivalence class the key names, not merely a member of it
@@ -5985,8 +5974,8 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
     free(state);
     free(resolved_objs);
     free(fail_at);
-    jl_safe_printf("RELINK_PROBE entries=%zu keyed=%zu resolved=%zu accepted=%zu unresolved=%zu digest_mismatch=%zu uncompiled_extfn=%zu fabricated=%zu method_unverified=%zu typehash=%zu\n",
-                   tbl->n, keyed, resolved, accepted, unresolved, digest_bad, extfn_bad, fabricated, method_unverified, typehash_bad);
+    jl_safe_printf("RELINK_PROBE entries=%zu keyed=%zu resolved=%zu accepted=%zu unresolved=%zu digest_mismatch=%zu uncompiled_extfn=%zu fabricated=%zu method_unverified=%zu\n",
+                   tbl->n, keyed, resolved, accepted, unresolved, digest_bad, extfn_bad, fabricated, method_unverified);
     jl_safe_printf("RELINK_SELFCHECK identical=%zu different=%zu\n", gt_checked - gt_bad, gt_bad);
     // kinds sorted by unresolved count, mismatches alongside; examples for the top two
     int order[RK_MAX];
