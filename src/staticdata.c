@@ -4853,6 +4853,201 @@ static int relink_unmoved_blob_is_method(jl_serializer_state *s, uint32_t d, uin
     return jl_is_method(w);
 }
 
+// Measurement for the borrowing design, not machinery: how many refused type-family
+// entries -- the population resolution can only *construct*, which the blob-identity
+// gate rightly refuses -- are reachable from an accepted entry's genuine object through
+// the non-lazy structural fields an owner+path locator could cite? Membership is tested
+// by pointer against the ground-truth object, so a path that hands back anything freshly
+// built or normalised on read fails the test by construction. Only meaningful where
+// nothing moved. Enabled by JULIA_RELINK_BORROW_PROBE.
+static void relink_borrow_probe(jl_serializer_state *s, jl_import_table_t *tbl) JL_NOTSAFEPOINT
+{
+    htable_t seen;
+    htable_new(&seen, 1 << 16);
+    arraylist_t work;
+    arraylist_new(&work, 0);
+    size_t nseen = 0;
+    for (size_t i = 0; i < tbl->n; i++) {
+        jl_value_t *v = tbl->e[i].resolved;
+        if (v != NULL && ptrhash_get(&seen, v) == HT_NOTFOUND) {
+            ptrhash_put(&seen, v, (void*)(uintptr_t)1);
+            arraylist_push(&work, v);
+            nseen++;
+        }
+    }
+#define BP_PUSH(child) do { \
+        jl_value_t *c_ = (jl_value_t*)(child); \
+        if (c_ != NULL && depth < 10 && nseen < ((size_t)1 << 22) && \
+            ptrhash_get(&seen, c_) == HT_NOTFOUND) { \
+            ptrhash_put(&seen, c_, (void*)(depth + 1)); \
+            arraylist_push(&work, c_); \
+            nseen++; \
+        } \
+    } while (0)
+    while (work.len) {
+        jl_value_t *v = (jl_value_t*)arraylist_pop(&work);
+        uintptr_t depth = (uintptr_t)ptrhash_get(&seen, v);
+        if (jl_is_svec(v)) {
+            for (size_t j = 0; j < jl_svec_len(v); j++)
+                BP_PUSH(jl_svecref(v, j));
+        }
+        else if (jl_is_datatype(v)) {
+            // parameters only: `types` and `layout` are built lazily, `instance` and
+            // `super` are reachable but never in the refused population
+            BP_PUSH(((jl_datatype_t*)v)->parameters);
+            BP_PUSH(((jl_datatype_t*)v)->name);
+        }
+        else if (jl_is_typename(v)) {
+            BP_PUSH(((jl_typename_t*)v)->wrapper);
+        }
+        else if (jl_is_unionall(v)) {
+            BP_PUSH(((jl_unionall_t*)v)->var);
+            BP_PUSH(((jl_unionall_t*)v)->body);
+        }
+        else if (jl_is_typevar(v)) {
+            BP_PUSH(((jl_tvar_t*)v)->lb);
+            BP_PUSH(((jl_tvar_t*)v)->ub);
+        }
+        else if (jl_is_uniontype(v)) {
+            BP_PUSH(((jl_uniontype_t*)v)->a);
+            BP_PUSH(((jl_uniontype_t*)v)->b);
+        }
+        else if (jl_is_vararg(v)) {
+            BP_PUSH(((jl_vararg_t*)v)->T);
+            BP_PUSH(((jl_vararg_t*)v)->N);
+        }
+        else if (jl_is_method(v)) {
+            jl_method_t *m = (jl_method_t*)v;
+            BP_PUSH(m->sig);
+            // roots are part of the method's identity now (the |R record digests them)
+            if (m->roots != NULL)
+                for (size_t j = 0; j < jl_array_nrows(m->roots); j++)
+                    BP_PUSH(jl_array_ptr_ref(m->roots, j));
+        }
+        else if (jl_is_method_instance(v)) {
+            BP_PUSH(((jl_method_instance_t*)v)->specTypes);
+        }
+        else if (jl_is_code_instance(v)) {
+            jl_code_instance_t *ci = (jl_code_instance_t*)v;
+            BP_PUSH(ci->rettype);
+            BP_PUSH(ci->exctype);
+            BP_PUSH(ci->rettype_const);
+            // the edge list is in the identity (its digest is part of the CI key)
+            BP_PUSH(jl_atomic_load_relaxed(&ci->edges));
+        }
+        else if (jl_is_array(v)) {
+            jl_array_t *a = (jl_array_t*)v;
+            const jl_datatype_layout_t *aly = ((jl_datatype_t*)jl_typeof(a->ref.mem))->layout;
+            if (aly->flags.arrayelem_isboxed)
+                for (size_t j = 0; j < jl_array_nrows(a); j++)
+                    BP_PUSH(jl_array_ptr_ref(a, j));
+        }
+    }
+#undef BP_PUSH
+    enum { BK_SVEC, BK_DT, BK_UA, BK_TV, BK_UNION, BK_VARARG, BK_OTHER, BK_N };
+    static const char *const bk_name[BK_N] =
+        { "simplevec", "datatype", "unionall", "typevar", "union", "vararg", "other" };
+    size_t total[BK_N], hit[BK_N], hd[11];
+    memset(total, 0, sizeof(total));
+    memset(hit, 0, sizeof(hit));
+    memset(hd, 0, sizeof(hd));
+    for (size_t i = 0; i < tbl->n; i++) {
+        if (tbl->e[i].resolved != NULL || tbl->e[i].loclen == 0)
+            continue;
+        uint32_t d = tbl->e[i].depsidx;
+        if (d < relink_mismatched_ndeps && relink_mismatched_deps[d])
+            continue;   // moved: no ground truth to test against
+        if (d >= jl_array_len(s->buildid_depmods_idxs))
+            continue;
+        size_t wb = jl_array_data(s->buildid_depmods_idxs, uint32_t)[d];
+        if (2 * wb >= jl_linkage_blobs.len)
+            continue;
+        jl_value_t *w = (jl_value_t*)((uintptr_t)jl_linkage_blobs.items[2 * wb] +
+                                      tbl->e[i].offset * SYS_EXTERNAL_LINK_UNIT);
+        int k = jl_is_svec(w) ? BK_SVEC :
+                jl_is_datatype(w) ? BK_DT :
+                jl_is_unionall(w) ? BK_UA :
+                jl_is_typevar(w) ? BK_TV :
+                jl_is_uniontype(w) ? BK_UNION :
+                jl_is_vararg(w) ? BK_VARARG : BK_OTHER;
+        total[k]++;
+        void *got = ptrhash_get(&seen, w);
+        if (got != HT_NOTFOUND) {
+            hit[k]++;
+            uintptr_t dep = (uintptr_t)got;
+            hd[dep > 10 ? 10 : dep]++;
+        }
+    }
+    size_t t = 0, h = 0;
+    for (int k = 0; k < BK_N; k++) {
+        t += total[k];
+        h += hit[k];
+        if (total[k])
+            jl_safe_printf("BORROW_KIND %-9s reachable=%zu of %zu\n", bk_name[k], hit[k], total[k]);
+    }
+    jl_safe_printf("BORROW_TOTAL reachable=%zu of %zu refused entries, walked=%zu, depth:", h, t, nseen);
+    for (int q = 1; q <= 10; q++)
+        jl_safe_printf(" %zu", hd[q]);
+    jl_safe_printf("\n");
+    // The number that decides: acceptance is all-or-nothing per dependency edge, so
+    // borrowing pays only where it would clear an edge's *entire* refused population
+    // (and the edge has no unkeyed entries, which borrowing cannot name either).
+    {
+        uint32_t maxdep = 0;
+        for (size_t i = 0; i < tbl->n; i++)
+            if (tbl->e[i].depsidx > maxdep)
+                maxdep = tbl->e[i].depsidx;
+        size_t nd = (size_t)maxdep + 1;
+        size_t *ref = (size_t*)calloc(nd, sizeof(size_t));
+        size_t *rch = (size_t*)calloc(nd, sizeof(size_t));
+        size_t *unk = (size_t*)calloc(nd, sizeof(size_t));
+        size_t *any = (size_t*)calloc(nd, sizeof(size_t));
+        for (size_t i = 0; i < tbl->n; i++) {
+            uint32_t d = tbl->e[i].depsidx;
+            any[d]++;
+            if (tbl->e[i].loclen == 0) {
+                unk[d]++;
+                continue;
+            }
+            if (tbl->e[i].resolved != NULL)
+                continue;
+            ref[d]++;
+            if (d < relink_mismatched_ndeps && relink_mismatched_deps[d])
+                continue;
+            if (d >= jl_array_len(s->buildid_depmods_idxs))
+                continue;
+            size_t wb = jl_array_data(s->buildid_depmods_idxs, uint32_t)[d];
+            if (2 * wb >= jl_linkage_blobs.len)
+                continue;
+            jl_value_t *w = (jl_value_t*)((uintptr_t)jl_linkage_blobs.items[2 * wb] +
+                                          tbl->e[i].offset * SYS_EXTERNAL_LINK_UNIT);
+            if (ptrhash_get(&seen, w) != HT_NOTFOUND)
+                rch[d]++;
+        }
+        size_t edges = 0, clean = 0, borrowed = 0, borrowed_if_keyed_too = 0;
+        for (size_t d = 0; d < nd; d++) {
+            if (any[d] == 0)
+                continue;
+            edges++;
+            if (ref[d] == 0 && unk[d] == 0)
+                clean++;
+            else if (ref[d] == rch[d] && unk[d] == 0)
+                borrowed++;
+            else if (ref[d] == rch[d])
+                borrowed_if_keyed_too++;
+        }
+        jl_safe_printf("BORROW_EDGES total=%zu clean=%zu recovered_by_borrowing=%zu"
+                       " recovered_if_unkeyed_also_solved=%zu\n",
+                       edges, clean, borrowed, borrowed_if_keyed_too);
+        free(ref);
+        free(rch);
+        free(unk);
+        free(any);
+    }
+    htable_free(&seen);
+    arraylist_free(&work);
+}
+
 static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_array_t *depmods, const uint8_t *extfn,
                            const char *imgdata, size_t imgsize) JL_GC_DISABLED
 {
@@ -5340,6 +5535,8 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
             }
         }
     }
+    if (getenv("JULIA_RELINK_BORROW_PROBE"))
+        relink_borrow_probe(s, tbl);
     free(rootcited);
     if (relink_mismatched_ndeps)
         jl_safe_printf("RELINK_REPOINT rebuilt_deps_imported=%zu blocked=%zu -> %s\n",
