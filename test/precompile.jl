@@ -3326,4 +3326,114 @@ end
     end end
 end
 
+# A cache that the relink probe refuses must cost a rebuild of that package, and nothing
+# else: never a second refusal of the same file, and never a fall back to running the
+# package from source. JULIA_PKGIMAGE_RELINK_REFUSE_ALL makes the probe refuse every cache
+# a rebuilt dependency reaches, so the path is taken whether or not these particular
+# packages happen to be repointable.
+@testset "a refused relink cache costs one rebuild, not a source load" begin
+    mkdepottempdir() do depot
+        project_path = joinpath(depot, "testenv")
+        mkpath(project_path)
+        srcs = Dict(
+            "RelinkA" => "module RelinkA\nstruct AType{T}; x::T; end\nf(x) = x + 1\nend\n",
+            "RelinkB" => "module RelinkB\nusing RelinkA\ng(x) = RelinkA.f(x) + 1\nconst B = RelinkA.AType(2)\nend\n",
+            "RelinkC" => "module RelinkC\nusing RelinkA, RelinkB\nh(x) = RelinkB.g(x) * 2\nconst C = RelinkA.AType(3)\nend\n")
+        uuids = Dict("RelinkA" => "40000000-0000-0000-0000-000000000001",
+                     "RelinkB" => "40000000-0000-0000-0000-000000000002",
+                     "RelinkC" => "40000000-0000-0000-0000-000000000003")
+        deps = Dict("RelinkA" => String[], "RelinkB" => ["RelinkA"], "RelinkC" => ["RelinkA", "RelinkB"])
+        for (name, src) in srcs
+            pkgpath = joinpath(depot, "dev", name)
+            mkpath(joinpath(pkgpath, "src"))
+            depstr = isempty(deps[name]) ? "" :
+                "\n[deps]\n" * join(("$d = \"$(uuids[d])\"" for d in deps[name]), "\n") * "\n"
+            write(joinpath(pkgpath, "Project.toml"),
+                  "name = \"$name\"\nuuid = \"$(uuids[name])\"\nversion = \"0.1.0\"\n" * depstr)
+            write(joinpath(pkgpath, "src", "$name.jl"), src)
+        end
+        write(joinpath(project_path, "Project.toml"), "[deps]\nRelinkC = \"$(uuids["RelinkC"])\"\n")
+        manifest = IOBuffer()
+        print(manifest, "julia_version = \"$(VERSION)\"\nmanifest_format = \"2.0\"\n")
+        for name in ("RelinkA", "RelinkB", "RelinkC")
+            print(manifest, "\n[[deps.$name]]\n")
+            isempty(deps[name]) || print(manifest, "deps = [", join(("\"$d\"" for d in deps[name]), ", "), "]\n")
+            print(manifest, "path = \"../dev/$name/\"\nuuid = \"$(uuids[name])\"\nversion = \"0.1.0\"\n")
+        end
+        write(joinpath(project_path, "Manifest.toml"), String(take!(manifest)))
+
+        # every build_id currently on disk, per package -- a rebuild moves one
+        function cached_build_ids()
+            ids = Dict{String,Vector{UInt128}}()
+            for d in readdir(joinpath(depot, "compiled"), join=true), pkgdir in readdir(d, join=true)
+                haskey(srcs, basename(pkgdir)) || continue
+                for f in readdir(pkgdir, join=true)
+                    endswith(f, ".ji") || continue
+                    push!(get!(Vector{UInt128}, ids, basename(pkgdir)), first(Base.parse_cache_buildid(f)))
+                end
+            end
+            return Dict(k => sort!(v) for (k, v) in ids)
+        end
+
+        # the C side of the probe keys on the variable being *present*, so an inherited
+        # JULIA_PKGIMAGE_RELINK* would decide these runs rather than the test
+        base_env = Dict{String,String}(k => v for (k, v) in ENV if !startswith(k, "JULIA_PKGIMAGE_RELINK"))
+        base_env["JULIA_DEPOT_PATH"] = depot
+        # to a file, not a pipe: the probe writes a diagnostic per image and per worker, and
+        # a reader that falls behind gives the package under test an EPIPE of its own
+        logfile = joinpath(depot, "run.log")
+        function load(script, env::Pair{String,String}...)
+            cmd = setenv(`$(Base.julia_cmd()) --startup-file=no --project=$(project_path) -e $script`,
+                         merge(base_env, Dict(env)))
+            ok = success(pipeline(ignorestatus(cmd), stdout=logfile, stderr=logfile))
+            return ok, read(logfile, String)
+        end
+
+        ok, out = load("using RelinkC")
+        @test ok
+        before = cached_build_ids()
+        @test issetequal(keys(before), keys(srcs))
+
+        # rebuild only RelinkA, by discarding its cache rather than editing its source
+        for d in readdir(joinpath(depot, "compiled"), join=true)
+            rm(joinpath(d, "RelinkA"); recursive=true, force=true)
+        end
+        # by UUID: RelinkA is reached transitively, so it is not a name the project resolves
+        ok, out = load("Base.require(Base.PkgId(Base.UUID(\"$(uuids["RelinkA"])\"), \"RelinkA\"))")
+        @test ok
+        rebuilt_dep = cached_build_ids()
+        @test rebuilt_dep["RelinkA"] != before["RelinkA"]
+        @test rebuilt_dep["RelinkB"] == before["RelinkB"]
+
+        # RelinkB and RelinkC are both refused now, and each must come back from a cache
+        script = """
+            using RelinkC
+            print("h=", RelinkC.h(1), " cache=", Base.pkgorigins[Base.PkgId(RelinkC)].cachepath)
+            """
+        relink = ("JULIA_PKGIMAGE_RELINK" => "1", "JULIA_PKGIMAGE_RELINK_REFUSE_ALL" => "1")
+        ok, out = load(script, relink...)
+        # bound to locals first: the probe writes a diagnostic per image, so a failing
+        # `occursin` on `out` would print thousands of lines instead of `false`
+        computed, fellback, from_source = occursin("h=6", out),
+            occursin("failed to create a usable precompiled cache file", out), occursin("cache=nothing", out)
+        @test ok
+        @test computed
+        @test !fellback
+        @test !from_source
+        after = cached_build_ids()
+        @test after["RelinkA"] == rebuilt_dep["RelinkA"]
+        @test after["RelinkB"] != rebuilt_dep["RelinkB"]
+        @test after["RelinkC"] != rebuilt_dep["RelinkC"]
+
+        # and exactly one rebuild: repeating it now finds nothing left to refuse
+        ok, out = load(script, relink...)
+        fellback, from_source = occursin("failed to create a usable precompiled cache file", out),
+            occursin("cache=nothing", out)
+        @test ok
+        @test !fellback
+        @test !from_source
+        @test cached_build_ids() == after
+    end
+end
+
 finish_precompile_test!()
