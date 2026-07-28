@@ -4168,11 +4168,17 @@ static jl_value_t *relink_export_lookup(size_t blob, uint64_t digest) JL_NOTSAFE
     // `LogExpFunctions` verified end to end: 15-file cascade avoided, 28 computed values
     // identical, 0 wrong resolutions. It is worth switching on; it is still opt-in only
     // because the writer-side cost has not been re-measured since.
+    // On by default. The index is written unconditionally, so its disk cost is already
+    // paid whether or not anything reads it, and consulting it is free at load: rebuild
+    // Animations and load Makie, median of three, 2.38 s either way. Set the variable to
+    // `-` to turn it off; anything else selects which locator kinds may consult it.
     static int consult = -1;
     static const char *kinds = NULL;
     if (consult == -1) {
         kinds = getenv("JULIA_PKGIMAGE_RELINK_INDEX");
-        consult = kinds != NULL;
+        consult = !(kinds != NULL && kinds[0] == '-' && kinds[1] == '\0');
+        if (kinds == NULL)
+            kinds = "sudUtvo";
     }
     if (!consult)
         return NULL;
