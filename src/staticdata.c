@@ -1179,6 +1179,7 @@ static uintptr_t add_external_linkage(jl_serializer_state *s, jl_value_t *v, jl_
 // one unit of `depth`.
 #define EXTKEY_MAX_TYPEDEPTH 40
 
+static int relink_stats(void) JL_NOTSAFEPOINT;
 static int extkey_write(ios_t *k, jl_value_t *v, int depth) JL_NOTSAFEPOINT;
 
 // Which field defeats a CodeInstance key. They are 44% of the entries the writer cannot
@@ -4099,7 +4100,7 @@ static inline uintptr_t relink_resolve(jl_serializer_state *s, size_t depsidx, s
 static void relink_free(jl_serializer_state *s, jl_import_table_t *tbl) JL_NOTSAFEPOINT
 {
     if (relink_repointed)
-        jl_safe_printf("RELINK_REPOINTED refs=%zu\n", relink_repointed);
+        if (relink_stats()) jl_safe_printf("RELINK_REPOINTED refs=%zu\n", relink_repointed);
     relink_repointed = 0;
     free(s->relink_map);
     s->relink_map = NULL;
@@ -5542,6 +5543,18 @@ static void relink_sweep(jl_serializer_state *s, jl_import_table_t *tbl, jl_arra
     free(nent);
 }
 
+// Statistics are development output and must not appear in an ordinary run: someone who
+// sets JULIA_PKGIMAGE_RELINK=1 wants working re-linking, not a coverage report. Set
+// JULIA_PKGIMAGE_RELINK_STATS=1 (or _VERBOSE=1) to see them.
+static int relink_stats(void) JL_NOTSAFEPOINT
+{
+    static int on = -1;
+    if (on == -1)
+        on = getenv("JULIA_PKGIMAGE_RELINK_STATS") != NULL ||
+             getenv("JULIA_PKGIMAGE_RELINK_VERBOSE") != NULL;
+    return on;
+}
+
 static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_array_t *depmods, const uint8_t *extfn,
                            const char *imgdata, size_t imgsize) JL_GC_DISABLED
 {
@@ -5627,7 +5640,7 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
             rootcited_n++;
             if (verbose && d - 1 < (size_t)jl_array_nrows(depmods)) {
                 jl_value_t *m = jl_array_ptr_ref(depmods, d - 1);
-                jl_safe_printf("RELINK_ROOTCITE_DEP idx=%zu name=%s\n", d,
+                if (relink_stats()) jl_safe_printf("RELINK_ROOTCITE_DEP idx=%zu name=%s\n", d,
                                jl_is_module(m) ? jl_symbol_name(((jl_module_t*)m)->name) : "?");
             }
         }
@@ -5801,7 +5814,7 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
                 if (exp != NULL) {
                     got = exp;
                     if (verbose && d < relink_mismatched_ndeps && relink_mismatched_deps[d]) {
-                        jl_safe_printf("RELINK_INDEXED dep=%u off=%zu [%s] exp=%p\n    obj=",
+                        if (relink_stats()) jl_safe_printf("RELINK_INDEXED dep=%u off=%zu [%s] exp=%p\n    obj=",
                                        (unsigned)d, (size_t)tbl->e[i].offset,
                                        jl_typeof_str(exp), (void*)exp);
                         if (jl_is_type(exp))
@@ -5940,7 +5953,7 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
                 // that moved -- which is the only case repointing is used for. Name what
                 // is about to be repointed so a wrong program has something to bisect.
                 if (verbose && d < relink_mismatched_ndeps && relink_mismatched_deps[d])
-                    jl_safe_printf("RELINK_ACCEPT dep=%u off=%zu [%s] %.200s\n",
+                    if (relink_stats()) jl_safe_printf("RELINK_ACCEPT dep=%u off=%zu [%s] %.200s\n",
                                    (unsigned)d, (size_t)tbl->e[i].offset,
                                    jl_typeof_str(got), tbl->e[i].loc);
                 // the name below comes from the representative's blob, so a rebuilt
@@ -5977,7 +5990,7 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
                     ios_mem(&idbuf, 256);
                     int idok = extkey_write(&idbuf, got, 0);
                     ios_putc('\0', &idbuf);
-                    jl_safe_printf("RELINK_DIGEST_MISMATCH [%s] %s\n    id=%s\n",
+                    if (relink_stats()) jl_safe_printf("RELINK_DIGEST_MISMATCH [%s] %s\n    id=%s\n",
                                    jl_typeof_str(got), tbl->e[i].loc,
                                    idok ? idbuf.buf : "(unrenderable)");
                     ios_close(&idbuf);
@@ -5988,7 +6001,7 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
             unresolved++;
             eclass[i] = RSW_UNRES;
             if (verbose)
-                jl_safe_printf("RELINK_UNRESOLVED at+%zu %s\n",
+                if (relink_stats()) jl_safe_printf("RELINK_UNRESOLVED at+%zu %s\n",
                                fail_at[i], tbl->e[i].loc);
         }
         if (failed || mismatched) {
@@ -6041,10 +6054,10 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
     // `mode=fast` means the coverage columns describe only the entries a moved dependency
     // made it necessary to look at; they are not acceptance rates for the image. Anything
     // measuring coverage wants JULIA_PKGIMAGE_RELINK_PROBE_ALL.
-    jl_safe_printf("RELINK_PROBE mode=%s entries=%zu resolved_entries=%zu skipped=%zu keyed=%zu resolved=%zu accepted=%zu unresolved=%zu digest_mismatch=%zu uncompiled_extfn=%zu fabricated=%zu method_unverified=%zu\n",
+    if (relink_stats()) jl_safe_printf("RELINK_PROBE mode=%s entries=%zu resolved_entries=%zu skipped=%zu keyed=%zu resolved=%zu accepted=%zu unresolved=%zu digest_mismatch=%zu uncompiled_extfn=%zu fabricated=%zu method_unverified=%zu\n",
                    probe_all ? "all" : "fast", tbl->n, nneed, nskip,
                    keyed, resolved, accepted, unresolved, digest_bad, extfn_bad, fabricated, method_unverified);
-    jl_safe_printf("RELINK_SELFCHECK identical=%zu different=%zu\n", gt_checked - gt_bad, gt_bad);
+    if (relink_stats()) jl_safe_printf("RELINK_SELFCHECK identical=%zu different=%zu\n", gt_checked - gt_bad, gt_bad);
     // kinds sorted by unresolved count, mismatches alongside; examples for the top two
     int order[RK_MAX];
     for (int q = 0; q < nrk; q++)
@@ -6058,19 +6071,19 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
         order[b] = t;
     }
     for (int q = 0; q < nrk; q++)
-        jl_safe_printf("RELINK_KIND %-16s unresolved=%zu digest_mismatch=%zu\n",
+        if (relink_stats()) jl_safe_printf("RELINK_KIND %-16s unresolved=%zu digest_mismatch=%zu\n",
                        rk_name[order[q]], rk_unres[order[q]], rk_mis[order[q]]);
     for (int q = 0; q < nrk && q < 2; q++) {
         int k = order[q];
         for (size_t x = 0; x < rk_nex[k]; x++) {
             size_t i = rk_ex[k][x];
-            jl_safe_printf("RELINK_EXAMPLE %-16s at+%zu %.200s\n",
+            if (relink_stats()) jl_safe_printf("RELINK_EXAMPLE %-16s at+%zu %.200s\n",
                            rk_name[k], rk_exat[k][x], tbl->e[i].loc);
         }
     }
     for (int r = 0; r < KP_CI_NREASON; r++)
         if (kp_ci_miss[r])
-            jl_safe_printf("RELINK_CI %-14s %zu\n", kp_ci_reason[r], kp_ci_miss[r]);
+            if (relink_stats()) jl_safe_printf("RELINK_CI %-14s %zu\n", kp_ci_reason[r], kp_ci_miss[r]);
     memset(kp_ci_miss, 0, sizeof(kp_ci_miss));
     // per-dependency: an edge survives a rebuild only if every entry from it is accepted,
     // keyed and unkeyed alike -- an unkeyed entry cannot be re-linked at all
@@ -6095,15 +6108,15 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
                 }
             }
         }
-        jl_safe_printf("RELINK_DEP idx=%u name=%s entries=%zu skipped=%zu keyed=%zu resolved=%zu accepted=%zu methods=%zu types=%zu cited=%d\n",
+        if (relink_stats()) jl_safe_printf("RELINK_DEP idx=%u name=%s entries=%zu skipped=%zu keyed=%zu resolved=%zu accepted=%zu methods=%zu types=%zu cited=%d\n",
                        d, name, dep_entries[d], dep_skipped[d], dep_keyed[d], dep_resolved[d], dep_accepted[d],
                        dep_methods[d], dep_types[d], d < ndep ? rootcited[d] : 0);
         if (dep_unkeyed[d])
-            jl_safe_printf("RELINK_UNKEYED_DEP idx=%u name=%s entries=%zu unkeyed=%zu\n",
+            if (relink_stats()) jl_safe_printf("RELINK_UNKEYED_DEP idx=%u name=%s entries=%zu unkeyed=%zu\n",
                            d, name, dep_entries[d], dep_unkeyed[d]);
         if (dep_accepted[d] != dep_keyed[d]) {
             // the edge is refused; name exactly what blocks it, by locator kind
-            jl_safe_printf("RELINK_BLOCKED idx=%u name=%s keyed=%zu failed=%zu:",
+            if (relink_stats()) jl_safe_printf("RELINK_BLOCKED idx=%u name=%s keyed=%zu failed=%zu:",
                            d, name, dep_keyed[d], dep_keyed[d] - dep_accepted[d]);
             for (int q = 0; q < nrk; q++) {
                 if (dep_kind_unres[(size_t)d * RK_MAX + q])
@@ -6114,7 +6127,7 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
             jl_safe_printf("\n");
         }
     }
-    jl_safe_printf("RELINK_DEPS ndeps=%zu fully_accepted_keyed=%zu (%.1f%%) fully_accepted_all=%zu (%.1f%%)\n",
+    if (relink_stats()) jl_safe_printf("RELINK_DEPS ndeps=%zu fully_accepted_keyed=%zu (%.1f%%) fully_accepted_all=%zu (%.1f%%)\n",
                    ndeps, full_keyed, ndeps ? 100.0 * (double)full_keyed / (double)ndeps : 0.0,
                    full_all, ndeps ? 100.0 * (double)full_all / (double)ndeps : 0.0);
     // Only the dependencies that actually moved have to be repointed, and repointing is
@@ -6149,7 +6162,7 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
         }
     }
     if (relink_mismatched_ndeps)
-        jl_safe_printf("RELINK_ROOTCITE deps_cited=%zu of %zu, rebuilt_and_cited=%zu method_unverified=%zu method_unverified_moved=%zu\n",
+        if (relink_stats()) jl_safe_printf("RELINK_ROOTCITE deps_cited=%zu of %zu, rebuilt_and_cited=%zu method_unverified=%zu method_unverified_moved=%zu\n",
                        rootcited_n, relink_ndep_buildids ? relink_ndep_buildids - 1 : 0,
                        moved_rootcited, method_unverified, method_unverified_moved);
     // The caller repoints exactly under this condition. Register the build_id
@@ -6168,7 +6181,7 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
                     jl_relink_register_buildid_alias(relink_dep_buildid[d],
                                                      ((jl_module_t*)mm)->build_id.lo);
                     if (verbose)
-                        jl_safe_printf("RELINK_ROOT_ALIAS %s %016" PRIx64 " -> %016" PRIx64 "\n",
+                        if (relink_stats()) jl_safe_printf("RELINK_ROOT_ALIAS %s %016" PRIx64 " -> %016" PRIx64 "\n",
                                        jl_symbol_name(((jl_module_t*)mm)->name),
                                        relink_dep_buildid[d], ((jl_module_t*)mm)->build_id.lo);
                 }
@@ -6182,7 +6195,7 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
     free(eclass);
     free(rootcited);
     if (relink_mismatched_ndeps)
-        jl_safe_printf("RELINK_REPOINT rebuilt_deps_imported=%zu blocked=%zu -> %s\n",
+        if (relink_stats()) jl_safe_printf("RELINK_REPOINT rebuilt_deps_imported=%zu blocked=%zu -> %s\n",
                        moved, moved_blocked, relinkable ? "repoint" : "rebuild");
     free(dep_entries);
     free(dep_keyed);
