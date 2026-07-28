@@ -5522,10 +5522,19 @@ static void relink_sweep(jl_serializer_state *s, jl_import_table_t *tbl, jl_arra
         }
         mask[d] |= b;
     }
-    size_t edges = 0, failedges = 0;
+    // Dependency 0 is the system image, and it can never be rebuilt independently -- the
+    // header check invalidates every cache when it changes. Its entries are resolved only
+    // because the sweep forces exhaustive resolution; the fast path never touches them.
+    // Counting their refusals as blockers inflated every figure here: 5937 of 9417
+    // refusals in one Makie run were dep=0, i.e. unreachable in normal operation.
+    size_t edges = 0, failedges = 0, sysimg_fail = 0;
     for (size_t d = 0; d < nd; d++) {
         if (nent[d] == 0)
             continue;
+        if (d == 0) {
+            sysimg_fail = nfail[d];
+            continue;
+        }
         edges++;
         if (nfail[d] == 0)
             continue;
@@ -5539,8 +5548,8 @@ static void relink_sweep(jl_serializer_state *s, jl_import_table_t *tbl, jl_arra
         jl_safe_printf("SWEEP_EDGE dep=%s mask=0x%x nfail=%zu nentries=%zu\n",
                        name, mask[d], nfail[d], nent[d]);
     }
-    jl_safe_printf("SWEEP_IMAGE entries=%zu edges=%zu clean=%zu failedges=%zu\n",
-                   tbl->n, edges, edges - failedges, failedges);
+    jl_safe_printf("SWEEP_IMAGE entries=%zu edges=%zu clean=%zu failedges=%zu sysimg_refusals_excluded=%zu\n",
+                   tbl->n, edges, edges - failedges, failedges, sysimg_fail);
     free(mask);
     free(nfail);
     free(nent);
@@ -5967,7 +5976,14 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
                 tbl->e[i].resolved = got;
             }
             else {
-                digest_bad++;
+                // Count each refusal once, under the reason that actually caused it. A
+                // fabricated object has already set ok=0 above, and counting it here too
+                // reported it as a digest mismatch -- which sent a day of work chasing a
+                // content bug in `V: simplevec` that was really "svecs are not interned,
+                // so the parser built one". Fabrication and mismatch need different fixes;
+                // conflating them hid that 9416 of 9417 refusals were the former.
+                if (rcls != RSW_FAB)
+                    digest_bad++;
                 mismatched = 1;
                 eclass[i] = rcls;
                 // full texts survive only in a file: `jl_safe_printf` truncates, and the
