@@ -1312,6 +1312,21 @@ function relink_cache_refused(cachefile::String, build_id::UInt128)
     return !isempty(cur) && occursin(string(cachefile, '|', UUID(build_id), ';'), cur)
 end
 
+# How many caches the probe has refused so far. `__require_prelocked` compares this across
+# a precompile attempt: the count only grows, so a growth is proof that the attempt learned
+# something it could not have known when it planned what to rebuild.
+relink_refused_count() = count(==(';'), get(ENV, "JULIA_PKGIMAGE_RELINK_REFUSED", ""))
+
+# Whether a pkgimage this process refused still occupies that path. Measured: `dlopen`
+# resolves an already-loaded object by name before it looks at the file, so a refused image
+# stays mapped and a rebuild written over it is never read. The slot is spent for the rest
+# of the process and the rebuild has to go somewhere else.
+function relink_ocachefile_burnt(ocachefile::String)
+    get_bool_env("JULIA_PKGIMAGE_RELINK", false) === true || return false # noidiom
+    cur = get(ENV, "JULIA_PKGIMAGE_RELINK_REFUSED", "")
+    return !isempty(cur) && occursin(string(cachefile_from_ocachefile(ocachefile), '|'), cur)
+end
+
 # loads a precompile cache file, ignoring stale_cachefile tests
 # assuming all depmods are already loaded and everything is valid
 # these return either the array of modules loaded from the path / content given
@@ -1327,6 +1342,7 @@ function _include_from_serialized(pkg::PkgId, path::String, ocachepath::Union{No
             t_comp_before = cumulative_compile_time_ns()
         end
 
+        relink_moved_dep = false
         for i in eachindex(depmods)
             dep = depmods[i]
             dep isa Module && continue
@@ -1340,16 +1356,24 @@ function _include_from_serialized(pkg::PkgId, path::String, ocachepath::Union{No
                 # table decide; the C side still refuses the cache if it cannot repoint.
                 dep = something(maybe_root_module(depkey))
                 @assert PkgId(dep) == depkey
+                relink_moved_dep = true
             else
                 dep = something(dep)
             end
             depmods[i] = dep
         end
+        # Refuse every cache the probe would have been asked about. Which edges the probe
+        # can repoint is a property of the packages at hand, so without this the refusal
+        # path -- and it is a whole path, ending in a rebuild -- has no test guaranteed to
+        # reach it.
+        relink_refuse_all = relink_moved_dep && get_bool_env("JULIA_PKGIMAGE_RELINK_REFUSE_ALL", false) === true # noidiom
 
         ignore_native = false
         unlock(require_lock) # temporarily _unlock_ during these operations
         sv = try
-            if ocachepath !== nothing
+            if relink_refuse_all
+                ErrorException("Refusing cache for $(pkg.name) after relink probe: JULIA_PKGIMAGE_RELINK_REFUSE_ALL")
+            elseif !isnothing(ocachepath)
                 @debug "Loading object cache file $ocachepath for $(repr("text/plain", pkg))"
                 ccall(:jl_restore_package_image_from_file, Any, (Cstring, Any, Cint, Cstring, Cint),
                     ocachepath, depmods, #=completeinfo=#false, pkg.name, ignore_native)
@@ -2764,6 +2788,21 @@ function __require_prelocked(pkg::PkgId, env)
 
     parallel_precompile_attempted = Ref(false) # being safe to avoid getting stuck in a precompilepkgs loop
     reasons = Dict{String,Int}()
+    # Under JULIA_PKGIMAGE_RELINK a cache is only proven unloadable once the relink probe
+    # has refused it, and the probe runs during the load -- after `compilecache` has
+    # already decided what to rebuild. `stale_cachefile` reports a cache whose dependencies
+    # moved as usable, on the promise that the probe decides, so the precompile pass sees
+    # nothing to do for it and hands it straight back. One refusal also creates the next:
+    # rebuilding a refused dependency moves its build_id, so its own dependents gain one
+    # more reference to repoint. Measured on Makie with `Observables` rebuilt: the pass
+    # rebuilt ShaderAbstractions, ComputePipeline and GridLayoutBase, judged Makie fresh
+    # although its cache pinned four build_ids that no longer existed, and the load then
+    # degraded to running Makie from source. So count the refusals across a precompile
+    # attempt: a growth means the attempt learned of a cache it had not been asked to
+    # rebuild, and going round again rebuilds it. The count only grows, so this makes
+    # progress or stops.
+    relink_refused = relink_refused_count()
+    relink_rounds = 0
     # attempt to load the module file via the precompile cache locations
     if JLOptions().use_compiled_modules != 0
         @label load_from_cache
@@ -2855,6 +2894,13 @@ function __require_prelocked(pkg::PkgId, env)
                 cachefile, ocachefile = loaded::Tuple{String, Union{Nothing, String}}
                 loaded = _tryrequire_from_serialized(pkg, cachefile, ocachefile)
                 if !isa(loaded, Module)
+                    # 16 rounds is a stop, not a budget: each round must have refused a
+                    # cache the previous one had not, and there are finitely many.
+                    if relink_refused_count() > relink_refused && relink_rounds < 16
+                        relink_refused = relink_refused_count()
+                        relink_rounds += 1
+                        @goto load_from_cache
+                    end
                     @warn "The call to compilecache failed to create a usable precompiled cache file for $(repr("text/plain", pkg))" exception=loaded
                 else
                     return loaded
@@ -3510,6 +3556,15 @@ function compilecache(pkg::PkgId, path::String, internal_stderr::IO = stderr, in
 end
 
 function rename_unique_ocachefile(tmppath_so::String, ocachefile_orig::String, ocachefile::String = ocachefile_orig, num = 0)
+    if relink_ocachefile_burnt(ocachefile)
+        # This process has the image at that path dlopen'd and the relink probe has refused
+        # it. `dlopen` matches on the path before it looks at the file, so overwriting the
+        # file changes nothing: every later load of this package would restore the refused
+        # image again. Renaming works on POSIX where Windows' in-use check does not fire,
+        # so the same escape has to be taken for a different reason.
+        ocachename, ocacheext = splitext(ocachefile_orig)
+        return rename_unique_ocachefile(tmppath_so, ocachefile_orig, ocachename * "_$num" * ocacheext, num + 1)
+    end
     try
         mv(tmppath_so, ocachefile; force=true)
     catch e
