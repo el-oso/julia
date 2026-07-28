@@ -4157,10 +4157,14 @@ static jl_value_t *relink_export_lookup(size_t blob, uint64_t digest) JL_NOTSAFE
     // dependency, and the type-hash gate below now refuses every type borrowed from a
     // dependency that moved -- which is the only case a relink ever consults it. So with
     // that gate in place the index unlocks exactly zero edges that survive to a repoint.
-    // Measured on Makie's image, 94 edges: it takes clean edges 25 -> 40, but 13 of the
-    // 25 and 28 of the 40 carry a type or svec import, so the count that survives a
-    // dependency actually moving is 12 either way. It becomes worth switching on the day
-    // owned types are re-hashed after a repoint instead of refused.
+    // STALE COMMENT REMOVED. That measurement predated `db84526f38`, which took the
+    // build_id out of `TypeName.hash` and let the type refusal go. Re-measured after it,
+    // by rebuilding each of Makie's 86 image dependencies one at a time: the index takes
+    // edges that SURVIVE A REAL REBUILD from 13 to 21, and brings in the large ones --
+    // StructUtils 219 refs, Printf 203, LogExpFunctions 185, IntervalArithmetic 118.
+    // `LogExpFunctions` verified end to end: 15-file cascade avoided, 28 computed values
+    // identical, 0 wrong resolutions. It is worth switching on; it is still opt-in only
+    // because the writer-side cost has not been re-measured since.
     static int consult = -1;
     static const char *kinds = NULL;
     if (consult == -1) {
