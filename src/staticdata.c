@@ -2974,6 +2974,15 @@ static void jl_write_export_index(jl_serializer_state *s, ios_t *f, size_t sysim
     // was the one its sharing structure actually pointed at. Repointing then gave the
     // process two equal copies of one object, and code compiled against their identity
     // hit ud2: the equal-not-identical wrong-program class, one level up.
+    //
+    // What the grouping is *not* is the reason most entries are missing. Measured on
+    // Colors: 4 159 of 18 975 candidates were dropped here, and of those 2 193 render the
+    // same identity as another object in the image, 1 930 could not be rendered at all,
+    // and 36 were vetoed by this group rule alone. Of Makie's 119 refused Colors digests,
+    // 101 name two or more objects in Colors' image. A digest that names two objects
+    // cannot be an index key, and no rendering of an object's own content can separate
+    // two objects whose content is equal -- `Gray{Float32}.parameters` and
+    // `RGB{Float32}.parameters` are distinct `svec(Float32)`s and always will be.
     htable_t groups;
     htable_new(&groups, 1 << 16);
     for (size_t i = 0; i < serialization_order.size; i += 2) {
@@ -2997,7 +3006,10 @@ static void jl_write_export_index(jl_serializer_state *s, ios_t *f, size_t sysim
             *slot = (void*)((uintptr_t)*slot + 1);
     }
     size_t cap = 4096, n = 0;
-    char *pairs = (char*)malloc_s(cap * 16);
+    size_t c_cand = 0, c_nonidx = 0, c_dup = 0, c_nolayout = 0, c_nodigest = 0;
+    // 24 bytes per record while grouping -- digest, offset, cheap key -- compacted to the
+    // 16 the format stores once the group filter has run.
+    char *pairs = (char*)malloc_s(cap * 24);
     for (size_t i = 0; i < serialization_order.size; i += 2) {
         jl_value_t *obj = (jl_value_t*)serialization_order.table[i];
         void *val = serialization_order.table[i + 1];
@@ -3012,37 +3024,79 @@ static void jl_write_export_index(jl_serializer_state *s, ios_t *f, size_t sysim
               jl_is_typevar(obj) || jl_is_vararg(obj) ||
               (jl_is_datatype(obj) && !jl_is_concrete_type(obj))))
             continue;
+        c_cand++;
         int budget = 300;
-        if (!export_index_indexable(obj, &budget))
+        if (!export_index_indexable(obj, &budget)) {
+            c_nonidx++;
             continue;
-        // content-unique across the WHOLE image, not merely among emitted entries
+        }
+        uint64_t ck = 1469598103934665603ULL;
         {
-            uint64_t ck = 1469598103934665603ULL;
             int ckbudget = 2048;
             export_cheap_key(obj, &ck, &ckbudget);
-            void *cnt = ptrhash_get(&groups, (void*)(uintptr_t)(ck | 1));
-            if ((uintptr_t)cnt != 2)   // count+1: exactly one content-equal object image-wide
-                continue;
         }
         size_t id = from_seroder_entry(val);
-        if (id >= layout_table.len)
+        if (id >= layout_table.len) {
+            c_nolayout++;
             continue;
+        }
         uintptr_t pos = (uintptr_t)layout_table.items[id];
-        if (pos == 0)
+        if (pos == 0) {
+            c_nolayout++;
             continue;   // queued but never laid out
+        }
         uint64_t off = (pos & 1) ? (uint64_t)constbase + (pos & ~(uintptr_t)1)
                                  : (uint64_t)pos;
         uint64_t h = 0;
-        if (!extkey_hash(obj, &h) || h == 0)
+        if (!extkey_hash(obj, &h) || h == 0) {
+            c_nodigest++;
             continue;
+        }
         if (n == cap) {
             cap *= 2;
-            pairs = (char*)realloc_s(pairs, cap * 16);
+            pairs = (char*)realloc_s(pairs, cap * 24);
         }
-        memcpy(pairs + n * 16, &h, 8);
-        memcpy(pairs + n * 16 + 8, &off, 8);
+        memcpy(pairs + n * 24, &h, 8);
+        memcpy(pairs + n * 24 + 8, &off, 8);
+        memcpy(pairs + n * 24 + 16, &ck, 8);
         n++;
     }
+    // The cheap key is a *proxy* for the digest, and a proxy is only allowed to veto where
+    // the real thing cannot be consulted. Every record above carries a digest, so a group
+    // whose members are all records is settled by the digest run-deletion below -- which
+    // deletes exactly the entries that truly cannot be told apart, and keeps the ones the
+    // proxy merely lumped together. What the proxy must still veto is a group holding an
+    // object that never became a record: excluded by kind, budget, layout or an
+    // unrenderable key, its digest is unknown, so a colliding sibling cannot be ruled out
+    // and the whole group has to go. That is the case the rule was added for.
+    {
+        htable_t kept;
+        htable_new(&kept, 1 << 16);
+        for (size_t q = 0; q < n; q++) {
+            uint64_t ckq;
+            memcpy(&ckq, pairs + q * 24 + 16, 8);
+            void **slot = ptrhash_bp(&kept, (void*)(uintptr_t)(ckq | 1));
+            *slot = *slot == HT_NOTFOUND ? (void*)2 : (void*)((uintptr_t)*slot + 1);
+        }
+        size_t keep = 0;
+        for (size_t q = 0; q < n; q++) {
+            uint64_t ckq;
+            memcpy(&ckq, pairs + q * 24 + 16, 8);
+            void *tot = ptrhash_get(&groups, (void*)(uintptr_t)(ckq | 1));
+            void *rec = ptrhash_get(&kept, (void*)(uintptr_t)(ckq | 1));
+            if (tot != rec) {   // an object in this group carries no digest to compare
+                c_dup++;
+                continue;
+            }
+            if (keep != q)
+                memcpy(pairs + keep * 24, pairs + q * 24, 24);
+            keep++;
+        }
+        n = keep;
+        htable_free(&kept);
+    }
+    for (size_t q = 0; q < n; q++)   // compact to the stored (digest, offset) pairs
+        memmove(pairs + q * 16, pairs + q * 24, 16);
     qsort(pairs, n, 16, relink_export_cmp);
     // a duplicated digest cannot name one object: delete the whole run
     size_t out = 0, dropped = 0, i = 0;
@@ -3063,6 +3117,9 @@ static void jl_write_export_index(jl_serializer_state *s, ios_t *f, size_t sysim
         }
         else {
             dropped += j - i;
+            if (getenv("JULIA_EXPORT_SKIP_DUMP"))
+                jl_safe_printf("EXPORT_SKIP collide digest=%016llx n=%zu\n",
+                               (unsigned long long)hi_, j - i);
         }
         i = j;
     }
@@ -3071,8 +3128,11 @@ static void jl_write_export_index(jl_serializer_state *s, ios_t *f, size_t sysim
     free(pairs);
     htable_free(&groups);
     if (getenv("JULIA_IMPORT_KEYS"))
-        jl_safe_printf("EXPORT_INDEX entries=%zu dropped_collisions=%zu bytes=%zu\n",
-                       out, dropped, out * 16 + 4);
+        jl_safe_printf("EXPORT_INDEX entries=%zu dropped_collisions=%zu bytes=%zu "
+                       "candidates=%zu rej_nonindexable=%zu rej_dupcontent=%zu "
+                       "rej_nolayout=%zu rej_nodigest=%zu\n",
+                       out, dropped, out * 16 + 4,
+                       c_cand, c_nonidx, c_dup, c_nolayout, c_nodigest);
 }
 
 static void jl_write_import_table(jl_serializer_state *s, ios_t *f) JL_NOTSAFEPOINT
@@ -5564,6 +5624,16 @@ static int relink_stats(void) JL_NOTSAFEPOINT
     return on;
 }
 
+// Per-entry report on refusals the export index was supposed to prevent. Separate from
+// the statistics because it is one line per refused object, not per image.
+static int relink_fabdbg(void) JL_NOTSAFEPOINT
+{
+    static int on = -1;
+    if (on == -1)
+        on = getenv("JULIA_RELINK_FABDBG") != NULL;
+    return on;
+}
+
 static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_array_t *depmods, const uint8_t *extfn,
                            const char *imgdata, size_t imgsize) JL_GC_DISABLED
 {
@@ -5873,6 +5943,36 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
                 rcls = RSW_FAB;
                 if (external_blob_index(got) >= n_linkage_blobs())
                     why = "heap";
+                // A heap fabrication whose dependency did NOT move can be asked why
+                // directly: the ground truth is still at blob_base+offset. `kindok` and
+                // `idxable` say whether the export index was ever entitled to hold it,
+                // `digok` whether the digest the image recorded is the one that object
+                // renders now, and `expn` how large the owning image's index is. All four
+                // true with a failed lookup means the writer dropped the entry; measured
+                // on Makie, that is what 2 544 of 3 479 pkg-owned fabrications are.
+                if (relink_fabdbg() && why[0] == 'h' && wantblob < n_linkage_blobs() &&
+                    !(d < relink_mismatched_ndeps && relink_mismatched_deps[d])) {
+                    jl_value_t *w = (jl_value_t*)((uintptr_t)jl_linkage_blobs.items[2 * wantblob] +
+                                                  tbl->e[i].offset * SYS_EXTERNAL_LINK_UNIT);
+                    int kindok = jl_is_svec(w) || jl_is_unionall(w) || jl_is_uniontype(w) ||
+                                 jl_is_typevar(w) || jl_is_vararg(w) ||
+                                 (jl_is_datatype(w) && !jl_is_concrete_type(w));
+                    int b2 = 300;
+                    int idxable = kindok && export_index_indexable(w, &b2);
+                    uint64_t hw = 0;
+                    int digok = extkey_hash(w, &hw) && hw == tbl->e[i].digest;
+                    size_t expn = 2 * wantblob + 1 < relink_export_registry.len
+                                ? (size_t)relink_export_registry.items[2 * wantblob + 1] : 0;
+                    const char *dname = "?";
+                    if (d >= 1 && d - 1 < (size_t)jl_array_nrows(depmods)) {
+                        jl_value_t *dm = jl_array_ptr_ref(depmods, d - 1);
+                        if (jl_is_module(dm))
+                            dname = jl_symbol_name(((jl_module_t*)dm)->name);
+                    }
+                    jl_safe_printf("RELINK_FABDBG dep=%u/%s type=%s kindok=%d idxable=%d digok=%d expn=%zu digest=%016llx\n    loc=%.300s\n",
+                                   (unsigned)d, dname, jl_typeof_str(w), kindok, idxable, digok,
+                                   expn, (unsigned long long)tbl->e[i].digest, tbl->e[i].loc);
+                }
             }
             // Borrowing a type from a *rebuilt* dependency used to poison this image's own
             // types, and no reference described the damage: `jl_new_typename_in` folded the
