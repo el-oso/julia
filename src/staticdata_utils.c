@@ -1014,9 +1014,22 @@ static jl_value_t *read_verify_mod_list(ios_t *s, jl_array_t *depmods)
         if (want_relink && i + 1 < relink_ndep_buildids)
             relink_dep_buildid[i + 1] = build_id.lo;
         if (m->build_id.hi != build_id.hi || m->build_id.lo != build_id.lo) {
-            if (want_relink) {
+            // Re-linking exists to survive a rebuilt *dependency*. A mismatch on Base or
+            // Core means something else entirely: this cache was produced by a different
+            // build of Julia, whose sysimage has a different layout and different type
+            // identities. Accepting it lets two incompatible copies of a stdlib into one
+            // session -- observed as `MethodError: no method matching
+            // _mergedface(::StyledStrings.Face)` whose closest candidate is that very
+            // signature, because the argument's type and the method's are distinct
+            // objects. `write_mod_list` records every loaded in-image module, so this
+            // catches any foreign-build cache, not only a directly-named one.
+            int foreign_build = (m == jl_base_module || m == jl_core_module);
+            if (want_relink && !foreign_build) {
                 // name the dependency: a refusal that only says "build_id mismatch"
-                // cost a debugging session before this line existed
+                // cost a debugging session before this line existed. Behind the stats
+                // flag: this fires for every moved dependency on every load, which is
+                // normal operation, not news.
+                if (getenv("JULIA_PKGIMAGE_RELINK_STATS") || getenv("JULIA_PKGIMAGE_RELINK_VERBOSE"))
                 jl_safe_printf("RELINK_MISMATCH dep=%s recorded=%016" PRIx64 "%016" PRIx64
                                " loaded=%016" PRIx64 "%016" PRIx64 "\n",
                                name, build_id.hi, build_id.lo, m->build_id.hi, m->build_id.lo);
