@@ -70,10 +70,35 @@ int must_be_new_dt(jl_value_t *t, htable_t *news, char *image_base, size_t sizeo
     return 0;
 }
 
+// The key a precompile unit's contributions to a foreign method's roots are filed under.
+//
+// It has to name the same module on all three sides or the roots go missing. Roots are
+// *written* under `jl_precompile_toplevel_module` (jl_add_method_root, via ircode.c),
+// which toplevel.c sets to the first root module the unit defines and never moves. They
+// are *collected* under this key (staticdata.c, nroots_with_key) and *installed* under it
+// again at load (jl_copy_roots). Collection and installation agree by construction --
+// same rule, same array -- so this function is what has to agree with the writer.
+//
+// Taking the last entry did that only when the unit defines exactly one root module. With
+// two, every root added during the precompile is keyed by the first module while the
+// collector looks for the last, so nothing is serialized, the IR citing those roots is
+// cached anyway (get_root_reference only refuses key 0), and at load the citation walks
+// off the end of a block table that has no such key. Take the first root module instead:
+// root modules cannot nest, so their completion order is their definition order, which
+// makes this the same module `jl_precompile_toplevel_module` names -- and, whenever there
+// is only one, the same module the last entry named.
 static uint64_t jl_worklist_key(jl_array_t *worklist) JL_NOTSAFEPOINT
 {
     assert(jl_is_array(worklist));
     size_t len = jl_array_nrows(worklist);
+    for (size_t i = 0; i < len; i++) {
+        jl_module_t *m = (jl_module_t*)jl_array_ptr_ref(worklist, i);
+        assert(jl_is_module(m));
+        if (m->parent == m)   // a root module is self-parented (jl_new_module_)
+            return m->build_id.lo;
+    }
+    // No root module at all: nothing writes roots under such a unit, but keep the old
+    // answer rather than inventing a new one.
     if (len > 0) {
         jl_module_t *topmod = (jl_module_t*)jl_array_ptr_ref(worklist, len-1);
         assert(jl_is_module(topmod));
