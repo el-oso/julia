@@ -81,7 +81,23 @@ JL_DLLEXPORT jl_typename_t *jl_new_typename_in(jl_sym_t *name, jl_module_t *modu
     jl_atomic_store_relaxed(&tn->cache, jl_emptysvec);
     jl_atomic_store_relaxed(&tn->linearcache, jl_emptysvec);
     tn->names = NULL;
-    tn->hash = bitmix(bitmix(module ? module->build_id.lo : 0, name->hash), 0xa1ada1da);
+    // The defining module's *path*, not its build_id. `build_id.lo` is
+    // `bitmix(jl_hrtime() + count, jl_rand())` (src/module.c:512) -- pure per-session
+    // entropy -- and this number is not private to the TypeName: `typekey_hash` folds
+    // `~tn->hash` into every instantiation's `hash`, that field is `jl_object_id` for a
+    // concrete DataType and the seed of `jl_object_id` for every immutable value, and it
+    // decides the slot of every hash table keyed on any of those. Serialized images carry
+    // all of it: the image's own `TypeName.cache` sets, its methods' `speckeyset`, and any
+    // `Dict`/`Set`/`IdDict` it holds whose keys are types or immutables. Rebuilding a
+    // package therefore moves the objectid of every type it defines -- measured, a rebuilt
+    // `Observables`: `objectid(Observable{Set{Symbol}})` 0x9b86df3b -> 0x0b6ca8ef -- which
+    // no serialized table keyed on it can survive.
+    // `module->hash` (src/module.c:526) is the same value derived from the module path, so
+    // it distinguishes the same TypeNames and is a function of content rather than of when
+    // the module happened to be created. Distinct TypeNames sharing a module path and name
+    // now collide, which is legal for both users of this number: a type cache is per
+    // TypeName, and objectid may collide as long as `===` objects agree.
+    tn->hash = bitmix(bitmix(module ? module->hash : 0, name->hash), 0xa1ada1da);
     tn->_unused = 0;
     tn->abstract = abstract;
     tn->mutabl = mutabl;
