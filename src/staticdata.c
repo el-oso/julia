@@ -5323,300 +5323,10 @@ static int relink_unmoved_blob_is_method(jl_serializer_state *s, uint32_t d, uin
     return jl_is_method(w);
 }
 
-// Measurement for the borrowing design, not machinery: how many refused type-family
-// entries -- the population resolution can only *construct*, which the blob-identity
-// gate rightly refuses -- are reachable from an accepted entry's genuine object through
-// the non-lazy structural fields an owner+path locator could cite? Membership is tested
-// by pointer against the ground-truth object, so a path that hands back anything freshly
-// built or normalised on read fails the test by construction. Only meaningful where
-// nothing moved. Enabled by JULIA_RELINK_BORROW_PROBE.
-static void relink_borrow_probe(jl_serializer_state *s, jl_import_table_t *tbl) JL_NOTSAFEPOINT
-{
-    htable_t seen;
-    htable_new(&seen, 1 << 16);
-    arraylist_t work;
-    arraylist_new(&work, 0);
-    size_t nseen = 0;
-    for (size_t i = 0; i < tbl->n; i++) {
-        jl_value_t *v = tbl->e[i].resolved;
-        if (v != NULL && ptrhash_get(&seen, v) == HT_NOTFOUND) {
-            // `HT_NOTFOUND` is `(void*)1`, so this marker reads back as "absent". Harmless
-            // here -- a seed is an *accepted* entry and the membership test below is only
-            // ever asked about refused ones -- but do not copy the pattern.
-            ptrhash_put(&seen, v, (void*)(uintptr_t)1);
-            arraylist_push(&work, v);
-            nseen++;
-        }
-    }
-#define BP_PUSH(child) do { \
-        jl_value_t *c_ = (jl_value_t*)(child); \
-        if (c_ != NULL && depth < 10 && nseen < ((size_t)1 << 22) && \
-            ptrhash_get(&seen, c_) == HT_NOTFOUND) { \
-            ptrhash_put(&seen, c_, (void*)(depth + 1)); \
-            arraylist_push(&work, c_); \
-            nseen++; \
-        } \
-    } while (0)
-    while (work.len) {
-        jl_value_t *v = (jl_value_t*)arraylist_pop(&work);
-        uintptr_t depth = (uintptr_t)ptrhash_get(&seen, v);
-        if (jl_is_svec(v)) {
-            for (size_t j = 0; j < jl_svec_len(v); j++)
-                BP_PUSH(jl_svecref(v, j));
-        }
-        else if (jl_is_datatype(v)) {
-            // parameters only: `types` and `layout` are built lazily, `instance` and
-            // `super` are reachable but never in the refused population
-            BP_PUSH(((jl_datatype_t*)v)->parameters);
-            BP_PUSH(((jl_datatype_t*)v)->name);
-        }
-        else if (jl_is_typename(v)) {
-            BP_PUSH(((jl_typename_t*)v)->wrapper);
-        }
-        else if (jl_is_unionall(v)) {
-            BP_PUSH(((jl_unionall_t*)v)->var);
-            BP_PUSH(((jl_unionall_t*)v)->body);
-        }
-        else if (jl_is_typevar(v)) {
-            BP_PUSH(((jl_tvar_t*)v)->lb);
-            BP_PUSH(((jl_tvar_t*)v)->ub);
-        }
-        else if (jl_is_uniontype(v)) {
-            BP_PUSH(((jl_uniontype_t*)v)->a);
-            BP_PUSH(((jl_uniontype_t*)v)->b);
-        }
-        else if (jl_is_vararg(v)) {
-            BP_PUSH(((jl_vararg_t*)v)->T);
-            BP_PUSH(((jl_vararg_t*)v)->N);
-        }
-        else if (jl_is_method(v)) {
-            jl_method_t *m = (jl_method_t*)v;
-            BP_PUSH(m->sig);
-            // roots are part of the method's identity now (the |R record digests them)
-            if (m->roots != NULL)
-                for (size_t j = 0; j < jl_array_nrows(m->roots); j++)
-                    BP_PUSH(jl_array_ptr_ref(m->roots, j));
-        }
-        else if (jl_is_method_instance(v)) {
-            BP_PUSH(((jl_method_instance_t*)v)->specTypes);
-        }
-        else if (jl_is_code_instance(v)) {
-            jl_code_instance_t *ci = (jl_code_instance_t*)v;
-            BP_PUSH(ci->rettype);
-            BP_PUSH(ci->exctype);
-            BP_PUSH(ci->rettype_const);
-            // the edge list is in the identity (its digest is part of the CI key)
-            BP_PUSH(jl_atomic_load_relaxed(&ci->edges));
-        }
-        else if (jl_is_array(v)) {
-            jl_array_t *a = (jl_array_t*)v;
-            const jl_datatype_layout_t *aly = ((jl_datatype_t*)jl_typeof(a->ref.mem))->layout;
-            if (aly->flags.arrayelem_isboxed)
-                for (size_t j = 0; j < jl_array_nrows(a); j++)
-                    BP_PUSH(jl_array_ptr_ref(a, j));
-        }
-    }
-#undef BP_PUSH
-    enum { BK_SVEC, BK_DT, BK_UA, BK_TV, BK_UNION, BK_VARARG, BK_OTHER, BK_N };
-    static const char *const bk_name[BK_N] =
-        { "simplevec", "datatype", "unionall", "typevar", "union", "vararg", "other" };
-    size_t total[BK_N], hit[BK_N], hd[11];
-    memset(total, 0, sizeof(total));
-    memset(hit, 0, sizeof(hit));
-    memset(hd, 0, sizeof(hd));
-    for (size_t i = 0; i < tbl->n; i++) {
-        if (tbl->e[i].resolved != NULL || tbl->e[i].loclen == 0)
-            continue;
-        uint32_t d = tbl->e[i].depsidx;
-        if (d < relink_mismatched_ndeps && relink_mismatched_deps[d])
-            continue;   // moved: no ground truth to test against
-        if (d >= jl_array_len(s->buildid_depmods_idxs))
-            continue;
-        size_t wb = jl_array_data(s->buildid_depmods_idxs, uint32_t)[d];
-        if (2 * wb >= jl_linkage_blobs.len)
-            continue;
-        jl_value_t *w = (jl_value_t*)((uintptr_t)jl_linkage_blobs.items[2 * wb] +
-                                      tbl->e[i].offset * SYS_EXTERNAL_LINK_UNIT);
-        int k = jl_is_svec(w) ? BK_SVEC :
-                jl_is_datatype(w) ? BK_DT :
-                jl_is_unionall(w) ? BK_UA :
-                jl_is_typevar(w) ? BK_TV :
-                jl_is_uniontype(w) ? BK_UNION :
-                jl_is_vararg(w) ? BK_VARARG : BK_OTHER;
-        total[k]++;
-        void *got = ptrhash_get(&seen, w);
-        if (got != HT_NOTFOUND) {
-            hit[k]++;
-            uintptr_t dep = (uintptr_t)got;
-            hd[dep > 10 ? 10 : dep]++;
-        }
-    }
-    size_t t = 0, h = 0;
-    for (int k = 0; k < BK_N; k++) {
-        t += total[k];
-        h += hit[k];
-        if (total[k])
-            jl_safe_printf("BORROW_KIND %-9s reachable=%zu of %zu\n", bk_name[k], hit[k], total[k]);
-    }
-    jl_safe_printf("BORROW_TOTAL reachable=%zu of %zu refused entries, walked=%zu, depth:", h, t, nseen);
-    for (int q = 1; q <= 10; q++)
-        jl_safe_printf(" %zu", hd[q]);
-    jl_safe_printf("\n");
-    // The number that decides: acceptance is all-or-nothing per dependency edge, so
-    // borrowing pays only where it would clear an edge's *entire* refused population
-    // (and the edge has no unkeyed entries, which borrowing cannot name either).
-    {
-        uint32_t maxdep = 0;
-        for (size_t i = 0; i < tbl->n; i++)
-            if (tbl->e[i].depsidx > maxdep)
-                maxdep = tbl->e[i].depsidx;
-        size_t nd = (size_t)maxdep + 1;
-        size_t *ref = (size_t*)calloc(nd, sizeof(size_t));
-        size_t *rch = (size_t*)calloc(nd, sizeof(size_t));
-        size_t *unk = (size_t*)calloc(nd, sizeof(size_t));
-        size_t *any = (size_t*)calloc(nd, sizeof(size_t));
-        for (size_t i = 0; i < tbl->n; i++) {
-            uint32_t d = tbl->e[i].depsidx;
-            any[d]++;
-            if (tbl->e[i].loclen == 0) {
-                unk[d]++;
-                continue;
-            }
-            if (tbl->e[i].resolved != NULL)
-                continue;
-            ref[d]++;
-            if (d < relink_mismatched_ndeps && relink_mismatched_deps[d])
-                continue;
-            if (d >= jl_array_len(s->buildid_depmods_idxs))
-                continue;
-            size_t wb = jl_array_data(s->buildid_depmods_idxs, uint32_t)[d];
-            if (2 * wb >= jl_linkage_blobs.len)
-                continue;
-            jl_value_t *w = (jl_value_t*)((uintptr_t)jl_linkage_blobs.items[2 * wb] +
-                                          tbl->e[i].offset * SYS_EXTERNAL_LINK_UNIT);
-            if (ptrhash_get(&seen, w) != HT_NOTFOUND)
-                rch[d]++;
-        }
-        size_t edges = 0, clean = 0, borrowed = 0, borrowed_if_keyed_too = 0;
-        for (size_t d = 0; d < nd; d++) {
-            if (any[d] == 0)
-                continue;
-            edges++;
-            if (ref[d] == 0 && unk[d] == 0)
-                clean++;
-            else if (ref[d] == rch[d] && unk[d] == 0)
-                borrowed++;
-            else if (ref[d] == rch[d])
-                borrowed_if_keyed_too++;
-        }
-        jl_safe_printf("BORROW_EDGES total=%zu clean=%zu recovered_by_borrowing=%zu"
-                       " recovered_if_unkeyed_also_solved=%zu\n",
-                       edges, clean, borrowed, borrowed_if_keyed_too);
-        free(ref);
-        free(rch);
-        free(unk);
-        free(any);
-    }
-    htable_free(&seen);
-    arraylist_free(&work);
-}
 
 // Per-entry refusal class, recorded during pass 2 for the counterfactual sweep below.
 enum { RSW_OK = 0, RSW_UNKEYED, RSW_UNRES, RSW_FAB, RSW_MIS, RSW_EXTFN, RSW_GT };
 
-// The counterfactual sweep, learned from the borrowing measurement: entry counts predict
-// nothing, because acceptance is all-or-nothing per dependency edge. For every edge with
-// failures, emit the *set of failure classes* on it as a bitmask; which single class --
-// or which cumulative combination -- would clear how many edges is then arithmetic over
-// the log, and "fix class X" can be priced in edges before anyone builds it. Enabled by
-// JULIA_RELINK_SWEEP; measurement only, nothing is fixed or changed.
-static void relink_sweep(jl_serializer_state *s, jl_import_table_t *tbl, jl_array_t *depmods,
-                         const uint8_t *eclass) JL_NOTSAFEPOINT
-{
-#define SB_UNKEYED  1
-#define SB_UNRES_CI 2
-#define SB_UNRES_MI 4
-#define SB_UNRES_TY 8
-#define SB_UNRES_OT 16
-#define SB_FAB_TY   32
-#define SB_FAB_OT   64
-#define SB_MIS_ME   128
-#define SB_MIS_OT   256
-#define SB_OTHER    512
-    uint32_t maxdep = 0;
-    for (size_t i = 0; i < tbl->n; i++)
-        if (tbl->e[i].depsidx > maxdep)
-            maxdep = tbl->e[i].depsidx;
-    size_t nd = (size_t)maxdep + 1;
-    uint32_t *mask = (uint32_t*)calloc(nd, sizeof(uint32_t));
-    size_t *nfail = (size_t*)calloc(nd, sizeof(size_t));
-    size_t *nent = (size_t*)calloc(nd, sizeof(size_t));
-    for (size_t i = 0; i < tbl->n; i++) {
-        uint32_t d = tbl->e[i].depsidx;
-        nent[d]++;
-        if (eclass[i] == RSW_OK)
-            continue;
-        nfail[d]++;
-        uint32_t b = SB_OTHER;
-        if (eclass[i] == RSW_UNKEYED)
-            b = SB_UNKEYED;
-        else {
-            // classify by the ground-truth object, which exists wherever the dependency
-            // did not move -- and the sweep is only meaningful in such a session
-            jl_value_t *w = NULL;
-            if (!(d < relink_mismatched_ndeps && relink_mismatched_deps[d]) &&
-                d < jl_array_len(s->buildid_depmods_idxs)) {
-                size_t wb = jl_array_data(s->buildid_depmods_idxs, uint32_t)[d];
-                if (2 * wb < jl_linkage_blobs.len)
-                    w = (jl_value_t*)((uintptr_t)jl_linkage_blobs.items[2 * wb] +
-                                      tbl->e[i].offset * SYS_EXTERNAL_LINK_UNIT);
-            }
-            int family = w != NULL && (jl_is_svec(w) || jl_is_datatype(w) || jl_is_unionall(w) ||
-                                       jl_is_typevar(w) || jl_is_uniontype(w) || jl_is_vararg(w));
-            if (eclass[i] == RSW_UNRES)
-                b = w == NULL ? SB_OTHER :
-                    jl_is_code_instance(w) ? SB_UNRES_CI :
-                    jl_is_method_instance(w) ? SB_UNRES_MI :
-                    family ? SB_UNRES_TY : SB_UNRES_OT;
-            else if (eclass[i] == RSW_FAB)
-                b = family ? SB_FAB_TY : SB_FAB_OT;
-            else if (eclass[i] == RSW_MIS)
-                b = (w != NULL && jl_is_method(w)) ? SB_MIS_ME : SB_MIS_OT;
-        }
-        mask[d] |= b;
-    }
-    // Dependency 0 is the system image, and it can never be rebuilt independently -- the
-    // header check invalidates every cache when it changes. Its entries are resolved only
-    // because the sweep forces exhaustive resolution; the fast path never touches them.
-    // Counting their refusals as blockers inflated every figure here: 5937 of 9417
-    // refusals in one Makie run were dep=0, i.e. unreachable in normal operation.
-    size_t edges = 0, failedges = 0, sysimg_fail = 0;
-    for (size_t d = 0; d < nd; d++) {
-        if (nent[d] == 0)
-            continue;
-        if (d == 0) {
-            sysimg_fail = nfail[d];
-            continue;
-        }
-        edges++;
-        if (nfail[d] == 0)
-            continue;
-        failedges++;
-        const char *name = "Core";
-        if (d >= 1 && d - 1 < (size_t)jl_array_nrows(depmods)) {
-            jl_value_t *m = jl_array_ptr_ref(depmods, d - 1);
-            if (jl_is_module(m))
-                name = jl_symbol_name(((jl_module_t*)m)->name);
-        }
-        jl_safe_printf("SWEEP_EDGE dep=%s mask=0x%x nfail=%zu nentries=%zu\n",
-                       name, mask[d], nfail[d], nent[d]);
-    }
-    jl_safe_printf("SWEEP_IMAGE entries=%zu edges=%zu clean=%zu failedges=%zu sysimg_refusals_excluded=%zu\n",
-                   tbl->n, edges, edges - failedges, failedges, sysimg_fail);
-    free(mask);
-    free(nfail);
-    free(nent);
-}
 
 // ---- The owner probe: JULIA_RELINK_OWNER_PROBE; measurement only ----
 //
@@ -5647,346 +5357,8 @@ static const char *const op_path_name[OP_NPATH] = {
 };
 typedef struct { jl_value_t *owner; uint8_t path; uint32_t n; } owner_rec_t;
 
-// The one field an owner-anchored locator would name. NULL for a path that is a position
-// rather than a name.
-static jl_value_t *op_field(jl_value_t *v, uint8_t path) JL_NOTSAFEPOINT
-{
-    switch (path) {
-    case OP_PARAMS:    return jl_is_datatype(v) ? (jl_value_t*)((jl_datatype_t*)v)->parameters : NULL;
-    case OP_TYPES:     return jl_is_datatype(v) ? (jl_value_t*)((jl_datatype_t*)v)->types : NULL;
-    case OP_SUPER:     return jl_is_datatype(v) ? (jl_value_t*)((jl_datatype_t*)v)->super : NULL;
-    case OP_INSTANCE:  return jl_is_datatype(v) ? ((jl_datatype_t*)v)->instance : NULL;
-    case OP_NAMES:     return jl_is_typename(v) ? (jl_value_t*)((jl_typename_t*)v)->names :
-                              jl_is_datatype(v) ? (jl_value_t*)((jl_datatype_t*)v)->name : NULL;
-    case OP_WRAPPER:   return jl_is_typename(v) ? ((jl_typename_t*)v)->wrapper : NULL;
-    case OP_TOFW:      return jl_is_typename(v) ? jl_atomic_load_relaxed(&((jl_typename_t*)v)->Typeofwrapper) : NULL;
-    case OP_UAVAR:     return jl_is_unionall(v) ? (jl_value_t*)((jl_unionall_t*)v)->var : NULL;
-    case OP_UABODY:    return jl_is_unionall(v) ? ((jl_unionall_t*)v)->body : NULL;
-    case OP_TVLB:      return jl_is_typevar(v) ? ((jl_tvar_t*)v)->lb : NULL;
-    case OP_TVUB:      return jl_is_typevar(v) ? ((jl_tvar_t*)v)->ub : NULL;
-    case OP_UNA:       return jl_is_uniontype(v) ? ((jl_uniontype_t*)v)->a : NULL;
-    case OP_UNB:       return jl_is_uniontype(v) ? ((jl_uniontype_t*)v)->b : NULL;
-    case OP_VAT:       return jl_is_vararg(v) ? ((jl_vararg_t*)v)->T : NULL;
-    case OP_VAN:       return jl_is_vararg(v) ? ((jl_vararg_t*)v)->N : NULL;
-    case OP_SIG:       return jl_is_method(v) ? ((jl_method_t*)v)->sig : NULL;
-    case OP_SPECTYPES: return jl_is_method_instance(v) ? ((jl_method_instance_t*)v)->specTypes : NULL;
-    default:           return NULL;
-    }
-}
 
-// Can the ordinary key machinery name this object and hand back the very same pointer?
-// A locator that cannot round-trip its anchor names nothing.
-static jl_value_t *owner_nameable(jl_value_t *v, jl_serializer_state *s, jl_import_table_t *tbl,
-                                  jl_array_t *depmods, jl_value_t **memo, char *state) JL_GC_DISABLED
-{
-    ios_t k;
-    ios_mem(&k, 256);
-    int ok = extkey_write(&k, v, 0);
-    jl_value_t *back = NULL;
-    if (ok) {
-        keyparse_t kp;
-        kp.p = k.buf;
-        kp.end = k.buf + (size_t)ios_pos(&k);
-        kp.mod_array = depmods;
-        kp.st = NULL;
-        kp.tbl = tbl;
-        kp.dep2blob = jl_array_data(s->buildid_depmods_idxs, uint32_t);
-        kp.ndep2blob = jl_array_len(s->buildid_depmods_idxs);
-        kp.memo = memo;
-        kp.memo_state = state;
-        kp.nmemo = tbl->n;
-        kp.nbind = 0;
-        jl_value_t *got = kp_value(&kp, 0);
-        // a top-level method locator legitimately trails its root-contribution record
-        if (kp.p == kp.end || (got != NULL && strncmp(kp.p, "|R", 2) == 0))
-            back = got;
-    }
-    ios_close(&k);
-    return back;
-}
 
-static void relink_owner_probe(jl_serializer_state *s, jl_import_table_t *tbl,
-                               jl_array_t *depmods, const uint8_t *eclass) JL_GC_DISABLED
-{
-    htable_t seen, own;
-    htable_new(&seen, 1 << 18);
-    htable_new(&own, 1 << 18);
-    arraylist_t work;
-    arraylist_new(&work, 0);
-    size_t nrec = 0, caprec = 1 << 14;
-    owner_rec_t *rec = (owner_rec_t*)malloc(caprec * sizeof(owner_rec_t));
-    size_t nseen = 0, nbind = 0, nmod = 0, ntn = 0, ndt = 0;
-    const size_t OP_SEEN_MAX = (size_t)1 << 23;
-    // a private memo for the round-trip test; the pass-2 one is gone by the time this runs
-    jl_value_t **memo = (jl_value_t**)calloc(tbl->n ? tbl->n : 1, sizeof(jl_value_t*));
-    char *state = (char*)calloc(tbl->n ? tbl->n : 1, 1);
-#define OP_SEE(child) do { \
-        jl_value_t *s_ = (jl_value_t*)(child); \
-        if (s_ != NULL && nseen < OP_SEEN_MAX && ptrhash_get(&seen, s_) == HT_NOTFOUND) { \
-            ptrhash_put(&seen, s_, (void*)(uintptr_t)2); /* not 1: HT_NOTFOUND is (void*)1 */ \
-            arraylist_push(&work, s_); \
-            nseen++; \
-        } \
-    } while (0)
-#define OP_EDGE(parent, child, pathcode) do { \
-        jl_value_t *c_ = (jl_value_t*)(child); \
-        if (c_ != NULL) { \
-            void *g_ = ptrhash_get(&own, c_); \
-            if (g_ == HT_NOTFOUND) { \
-                if (nrec == caprec) { \
-                    caprec *= 2; \
-                    rec = (owner_rec_t*)realloc(rec, caprec * sizeof(owner_rec_t)); \
-                } \
-                rec[nrec].owner = (jl_value_t*)(parent); \
-                rec[nrec].path = (uint8_t)(pathcode); \
-                rec[nrec].n = 1; \
-                nrec++; \
-                ptrhash_put(&own, c_, (void*)(uintptr_t)nrec); \
-            } \
-            else { \
-                owner_rec_t *r_ = &rec[(uintptr_t)g_ - 1]; \
-                if (!(r_->owner == (jl_value_t*)(parent) && r_->path == (uint8_t)(pathcode))) \
-                    r_->n++; \
-            } \
-            OP_SEE(c_); \
-        } \
-    } while (0)
-    for (size_t i = 0; i < (size_t)jl_array_nrows(depmods); i++)
-        OP_SEE(jl_array_ptr_ref(depmods, i));
-    OP_SEE(jl_main_module);
-    OP_SEE(jl_base_module);
-    OP_SEE(jl_core_module);
-    while (work.len) {
-        jl_value_t *v = (jl_value_t*)arraylist_pop(&work);
-        // Deliberately *not* pruned to the package blobs. `Array`'s TypeName lives in the
-        // system image while `Array{RGB{Float64},1}` lives in a package one, so pruning on
-        // the parent's blob severs exactly the edge that finds a dependency's own types.
-        if (jl_is_module(v)) {
-            nmod++;
-            jl_module_t *m = (jl_module_t*)v;
-            jl_svec_t *bt = jl_atomic_load_relaxed(&m->bindings);
-            for (size_t i = 0; bt != NULL && i < jl_svec_len(bt); i++) {
-                jl_value_t *bv = jl_svecref(bt, i);
-                if (bv == NULL || !jl_is_binding(bv))
-                    continue;
-                jl_binding_t *b = (jl_binding_t*)bv;
-                nbind++;
-                OP_EDGE(v, jl_atomic_load_relaxed(&b->value), OP_BINDING);
-                for (jl_binding_partition_t *bp = jl_atomic_load_relaxed(&b->partitions);
-                     bp != NULL; bp = jl_atomic_load_relaxed(&bp->next))
-                    OP_EDGE(v, bp->restriction, OP_BINDING);
-            }
-        }
-        else if (jl_is_datatype(v)) {
-            ndt++;
-            jl_datatype_t *dt = (jl_datatype_t*)v;
-            OP_EDGE(v, dt->parameters, OP_PARAMS);
-            OP_EDGE(v, dt->types, OP_TYPES);
-            OP_EDGE(v, dt->name, OP_NAMES);
-            OP_EDGE(v, dt->super, OP_SUPER);
-            OP_EDGE(v, dt->instance, OP_INSTANCE);
-        }
-        else if (jl_is_typename(v)) {
-            ntn++;
-            jl_typename_t *tn = (jl_typename_t*)v;
-            OP_EDGE(v, tn->names, OP_NAMES);
-            OP_EDGE(v, tn->wrapper, OP_WRAPPER);
-            OP_EDGE(v, jl_atomic_load_relaxed(&tn->Typeofwrapper), OP_TOFW);
-            // The instantiation caches are the whole point: `Gray{Float32}` is reachable
-            // from nowhere else, and it is the owner the earlier walk could not see.
-            jl_svec_t *c = jl_atomic_load_relaxed(&tn->cache);
-            for (size_t i = 0; c != NULL && i < jl_svec_len(c); i++)
-                OP_EDGE(v, jl_svecref(c, i), OP_TNCACHE);
-            c = jl_atomic_load_relaxed(&tn->linearcache);
-            for (size_t i = 0; c != NULL && i < jl_svec_len(c); i++)
-                OP_EDGE(v, jl_svecref(c, i), OP_TNCACHE);
-        }
-        else if (jl_is_svec(v)) {
-            for (size_t i = 0; i < jl_svec_len(v); i++)
-                OP_EDGE(v, jl_svecref(v, i), OP_SVECELEM);
-        }
-        else if (jl_is_unionall(v)) {
-            OP_EDGE(v, ((jl_unionall_t*)v)->var, OP_UAVAR);
-            OP_EDGE(v, ((jl_unionall_t*)v)->body, OP_UABODY);
-        }
-        else if (jl_is_typevar(v)) {
-            OP_EDGE(v, ((jl_tvar_t*)v)->lb, OP_TVLB);
-            OP_EDGE(v, ((jl_tvar_t*)v)->ub, OP_TVUB);
-        }
-        else if (jl_is_uniontype(v)) {
-            OP_EDGE(v, ((jl_uniontype_t*)v)->a, OP_UNA);
-            OP_EDGE(v, ((jl_uniontype_t*)v)->b, OP_UNB);
-        }
-        else if (jl_is_vararg(v)) {
-            OP_EDGE(v, ((jl_vararg_t*)v)->T, OP_VAT);
-            OP_EDGE(v, ((jl_vararg_t*)v)->N, OP_VAN);
-        }
-        else if (jl_is_method(v)) {
-            OP_EDGE(v, ((jl_method_t*)v)->sig, OP_SIG);
-        }
-        else if (jl_is_method_instance(v)) {
-            OP_EDGE(v, ((jl_method_instance_t*)v)->specTypes, OP_SPECTYPES);
-        }
-    }
-#undef OP_SEE
-#undef OP_EDGE
-    enum { OK_SVEC, OK_DT, OK_UA, OK_TV, OK_UNION, OK_VARARG, OK_OTHER, OK_N };
-    static const char *const ok_name[OK_N] =
-        { "simplevec", "datatype", "unionall", "typevar", "union", "vararg", "other" };
-    size_t tot[OK_N], found[OK_N], uniq[OK_N], sameblob[OK_N], named[OK_N], anchorable[OK_N];
-    memset(tot, 0, sizeof(tot));
-    memset(found, 0, sizeof(found));
-    memset(uniq, 0, sizeof(uniq));
-    memset(sameblob, 0, sizeof(sameblob));
-    memset(named, 0, sizeof(named));
-    memset(anchorable, 0, sizeof(anchorable));
-    // (owner kind, path) distribution over the refused population that has an owner
-    size_t bypath[OK_N][OP_NPATH];
-    memset(bypath, 0, sizeof(bypath));
-    uint32_t maxdep = 0;
-    for (size_t i = 0; i < tbl->n; i++)
-        if (tbl->e[i].depsidx > maxdep)
-            maxdep = tbl->e[i].depsidx;
-    size_t nd = (size_t)maxdep + 1;
-    size_t *dfail = (size_t*)calloc(nd, sizeof(size_t));
-    size_t *dfix = (size_t*)calloc(nd, sizeof(size_t));
-    size_t *dent = (size_t*)calloc(nd, sizeof(size_t));
-    size_t nshow = 0;
-    size_t nshowb = 0, nsys_owner = 0, nheap_owner = 0, nother_owner = 0;
-    size_t *dfix_opt = (size_t*)calloc(nd, sizeof(size_t));
-    for (size_t i = 0; i < tbl->n; i++) {
-        uint32_t d = tbl->e[i].depsidx;
-        dent[d]++;
-        if (eclass[i] == RSW_OK)
-            continue;
-        dfail[d]++;
-        if (d == 0 || eclass[i] == RSW_UNKEYED)
-            continue;   // the sysimage is never rebuilt alone; an unkeyed entry has no key
-        if (d < relink_mismatched_ndeps && relink_mismatched_deps[d])
-            continue;   // moved: no ground truth to ask about
-        if (d >= jl_array_len(s->buildid_depmods_idxs))
-            continue;
-        size_t wb = jl_array_data(s->buildid_depmods_idxs, uint32_t)[d];
-        if (2 * wb >= jl_linkage_blobs.len)
-            continue;
-        jl_value_t *w = (jl_value_t*)((uintptr_t)jl_linkage_blobs.items[2 * wb] +
-                                      tbl->e[i].offset * SYS_EXTERNAL_LINK_UNIT);
-        int k = jl_is_svec(w) ? OK_SVEC : jl_is_datatype(w) ? OK_DT :
-                jl_is_unionall(w) ? OK_UA : jl_is_typevar(w) ? OK_TV :
-                jl_is_uniontype(w) ? OK_UNION : jl_is_vararg(w) ? OK_VARARG : OK_OTHER;
-        tot[k]++;
-        void *g = ptrhash_get(&own, w);
-        if (g == HT_NOTFOUND) {
-            // What an ownerless object actually is, so the next question is asked of
-            // data rather than of the theory that named this probe.
-            if (nshow < 40) {
-                nshow++;
-                ios_t kk;
-                ios_mem(&kk, 128);
-                int okk = extkey_write(&kk, w, 0);
-                jl_safe_printf("OWNER_ORPHAN %s len=%zu %.200s\n", jl_typeof_str(w),
-                               jl_is_svec(w) ? jl_svec_len(w) : (size_t)0,
-                               okk ? kk.buf : "<unrenderable>");
-                ios_close(&kk);
-            }
-            continue;
-        }
-        owner_rec_t *r = &rec[(uintptr_t)g - 1];
-        found[k]++;
-        bypath[k][r->path]++;
-        if (r->n != 1)
-            continue;
-        uniq[k]++;
-        // The optimistic ceiling: what this would buy if every uniquely owned entry were
-        // recoverable, nameability granted for free. Priced in edges because entry counts
-        // have misled this project six times.
-        dfix_opt[d]++;
-        // Where the owner lives is *reported*, not required. The blob-identity gate
-        // applies to what the locator resolves to -- `owner.parameters` -- and that is
-        // the object at the recorded offset by construction of this record. A live type
-        // instantiated on the heap can perfectly well hold a dependency's svec.
-        size_t ob = external_blob_index(r->owner);
-        if (ob == wb)
-            sameblob[k]++;
-        else if (ob == 0)
-            nsys_owner++;
-        else if (ob >= n_linkage_blobs())
-            nheap_owner++;
-        else
-            nother_owner++;
-        // A path a locator may actually cite: a single fixed field. Position in a type
-        // cache, position in an svec whose own owner is unnamed, and "some binding of
-        // this module" are not names.
-        if (r->path == OP_TNCACHE || r->path == OP_SVECELEM || r->path == OP_BINDING)
-            continue;
-        anchorable[k]++;
-        // End to end: render the owner, parse it back, walk the recorded field from
-        // whatever came back, and demand the very object the reference names. Anything
-        // less tests the theory rather than the locator.
-        jl_value_t *back = owner_nameable(r->owner, s, tbl, depmods, memo, state);
-        if (back == NULL || op_field(back, r->path) != w)
-            continue;
-        named[k]++;
-        dfix[d]++;
-    }
-    size_t T = 0, F = 0, U = 0, B = 0, N = 0, A = 0;
-    for (int k = 0; k < OK_N; k++) {
-        T += tot[k]; F += found[k]; U += uniq[k]; B += sameblob[k]; N += named[k];
-        A += anchorable[k];
-        if (tot[k])
-            jl_safe_printf("OWNER_KIND %-9s refused=%zu owned=%zu unique=%zu ownerinblob=%zu anchorable=%zu resolves=%zu\n",
-                           ok_name[k], tot[k], found[k], uniq[k], sameblob[k], anchorable[k], named[k]);
-    }
-    for (int k = 0; k < OK_N; k++)
-        for (int p = 0; p < OP_NPATH; p++)
-            if (bypath[k][p])
-                jl_safe_printf("OWNER_PATH %-9s via %-13s n=%zu\n",
-                               ok_name[k], op_path_name[p], bypath[k][p]);
-    // The shape of the walk, because a walk that reached nothing reports "no owner
-    // exists" in exactly the same words as a walk that reached everything.
-    jl_safe_printf("OWNER_WALK modules=%zu bindings=%zu typenames=%zu datatypes=%zu objects=%zu\n",
-                   nmod, nbind, ntn, ndt, nrec);
-    jl_safe_printf("OWNER_TOTAL walked=%zu refused=%zu owned=%zu unique=%zu ownerinblob=%zu anchorable=%zu resolves=%zu\n",
-                   nseen, T, F, U, B, A, N);
-    // The number that decides: acceptance is all-or-nothing per edge, so this pays only
-    // where it clears an edge's *entire* refused population.
-    jl_safe_printf("OWNER_OWNERBLOB sysimage=%zu other_pkg=%zu heap=%zu\n",
-                   nsys_owner, nother_owner, nheap_owner);
-    size_t edges = 0, clean = 0, fixed = 0, fixed_opt = 0;
-    for (size_t d = 1; d < nd; d++) {
-        if (dent[d] == 0)
-            continue;
-        edges++;
-        if (dfail[d] == 0) {
-            clean++;
-            continue;
-        }
-        if (dfail[d] == dfix_opt[d])
-            fixed_opt++;
-        if (dfail[d] == dfix[d]) {
-            fixed++;
-            const char *name = "Core";
-            if (d - 1 < (size_t)jl_array_nrows(depmods)) {
-                jl_value_t *m = jl_array_ptr_ref(depmods, d - 1);
-                if (jl_is_module(m))
-                    name = jl_symbol_name(((jl_module_t*)m)->name);
-            }
-            jl_safe_printf("OWNER_EDGE_FIXED dep=%s nfail=%zu\n", name, dfail[d]);
-        }
-    }
-    jl_safe_printf("OWNER_EDGES total=%zu clean=%zu recovered_by_owner_anchoring=%zu ceiling_if_gates_free=%zu\n",
-                   edges, clean, fixed, fixed_opt);
-    free(memo);
-    free(state);
-    free(dfail);
-    free(dfix);
-    free(dfix_opt);
-    free(dent);
-    free(rec);
-    htable_free(&seen);
-    htable_free(&own);
-    arraylist_free(&work);
-}
 
 // Statistics are development output and must not appear in an ordinary run: someone who
 // sets JULIA_PKGIMAGE_RELINK=1 wants working re-linking, not a coverage report. Set
@@ -6061,7 +5433,6 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
     const char *gt_verbose = getenv("JULIA_PKGIMAGE_RELINK_SELFCHECK");
     jl_value_t **memo = (jl_value_t**)calloc(tbl->n ? tbl->n : 1, sizeof(jl_value_t*));
     // why each entry was refused, for the counterfactual sweep (RSW_*)
-    uint8_t *eclass = (uint8_t*)calloc(tbl->n ? tbl->n : 1, 1);
     char *state = (char*)calloc(tbl->n ? tbl->n : 1, 1);
     // failures by locator kind, with a few examples of each kept for the report
 #define RK_MAX 24
@@ -6108,7 +5479,6 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
     jl_value_t **dep_rep = (jl_value_t**)calloc(maxdep + 1, sizeof(jl_value_t*));
     // per-dependency failure breakdown: one failing entry refuses a whole edge, so the
     // decision-relevant number is how many entries block each edge, and of what kind
-    size_t *dep_mis = (size_t*)calloc(maxdep + 1, sizeof(size_t));
     size_t *dep_kind_unres = (size_t*)calloc((size_t)(maxdep + 1) * RK_MAX, sizeof(size_t));
     size_t *dep_kind_mis = (size_t*)calloc((size_t)(maxdep + 1) * RK_MAX, sizeof(size_t));
     // An entry the *writer* could not render carries no locator, so nothing can re-derive
@@ -6225,7 +5595,6 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
             // address can land mid-object. The writer names these instead (RELINK_UNKEYED
             // below, under JULIA_IMPORT_KEYS), where the object is live.
             dep_unkeyed[d]++;
-            eclass[i] = RSW_UNKEYED;
             if (relink_unmoved_blob_is_method(s, d, tbl->e[i].offset)) {
                 method_unverified++;
                 if (tbl->e[i].loclen == 0) {
@@ -6459,7 +5828,6 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
                 if (rcls != RSW_FAB)
                     digest_bad++;
                 mismatched = 1;
-                eclass[i] = rcls;
                 // full texts survive only in a file: `jl_safe_printf` truncates, and the
                 // interesting mismatches are exactly the giant nested unionalls
                 const char *misdump = getenv("JULIA_PKGIMAGE_RELINK_MISDUMP");
@@ -6492,7 +5860,6 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
         }
         else {
             unresolved++;
-            eclass[i] = RSW_UNRES;
             if (verbose)
                 if (relink_stats()) jl_safe_printf("RELINK_UNRESOLVED at+%zu %s\n",
                                fail_at[i], tbl->e[i].loc);
@@ -6534,7 +5901,6 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
                 }
                 else {
                     rk_mis[q]++;
-                    dep_mis[d]++;
                     dep_kind_mis[(size_t)d * RK_MAX + q]++;
                 }
             }
@@ -6684,13 +6050,6 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
             }
         }
     }
-    if (getenv("JULIA_RELINK_BORROW_PROBE"))
-        relink_borrow_probe(s, tbl);
-    if (getenv("JULIA_RELINK_OWNER_PROBE"))
-        relink_owner_probe(s, tbl, depmods, eclass);
-    if (getenv("JULIA_RELINK_SWEEP"))
-        relink_sweep(s, tbl, depmods, eclass);
-    free(eclass);
     free(rootcited);
     if (relink_mismatched_ndeps)
         if (relink_stats()) jl_safe_printf("RELINK_REPOINT rebuilt_deps_imported=%zu blocked=%zu -> %s\n",
@@ -6700,7 +6059,6 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
     free(dep_resolved);
     free(dep_accepted);
     free(dep_rep);
-    free(dep_mis);
     free(dep_kind_unres);
     free(dep_kind_mis);
     free(dep_unkeyed);
