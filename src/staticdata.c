@@ -463,24 +463,20 @@ JL_DLLEXPORT int jl_running_on_valgrind(void)
 
 #define NBOX_C 1024
 
-// DebugInfo owned by another image is copied into the image being written instead of
-// being referenced across images: it is immutable content with no stable name, so a
-// cross-image reference could only be keyed by a content digest, which a loader cannot
-// invert to locate the object again. Copying trades image size for keeping every
-// import-table entry resolvable. The `edges` simplevectors holding nested DebugInfo are
-// reached by the same path and copied for the same reason (their key would be a list of
+// DebugInfo and String owned by another image are copied into the image being written
+// rather than referenced across images. Both are immutable content with no stable name,
+// so a cross-image reference could only be keyed by a content digest -- and a digest
+// cannot be inverted to locate the object again, so every such reference is refused on
+// re-link. Copying trades image size for keeping the entry resolvable. The `edges`
+// simplevectors holding nested DebugInfo go the same way (their key would be a list of
 // those same digests).
 //
-// A String is copied for the same reason and at a lower price. Its key can only be its
-// bytes, and a parser handed those bytes can allocate an equal string but can never
-// locate the one the dependency owns, so every cross-image string reference is refused
-// on re-link. Copying is free of semantic consequence here in a way it would not be for
-// most objects: `jl_egal` on strings is a memcmp (builtins.c, the `jl_string_tag` case)
-// and `jl_object_id` of a string hashes its bytes, so a copy is `===` the original, has
-// the same `objectid`, and is found by an `IdDict` lookup under the original. The only
-// thing that differs is the address, which is not stable across builds anyway. Unlike
-// DebugInfo a string has no pointer fields, so copying it exposes no new leaves as
-// imports of their own.
+// For strings the copy is also free of semantic consequence, which it would not be for
+// most objects: `jl_egal` on strings is a memcmp (builtins.c, `jl_string_tag`) and
+// `jl_object_id` hashes the bytes, so a copy is `===` the original, shares its
+// `objectid`, and an `IdDict` finds it under the original. Only the address differs, and
+// that is not stable across builds anyway. A string has no pointer fields, so unlike
+// DebugInfo copying one exposes no new leaves as imports of their own.
 static int jl_copy_instead_of_import(jl_value_t *v) JL_NOTSAFEPOINT
 {
     if (jl_typetagis(v, jl_debuginfo_type))
@@ -1390,25 +1386,23 @@ static int extkey_file_digest(jl_sym_t *file, uint64_t *out) JL_NOTSAFEPOINT
 
 // Render a method's root contributions, per contributing module, into its identity.
 //
-// Compressed IR cites a constant in `Method.roots` as (contributing module's build_id.lo,
-// index within that module's blocks), so code compiled against this method commits to the
-// *value at that index* -- a number no reference in the import table describes. A rebuild
-// of the contributor re-appends its roots under a fresh build_id; repointing at it is
-// sound only if every contributor's root sequence is unchanged, and this section is what
-// makes the digest able to decide that. Per contributor: name (a build_id is a per-build
-// counter, so the module's name stands in for it), count, and an FNV-1a digest over
-// `jl_static_show` of each root in citation order. Groups are sorted by name so the text
-// does not depend on which image happened to append first.
+// Compressed IR cites a constant in `Method.roots` as (contributor's build_id.lo, index
+// within that contributor's blocks), so compiled code commits to the *value at that
+// index* -- which no import-table reference describes. A rebuild re-appends the
+// contributor's roots under a fresh build_id, so repointing is sound only if every
+// contributor's root sequence is unchanged; this section lets the digest decide that.
+// Per contributor: name (standing in for the per-build id), count, and an FNV-1a digest
+// over `jl_static_show` of each root in citation order, groups sorted by name so the text
+// does not depend on which image appended first.
 //
-// Key-0 roots are excluded: a citation of one is only written relocatably when its index
-// is below `nroots_sysimg`, which pins it to the sysimage the header check already
-// guards. The writing image's own contributions are excluded too -- they travel inside
-// this image and are appended back under its own (unchanged) build_id at load, and they
-// do not exist yet when the loading process re-renders this method during its probe.
+// Two exclusions. Key-0 roots: a citation of one is written relocatably only when its
+// index is below `nroots_sysimg`, which pins it to the sysimage the header check already
+// guards. And this image's own contributions: they travel inside it, are re-appended
+// under its own unchanged build_id at load, and do not exist yet when the loading process
+// re-renders this method.
 //
-// A root that cannot be rendered deterministically refuses the whole method key -- no
-// digest can then vouch for the citation, and an unkeyed method is what the probe's
-// `method_unverified` tally is built to catch.
+// A root that cannot be rendered deterministically refuses the whole method key: no
+// digest can then vouch for the citation.
 
 // Render one root's *content*. `extkey_write` already renders everything with a name --
 // symbols, strings, types, methods, code instances, singletons, boxed immutables -- and
@@ -2152,12 +2146,10 @@ static int extkey_write(ios_t *k, jl_value_t *v, int depth) JL_NOTSAFEPOINT
         // dispatch answer is unchanged, so it would silently run stale code. Bumping a
         // dependency's patch version is exactly that case.
         //
-        // The body identity is the defining file's contents. Digesting `Method.source`
-        // instead was tried and reverted: compressed IR refers to method roots by index
-        // and root sets are keyed per build, so it is not byte-stable across independent
-        // builds of identical source -- on Makie it perturbed 4127 keys. Refusing a key
-        // when the file cannot be read keeps this conservative: no key means no re-link,
-        // which is exactly today's behaviour.
+        // The body identity is the defining file's contents. `Method.source` will not do:
+        // compressed IR refers to roots by index and root sets are keyed per build, so it
+        // is not byte-stable across independent builds of identical source -- on Makie it
+        // perturbed 4127 keys. An unreadable file refuses the key, which costs a rebuild.
         // Only methods in a *rebuildable* image need a body identity. A method in the
         // sysimage cannot change without changing the Julia build, which already
         // invalidates every cache through the header check, and its `file` is a bare
@@ -3114,14 +3106,13 @@ static void relink_free(jl_serializer_state *s, jl_import_table_t *tbl) JL_NOTSA
 // SimpleVector, UnionAll, Union, TypeVar or Vararg -- so for these there is no runtime
 // table a locator can find them in, only the means to construct an equal copy, which the
 // blob-identity gate rightly refuses. Measured, that family is what blocks 67 of Makie's
-// 70 refused dependencies. So each incremental image publishes an
-// index over its *own* uninterned objects -- digest -> offset from the image base, sorted
-// by digest -- and a relink resolves such a reference by searching the rebuilt
-// dependency's index for the digest the entry recorded. What comes back is genuinely
-// resident in that dependency's blob, so it passes the blob-identity gate by
-// construction; it is found, never built. Index membership proves nothing by itself:
-// every candidate still re-renders to the recorded digest and passes the ground-truth
-// check where the dependency did not move.
+// 70 refused dependencies. So each incremental image publishes an index over its *own*
+// uninterned objects -- digest -> offset from the image base, sorted by digest -- and a
+// relink searches the rebuilt dependency's index for the digest the entry recorded. What
+// comes back is resident in that dependency's blob, so it passes the blob-identity gate
+// by construction: found, never built. Membership alone proves nothing -- every candidate
+// still re-renders to the recorded digest, and passes the ground-truth check wherever the
+// dependency did not move.
 //
 // Registered per loaded image, aligned with `jl_linkage_blobs` (two slots per blob:
 // pairs pointer into the mapped image, entry count). A collision inside one image --
@@ -3146,33 +3137,11 @@ static void relink_export_register(void) JL_NOTSAFEPOINT
 
 static jl_value_t *relink_export_lookup(size_t blob, uint64_t digest) JL_NOTSAFEPOINT
 {
-    // Consultation is opt-in beyond relinking itself, and the reason is arithmetic rather
-    // than doubt. Everything this index can supply is a type-family object owned by the
-    // dependency, and the type-hash gate below now refuses every type borrowed from a
-    // dependency that moved -- which is the only case a relink ever consults it. So with
-    // that gate in place the index unlocks exactly zero edges that survive to a repoint.
-    // STALE COMMENT REMOVED. That measurement predated `db84526f38`, which took the
-    // build_id out of `TypeName.hash` and let the type refusal go. Re-measured after it,
-    // by rebuilding each of Makie's 86 image dependencies one at a time: the index takes
-    // edges that SURVIVE A REAL REBUILD from 13 to 21, and brings in the large ones --
-    // StructUtils 219 refs, Printf 203, LogExpFunctions 185, IntervalArithmetic 118.
-    // `LogExpFunctions` verified end to end: 15-file cascade avoided, 28 computed values
-    // identical, 0 wrong resolutions. It is worth switching on; it is still opt-in only
-    // because the writer-side cost has not been re-measured since.
-    // On by default. The index is written unconditionally, so its disk cost is already
-    // paid whether or not anything reads it, and consulting it is free at load: rebuild
-    // Animations and load Makie, median of three, 2.38 s either way. Set the variable to
-    // `-` to turn it off; anything else selects which locator kinds may consult it.
-    static int consult = -1;
-    static const char *kinds = NULL;
-    if (consult == -1) {
-        kinds = getenv("JULIA_PKGIMAGE_RELINK_INDEX");
-        consult = !(kinds != NULL && kinds[0] == '-' && kinds[1] == '\0');
-        if (kinds == NULL)
-            kinds = "sudUtvo";
-    }
-    if (!consult)
-        return NULL;
+    // Measured by rebuilding each of Makie's 86 image dependencies one at a time, the
+    // index takes the count that survives a real rebuild from 13 to 21 and brings in the
+    // large ones -- StructUtils 219 refs, Printf 203, LogExpFunctions 185. It costs
+    // nothing to consult: the index is written unconditionally, so its disk cost is paid
+    // either way, and rebuilding Animations then loading Makie is 2.38 s with or without.
     if (!relink_export_registry_ready || digest == 0 ||
         2 * blob + 1 >= relink_export_registry.len)
         return NULL;
@@ -3201,17 +3170,7 @@ static jl_value_t *relink_export_lookup(size_t blob, uint64_t digest) JL_NOTSAFE
     uintptr_t end = (uintptr_t)jl_linkage_blobs.items[2 * blob + 1];
     if (base + off >= end)
         return NULL;   // corrupt offset: refuse rather than read past the blob
-    jl_value_t *v = (jl_value_t*)(base + off);
-    // bisecting handle: the env var's value may name which kinds the index is allowed to
-    // answer for, so a wrong program can be attributed to one kind without a rebuild
-    if (kinds != NULL && kinds[0] != '\0' && kinds[1] != '\0') {
-        char c = jl_is_svec(v) ? 's' : jl_is_unionall(v) ? 'u' : jl_is_uniontype(v) ? 'U'
-               : jl_is_typevar(v) ? 't' : jl_is_vararg(v) ? 'v'
-               : jl_is_datatype(v) ? 'd' : 'o';
-        if (strchr(kinds, c) == NULL)
-            return NULL;
-    }
-    return v;
+    return (jl_value_t*)(base + off);
 }
 
 // ---- Reading a key back into the object it names ----
@@ -4466,36 +4425,24 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
                 fabricated++;
                 rcls = RSW_FAB;
             }
-            // Borrowing a type from a *rebuilt* dependency used to poison this image's own
-            // types, and no reference described the damage: `jl_new_typename_in` folded the
-            // defining module's `build_id.lo` -- session entropy, `bitmix(jl_hrtime(),
-            // jl_rand())` -- into `TypeName.hash`, `typekey_hash` folded `~tn->hash` into
-            // every instantiation's `hash`, and that number is baked into every serialized
-            // `Foo{...}` and decides its slot in the type cache. Rebuild the dependency and
-            // the number moved, so `lookup_type_set` (src/jltypes.c:1051), which rejects a
-            // candidate on `val->hash == hv` before it compares keys, could not see this
-            // image's own types: the next request allocated a second copy, `==` and not
-            // `===`, and codegen executed the `ud2` it had emitted for the branch it had
-            // proved impossible.
+            // Types from a rebuilt dependency needed no refusal here once `TypeName.hash`
+            // stopped carrying a build id (src/datatype.c). It had folded the module's
+            // `build_id.lo` -- session entropy -- and `typekey_hash` folds `~tn->hash` into
+            // every instantiation, so a rebuild moved the hash baked into every serialized
+            // `Foo{...}`. `lookup_type_set` (jltypes.c) rejects on `val->hash == hv` before
+            // comparing keys, so this image's own types became invisible: the next request
+            // allocated a second copy, `==` but not `===`, and codegen hit the `ud2` it had
+            // emitted for a branch it proved impossible.
             //
-            // The refusal that stood here -- an entry citing a moved dependency that
-            // resolves to a type -- is gone because its premise is gone. `TypeName.hash`
-            // now derives from the module *path* (src/datatype.c), so a rebuild does not
-            // move it and no derived hash anywhere goes stale. Recomputing `dt->hash` at
-            // restore time instead was measured to be the wrong repair, and not only for
-            // its consumers: there is no enumeration of the image's DataTypes at that
-            // point, and the populations it could walk (`uniquing_types`, `fixup_types`)
-            // exclude by construction both the entries of the image's own `TypeName.cache`
-            // sets -- 130 of Makie's mention a type from a package a proof target rebuilds
-            // -- and the `specTypes` behind `Method.speckeyset`, of which 2 397 do. Those
-            // are serialized hash tables whose slots were computed from the same number,
-            // so moving the field without rehashing them trades one invisible object for
-            // another, and `dt->hash` is also `jl_object_id` of a concrete type and the
-            // seed of `jl_object_id` for every immutable value, which reaches any `Dict`
-            // or `IdDict` the image happens to hold.
-            //
-            // Counted, not gated: `types=` on RELINK_DEP still reports how many of an
-            // edge's entries are types, which is what this cost before.
+            // Rehashing `dt->hash` at restore instead was measured to be the wrong repair.
+            // There is no enumeration of the image's DataTypes at that point, and the
+            // populations one could walk (`uniquing_types`, `fixup_types`) exclude by
+            // construction the image's own `TypeName.cache` sets (130 of Makie's cite a
+            // rebuilt package) and the `specTypes` behind `Method.speckeyset` (2 397 do).
+            // Those are serialized hash tables slotted by the same number, so moving the
+            // field without rehashing them trades one invisible object for another -- and
+            // `dt->hash` is `jl_object_id` for a concrete type and seeds it for every
+            // immutable, reaching any `Dict` or `IdDict` the image holds.
             if (ok && (jl_is_type(got) || jl_is_typename(got) || jl_is_typevar(got) ||
                        jl_is_vararg(got) || jl_is_svec(got))) {
                 dep_types[d]++;
