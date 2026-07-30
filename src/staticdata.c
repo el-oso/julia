@@ -1605,10 +1605,6 @@ static int extkey_root_value(ios_t *k, jl_value_t *v, int depth) JL_NOTSAFEPOINT
 // through the nested method's own import entry.
 static int extkey_rendering_roots = 0;
 
-// Determinism-harness dedup: identities are re-rendered thousands of times per session,
-// and an unbounded dump measured in the gigabytes -- it filled the tmpfs and took the
-// session down. One dump per method per process is what a cross-session diff needs.
-
 static int extkey_method_roots(ios_t *k, jl_method_t *m) JL_NOTSAFEPOINT
 {
     if (m->root_blocks == NULL || m->roots == NULL)
@@ -3117,8 +3113,8 @@ static void relink_free(jl_serializer_state *s, jl_import_table_t *tbl) JL_NOTSA
 // Julia interns a tuple type only when every parameter is concrete, and never interns a
 // SimpleVector, UnionAll, Union, TypeVar or Vararg -- so for these there is no runtime
 // table a locator can find them in, only the means to construct an equal copy, which the
-// blob-identity gate rightly refuses. The counterfactual sweep priced that: the family is
-// necessary on 67 of Makie's 70 blocked edges. So each incremental image publishes an
+// blob-identity gate rightly refuses. Measured, that family is what blocks 67 of Makie's
+// 70 refused dependencies. So each incremental image publishes an
 // index over its *own* uninterned objects -- digest -> offset from the image base, sorted
 // by digest -- and a relink resolves such a reference by searching the rebuilt
 // dependency's index for the digest the entry recorded. What comes back is genuinely
@@ -4161,7 +4157,8 @@ static int relink_unmoved_blob_is_method(jl_serializer_state *s, uint32_t d, uin
 }
 
 
-// Per-entry refusal class, recorded during pass 2 for the counterfactual sweep below.
+// Why an entry was refused; `digest_bad` counts everything except fabrication, which
+// needs a different fix and was hidden for a day by being counted as a mismatch.
 enum { RSW_OK = 0, RSW_UNKEYED, RSW_UNRES, RSW_FAB, RSW_MIS, RSW_EXTFN, RSW_GT };
 
 
@@ -4196,8 +4193,8 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
     // index the export table directly ... this is the common path and must not regress"),
     // and it is not a weakened gate: every entry that IS resolved passes exactly the
     // checks it passed before. `JULIA_PKGIMAGE_RELINK_PROBE_ALL` restores exhaustive
-    // resolution, which is what the coverage measurements (RELINK_DEPS, RELINK_PROBE, the
-    // sweep, the borrow probe, and the ground-truth self-check on unmoved edges) need.
+    // resolution, which is what the coverage counters and the ground-truth self-check on
+    // unmoved edges need.
     int probe_all = getenv("JULIA_PKGIMAGE_RELINK_PROBE_ALL") != NULL;
     size_t keyed = 0, resolved = 0, accepted = 0, unresolved = 0, digest_bad = 0, extfn_bad = 0, fabricated = 0;
     // Method entries whose root contributions could not be verified -- refused, or
@@ -4228,7 +4225,6 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
     size_t gt_checked = 0, gt_bad = 0, gt_shown = 0;
     const char *gt_verbose = getenv("JULIA_PKGIMAGE_RELINK_SELFCHECK");
     jl_value_t **memo = (jl_value_t**)calloc(tbl->n ? tbl->n : 1, sizeof(jl_value_t*));
-    // why each entry was refused, for the counterfactual sweep (RSW_*)
     char *state = (char*)calloc(tbl->n ? tbl->n : 1, 1);
     // failures by locator kind, with a few examples of each kept for the report
 #define RK_MAX 24
