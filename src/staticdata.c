@@ -4265,15 +4265,6 @@ static int relink_stats(void) JL_NOTSAFEPOINT
     return on;
 }
 
-// Per-entry report on refusals the export index was supposed to prevent. Separate from
-// the statistics because it is one line per refused object, not per image.
-static int relink_fabdbg(void) JL_NOTSAFEPOINT
-{
-    static int on = -1;
-    if (on == -1)
-        on = getenv("JULIA_RELINK_FABDBG") != NULL;
-    return on;
-}
 
 static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_array_t *depmods, const uint8_t *extfn,
                            const char *imgdata, size_t imgsize) JL_GC_DISABLED
@@ -4281,7 +4272,6 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
     // scoped to this image's dependency set, like the type-variable table below
     extkey_reset_paths();
     extkey_build_paths(depmods);
-    int verbose = getenv("JULIA_PKGIMAGE_RELINK_VERBOSE") != NULL;
     // Resolving every entry is measurement, not work. A dependency whose build_id matches
     // what this image recorded has not moved a byte, so every reference into it resolves
     // by the same pointer arithmetic as today and there is nothing to re-derive; only the
@@ -4358,11 +4348,6 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
         if (relink_scan_for_key(imgdata, imgsize, relink_dep_buildid[d])) {
             rootcited[d] = 1;
             rootcited_n++;
-            if (verbose && d - 1 < (size_t)jl_array_nrows(depmods)) {
-                jl_value_t *m = jl_array_ptr_ref(depmods, d - 1);
-                if (relink_stats()) jl_safe_printf("RELINK_ROOTCITE_DEP idx=%zu name=%s\n", d,
-                               jl_is_module(m) ? jl_symbol_name(((jl_module_t*)m)->name) : "?");
-            }
         }
     }
     size_t *dep_entries = (size_t*)calloc(maxdep + 1, sizeof(size_t));
@@ -4531,14 +4516,6 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
                 jl_value_t *exp = relink_export_lookup(wb0, tbl->e[i].digest);
                 if (exp != NULL) {
                     got = exp;
-                    if (verbose && d < relink_mismatched_ndeps && relink_mismatched_deps[d]) {
-                        if (relink_stats()) jl_safe_printf("RELINK_INDEXED dep=%u off=%zu [%s] exp=%p\n    obj=",
-                                       (unsigned)d, (size_t)tbl->e[i].offset,
-                                       jl_typeof_str(exp), (void*)exp);
-                        if (jl_is_type(exp))
-                            jl_static_show(JL_STDERR, exp);
-                        jl_safe_printf("\n    loc=%.400s\n", tbl->e[i].loc);
-                    }
                 }
             }
         }
@@ -4554,7 +4531,6 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
             // object on the heap means the parser built one instead of finding it, and an
             // object in another image means it was found but is not the one the reference
             // names.
-            const char *why = ok ? "otherblob" : "digest";
             uint8_t rcls = ok ? RSW_OK : RSW_MIS;
             // Resolution must *find* the object, not rebuild an equal one. A reference
             // means the specific object the dependency owns, and the digest cannot tell
@@ -4580,38 +4556,6 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
                 ok = 0;
                 fabricated++;
                 rcls = RSW_FAB;
-                if (external_blob_index(got) >= n_linkage_blobs())
-                    why = "heap";
-                // A heap fabrication whose dependency did NOT move can be asked why
-                // directly: the ground truth is still at blob_base+offset. `kindok` and
-                // `idxable` say whether the export index was ever entitled to hold it,
-                // `digok` whether the digest the image recorded is the one that object
-                // renders now, and `expn` how large the owning image's index is. All four
-                // true with a failed lookup means the writer dropped the entry; measured
-                // on Makie, that is what 2 544 of 3 479 pkg-owned fabrications are.
-                if (relink_fabdbg() && why[0] == 'h' && wantblob < n_linkage_blobs() &&
-                    !(d < relink_mismatched_ndeps && relink_mismatched_deps[d])) {
-                    jl_value_t *w = (jl_value_t*)((uintptr_t)jl_linkage_blobs.items[2 * wantblob] +
-                                                  tbl->e[i].offset * SYS_EXTERNAL_LINK_UNIT);
-                    int kindok = jl_is_svec(w) || jl_is_unionall(w) || jl_is_uniontype(w) ||
-                                 jl_is_typevar(w) || jl_is_vararg(w) ||
-                                 (jl_is_datatype(w) && !jl_is_concrete_type(w));
-                    int b2 = 300;
-                    int idxable = kindok && export_index_indexable(w, &b2);
-                    uint64_t hw = 0;
-                    int digok = extkey_hash(w, &hw) && hw == tbl->e[i].digest;
-                    size_t expn = 2 * wantblob + 1 < relink_export_registry.len
-                                ? (size_t)relink_export_registry.items[2 * wantblob + 1] : 0;
-                    const char *dname = "?";
-                    if (d >= 1 && d - 1 < (size_t)jl_array_nrows(depmods)) {
-                        jl_value_t *dm = jl_array_ptr_ref(depmods, d - 1);
-                        if (jl_is_module(dm))
-                            dname = jl_symbol_name(((jl_module_t*)dm)->name);
-                    }
-                    jl_safe_printf("RELINK_FABDBG dep=%u/%s type=%s kindok=%d idxable=%d digok=%d expn=%zu digest=%016llx\n    loc=%.300s\n",
-                                   (unsigned)d, dname, jl_typeof_str(w), kindok, idxable, digok,
-                                   expn, (unsigned long long)tbl->e[i].digest, tbl->e[i].loc);
-                }
             }
             // Borrowing a type from a *rebuilt* dependency used to poison this image's own
             // types, and no reference described the damage: `jl_new_typename_in` folded the
@@ -4700,10 +4644,6 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
                 // The ground-truth check above is vacuous for exactly the dependencies
                 // that moved -- which is the only case repointing is used for. Name what
                 // is about to be repointed so a wrong program has something to bisect.
-                if (verbose && d < relink_mismatched_ndeps && relink_mismatched_deps[d])
-                    if (relink_stats()) jl_safe_printf("RELINK_ACCEPT dep=%u off=%zu [%s] %.200s\n",
-                                   (unsigned)d, (size_t)tbl->e[i].offset,
-                                   jl_typeof_str(got), tbl->e[i].loc);
                 // the name below comes from the representative's blob, so a rebuilt
                 // object (a fresh svec or re-boxed immutable lives in no blob) cannot
                 // serve as one
@@ -4721,41 +4661,10 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
                 if (rcls != RSW_FAB)
                     digest_bad++;
                 mismatched = 1;
-                // full texts survive only in a file: `jl_safe_printf` truncates, and the
-                // interesting mismatches are exactly the giant nested unionalls
-                const char *misdump = getenv("JULIA_PKGIMAGE_RELINK_MISDUMP");
-                if (misdump) {
-                    ios_t md;
-                    if (ios_file(&md, misdump, 1, 1, 1, 0) != NULL) {
-                        ios_seek_end(&md);
-                        ios_printf(&md, "ENTRY %zu dep=%u why=%s type=%s digest=%016" PRIx64 "\nLOC %s\nID ",
-                                   i, (unsigned)d, why, jl_typeof_str(got),
-                                   tbl->e[i].digest, tbl->e[i].loc);
-                        if (!extkey_write(&md, got, 0))
-                            ios_puts("(unrenderable)", &md);
-                        ios_putc('\n', &md);
-                        ios_close(&md);
-                    }
-                }
-                if (verbose) {
-                    // the recomputed identity, so a mismatch shows *what* re-rendered
-                    // differently rather than only that something did
-                    ios_t idbuf;
-                    ios_mem(&idbuf, 256);
-                    int idok = extkey_write(&idbuf, got, 0);
-                    ios_putc('\0', &idbuf);
-                    if (relink_stats()) jl_safe_printf("RELINK_DIGEST_MISMATCH [%s] %s\n    id=%s\n",
-                                   jl_typeof_str(got), tbl->e[i].loc,
-                                   idok ? idbuf.buf : "(unrenderable)");
-                    ios_close(&idbuf);
-                }
             }
         }
         else {
             unresolved++;
-            if (verbose)
-                if (relink_stats()) jl_safe_printf("RELINK_UNRESOLVED at+%zu %s\n",
-                               fail_at[i], tbl->e[i].loc);
         }
         if (failed || mismatched) {
             if (relink_unmoved_blob_is_method(s, d, tbl->e[i].offset)) {
@@ -4935,10 +4844,6 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
                 if (jl_is_module(mm) && d < relink_ndep_buildids) {
                     jl_relink_register_buildid_alias(relink_dep_buildid[d],
                                                      ((jl_module_t*)mm)->build_id.lo);
-                    if (verbose)
-                        if (relink_stats()) jl_safe_printf("RELINK_ROOT_ALIAS %s %016" PRIx64 " -> %016" PRIx64 "\n",
-                                       jl_symbol_name(((jl_module_t*)mm)->name),
-                                       relink_dep_buildid[d], ((jl_module_t*)mm)->build_id.lo);
                 }
             }
         }
