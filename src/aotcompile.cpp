@@ -721,12 +721,19 @@ void *jl_create_native_impl(LLVMOrcThreadSafeModuleRef llvmmod, int trim, int ex
     fargs[8] = ext_foreign_cis ? (jl_value_t*)ext_foreign_cis : jl_nothing; // ext_foreign_cis (or nothing)
     size_t last_age = ct->world_age;
     ct->world_age = jl_typeinf_world;
+    // JULIA_COMPILE_SPLIT measurement only: batch inference vs LLVM IR construction
+    int split_report = getenv("JULIA_COMPILE_SPLIT") != NULL;
+    uint64_t split_t0 = jl_hrtime();
     fargs[0] = jl_apply(fargs, 9);
+    uint64_t split_t1 = jl_hrtime();
     fargs[1] = fargs[2] = fargs[3] = fargs[4] = fargs[5] = fargs[6] = fargs[7] = fargs[8] = NULL;
     ct->world_age = last_age;
     jl_value_t *codeinfos = fargs[0];
     JL_TYPECHK(jl_create_native, array_any, codeinfos);
     void *data = jl_emit_native((jl_array_t*)codeinfos, llvmmod, NULL, external_linkage ? 1 : 0);
+    if (split_report)
+        jl_safe_printf("SPLIT_PHASE batch_infer=%" PRIu64 " emit_ir=%" PRIu64 "\n",
+                       split_t1 - split_t0, jl_hrtime() - split_t1);
     JL_GC_POP();
 
     // move everything inside, now that we've merged everything
@@ -2068,6 +2075,16 @@ void jl_dump_native_impl(void *native_code,
         jl_emission_params_t *params)
 {
     JL_TIMING(NATIVE_AOT, NATIVE_Dump);
+    // JULIA_COMPILE_SPLIT measurement only; RAII so early returns are still reported
+    struct SplitDumpTimer {
+        uint64_t t0;
+        bool on;
+        SplitDumpTimer() : t0(jl_hrtime()), on(getenv("JULIA_COMPILE_SPLIT") != NULL) {}
+        ~SplitDumpTimer() {
+            if (on)
+                jl_safe_printf("SPLIT_PHASE dump_native=%" PRIu64 "\n", jl_hrtime() - t0);
+        }
+    } split_dump_timer;
     jl_native_code_desc_t *data = (jl_native_code_desc_t*)native_code;
     if (!bc_fname && !unopt_bc_fname && !obj_fname && !asm_fname) {
         LLVM_DEBUG(dbgs() << "No output requested, skipping native code dump?\n");

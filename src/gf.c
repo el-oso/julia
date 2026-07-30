@@ -3498,6 +3498,19 @@ JL_DLLEXPORT int jl_method_is_macro(jl_method_t *m)
     return jl_symbol_name(m->name)[0] == '@';
 }
 
+// Measurement-only: with JULIA_COMPILE_SPLIT=1, report per-method inference time and
+// codegen time separately, for outermost compilations only so the numbers do not
+// double-count nested work. See DESIGN-parallel-precompile.md, Step 0.
+static int jl_compile_split_enabled(void) JL_NOTSAFEPOINT
+{
+    static int enabled = -1;
+    if (enabled == -1) {
+        const char *e = getenv("JULIA_COMPILE_SPLIT");
+        enabled = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return enabled;
+}
+
 jl_code_instance_t *jl_compile_method_internal(jl_method_instance_t *mi, size_t world)
 {
     // quick check if we already have a compiled result
@@ -3617,6 +3630,7 @@ jl_code_instance_t *jl_compile_method_internal(jl_method_instance_t *mi, size_t 
     // Everything from here on is considered (user facing) compile time
     uint64_t compilation_start = jl_hrtime();
     uint64_t inference_start = jl_typeinf_timing_begin(); // Special-handling for reentrancy
+    uint64_t split_infer_ns = 0; // JULIA_COMPILE_SPLIT measurement only
 
     // Is a recompile if there is cached code, and it was compiled (not only inferred) before
     int is_recompile = 0;
@@ -3637,7 +3651,9 @@ jl_code_instance_t *jl_compile_method_internal(jl_method_instance_t *mi, size_t 
         int should_skip_inference = !jl_is_method(mi->def.method) || jl_method_is_macro(mi->def.method);
 
         if (!should_skip_inference) {
+            uint64_t split_infer_start = jl_hrtime();
             codeinst = jl_type_infer(mi, world, SOURCE_MODE_ABI, jl_options.trim);
+            split_infer_ns = jl_hrtime() - split_infer_start;
         }
     }
 
@@ -3649,8 +3665,15 @@ jl_code_instance_t *jl_compile_method_internal(jl_method_instance_t *mi, size_t 
         }
 
         JL_GC_PUSH1(&codeinst);
+        uint64_t split_codegen_start = jl_hrtime();
         int did_compile = jl_compile_codeinst(codeinst);
+        uint64_t split_codegen_ns = jl_hrtime() - split_codegen_start;
         double compile_time = jl_hrtime() - compilation_start;
+        // inference_start is 0 when this call is nested inside another compilation, so
+        // only outermost entries are reported and the two sums partition compile time
+        if (inference_start != 0 && jl_compile_split_enabled())
+            jl_safe_printf("SPLIT infer=%" PRIu64 " codegen=%" PRIu64 " did_compile=%d\n",
+                           split_infer_ns, split_codegen_ns, did_compile);
 
         if (jl_atomic_load_relaxed(&codeinst->invoke) == NULL) {
             // Something went wrong. Bail to the fallback path.
