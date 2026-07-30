@@ -137,9 +137,13 @@ JL_DLLEXPORT void jl_write_compiler_output(void)
     ios_t *s = NULL;
     ios_t *z = NULL;
     int64_t srctextpos = 0 ;
+    // JULIA_COMPILE_SPLIT measurement only
+    int split_report = getenv("JULIA_COMPILE_SPLIT") != NULL;
+    uint64_t split_output_start = jl_hrtime();
     jl_create_system_image(emit_native ? &native_code : NULL,
                            jl_options.incremental ? worklist : NULL,
                            emit_split, &s, &z, &udeps, &srctextpos, jl_module_init_order);
+    uint64_t split_sysimg_ns = jl_hrtime() - split_output_start;
 
     if (!emit_split)
         z = s;
@@ -188,6 +192,9 @@ JL_DLLEXPORT void jl_write_compiler_output(void)
         exit(0); // Some finalizers need to run and we've blown up the bindings table
         // TODO: Is this still needed
     }
+    if (split_report)
+        jl_safe_printf("SPLIT_PHASE create_sysimg=%" PRIu64 " write_output_total=%" PRIu64 "\n",
+                       split_sysimg_ns, jl_hrtime() - split_output_start);
     JL_GC_POP();
     jl_gc_enable_finalizers(ct, 1);
 }
