@@ -6607,9 +6607,12 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
         if (dep_unkeyed[d])
             if (relink_stats()) jl_safe_printf("RELINK_UNKEYED_DEP idx=%u name=%s entries=%zu unkeyed=%zu\n",
                            d, name, dep_entries[d], dep_unkeyed[d]);
-        if (dep_accepted[d] != dep_keyed[d]) {
+        // The whole report is gated once, here. Gating the individual prints instead
+        // leaves the continuation fragments and the newline unguarded, so an ordinary
+        // precompile emits headerless noise like " mis[A< unionall]=3 mis[V: simplevec]=17".
+        if (dep_accepted[d] != dep_keyed[d] && relink_stats()) {
             // the edge is refused; name exactly what blocks it, by locator kind
-            if (relink_stats()) jl_safe_printf("RELINK_BLOCKED idx=%u name=%s keyed=%zu failed=%zu:",
+            jl_safe_printf("RELINK_BLOCKED idx=%u name=%s keyed=%zu failed=%zu:",
                            d, name, dep_keyed[d], dep_keyed[d] - dep_accepted[d]);
             for (int q = 0; q < nrk; q++) {
                 if (dep_kind_unres[(size_t)d * RK_MAX + q])
