@@ -1645,11 +1645,27 @@ int get_root_reference(rle_reference *rr, jl_method_t *m, size_t i)
 jl_value_t *lookup_root(jl_method_t *m, uint64_t key, int index)
 {
     if (!m->root_blocks) {
-        assert(key == 0);
+        // No block table at all: every root this method has is key 0, and only the first
+        // `nroots_sysimg` of them are citable. An `assert` is a no-op in a release build,
+        // and the read below is unchecked -- so a citation under a nonzero key, or past
+        // the end, silently returns an unrelated object. That is reachable in stock Julia:
+        // a package whose file defines more than one top-level module writes its roots
+        // under the first module's build_id and collects them under the last one's, so
+        // they are never serialized and the IR citing them survives anyway.
+        if (key != 0 || index < 0 || (size_t)index >= jl_array_nrows(m->roots))
+            jl_errorf("Method %s has no root %d with key 0x%016" PRIx64 ".",
+                      jl_symbol_name(m->name), index, key);
         return jl_array_ptr_ref(m->roots, index);
     }
     rle_reference rr = {key, index};
     size_t i = rle_reference_to_index(&rr, jl_array_data(m->root_blocks, uint64_t), jl_array_nrows(m->root_blocks), 0);
+    // The key is the build_id of the module that contributed the root, so a reference
+    // written against a different build of that module names a block this method does not
+    // have. Reading `m->roots` at whatever index came back would hand out an unrelated
+    // object, or one past the end.
+    if (i == RLE_NOTFOUND || i >= jl_array_nrows(m->roots))
+        jl_errorf("Method %s has no root %d with key 0x%016" PRIx64 ".",
+                  jl_symbol_name(m->name), index, key);
     return jl_array_ptr_ref(m->roots, i);
 }
 

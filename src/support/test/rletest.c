@@ -56,5 +56,15 @@ int main()
         assert(rle_reference_to_index(&rr, rletable4, 6, 0) == i);
     }
 
+    /* a reference the table cannot satisfy is reported, not answered with a stray index */
+    rr.key = 99; rr.index = 0;   // no run has this key
+    assert(rle_reference_to_index(&rr, rletable3, 8, 0) == RLE_NOTFOUND);
+    rr.key = 5; rr.index = 1;    // key 5 has one item, not two
+    assert(rle_reference_to_index(&rr, rletable3, 8, 0) == RLE_NOTFOUND);
+    rr.key = 22; rr.index = 2;   // key 22 has two items, not three
+    assert(rle_reference_to_index(&rr, rletable3, 8, 0) == RLE_NOTFOUND);
+    rr.key = 1; rr.index = 0;    // no table at all, so only key0 is answerable
+    assert(rle_reference_to_index(&rr, NULL, 0, 0) == RLE_NOTFOUND);
+
     return 0;
 }
