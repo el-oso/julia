@@ -1185,14 +1185,6 @@ static uintptr_t add_external_linkage(jl_serializer_state *s, jl_value_t *v, jl_
 static int relink_stats(void) JL_NOTSAFEPOINT;
 static int extkey_write(ios_t *k, jl_value_t *v, int depth) JL_NOTSAFEPOINT;
 
-// Which field defeats a CodeInstance key. They are 44% of the entries the writer cannot
-// key at all, and the field that stops them decides whether that is fixable.
-enum { EK_CI_MI, EK_CI_OWNER, EK_CI_RETTYPE, EK_CI_EDGES, EK_CI_EXCTYPE, EK_CI_RETCONST,
-       EK_CI_NREASON };
-static const char *const extkey_ci_reason[EK_CI_NREASON] = {
-    "methodinstance", "owner", "rettype", "edges", "exctype", "rettype_const" };
-static size_t extkey_ci_fail[EK_CI_NREASON];
-
 // ...and, for the one field that turns out to account for nearly all of them, which kind
 
 // Reverse index from an object to a module binding that holds it, so objects with no
@@ -1616,8 +1608,6 @@ static int extkey_rendering_roots = 0;
 // Determinism-harness dedup: identities are re-rendered thousands of times per session,
 // and an unbounded dump measured in the gigabytes -- it filled the tmpfs and took the
 // session down. One dump per method per process is what a cross-session diff needs.
-static htable_t ekrb_dumped;
-static int ekrb_dumped_ready = 0;
 
 static int extkey_method_roots(ios_t *k, jl_method_t *m) JL_NOTSAFEPOINT
 {
@@ -1632,22 +1622,6 @@ static int extkey_method_roots(ios_t *k, jl_method_t *m) JL_NOTSAFEPOINT
     struct ek_rb_grp grp[EK_RB_MAX];
     size_t ngrp = 0;
     int overflow = 0;
-    const char *ekdump = getenv("JULIA_EKRB_DUMP");
-    if (ekdump) {
-        if (!ekrb_dumped_ready) {
-            htable_new(&ekrb_dumped, 0);
-            ekrb_dumped_ready = 1;
-        }
-        const char *only = getenv("JULIA_EKRB_DUMP_METHOD");
-        if (only && strcmp(only, jl_symbol_name(m->name)) == 0) {
-            // targeted: every render of this method dumps in full, dupes and all --
-            // an intra-session divergence needs both texts
-        }
-        else if (ptrhash_get(&ekrb_dumped, m) != HT_NOTFOUND)
-            ekdump = NULL;   // this method's roots were already dumped this process
-        else
-            ptrhash_put(&ekrb_dumped, m, (void*)1);
-    }
     ios_t t;
     ios_mem(&t, 256);
     for (size_t j = 0; j + 1 < nb; j += 2) {
@@ -1687,23 +1661,6 @@ static int extkey_method_roots(ios_t *k, jl_method_t *m) JL_NOTSAFEPOINT
             int rok = extkey_root_value(&t, r, 0);
             extkey_rendering_roots = 0;
             if (!rok) {
-                if (getenv("JULIA_EKRB_WHY")) {
-                    jl_safe_printf("EKRB_REFUSE method=%s.%s root=%zu type=%s ci=",
-                                   jl_symbol_name(m->module->name), jl_symbol_name(m->name),
-                                   i, jl_typeof_str(r));
-                    if (jl_is_code_instance(r)) {
-                        // re-render just to see which CI key component refuses
-                        size_t before[EK_CI_NREASON];
-                        memcpy(before, extkey_ci_fail, sizeof(before));
-                        ios_seek(&t, 0);
-                        ios_trunc(&t, 0);
-                        extkey_write(&t, r, 0);
-                        for (int q = 0; q < EK_CI_NREASON; q++)
-                            if (extkey_ci_fail[q] != before[q])
-                                jl_safe_printf("%s ", extkey_ci_reason[q]);
-                    }
-                    jl_safe_printf("\n");
-                }
                 ios_close(&t);
                 return 0;   // an unverifiable root refuses the whole method key
             }
@@ -1711,37 +1668,6 @@ static int extkey_method_roots(ios_t *k, jl_method_t *m) JL_NOTSAFEPOINT
             // The determinism harness: rendering an identity must be a pure function of
             // the object, so the same dump from two sessions of one build must be
             // byte-identical. One line per (method, root): join key plus a digest of the
-            // render -- the full text only under JULIA_EKRB_DUMP_METHOD, because a full
-            // hex dump of every root measured in the gigabytes and filled the tmpfs.
-            if (ekdump) {
-                ios_t dio;
-                if (ios_file(&dio, ekdump, 1, 1, 1, 0) != NULL) {
-                    ios_seek_end(&dio);
-                    jl_module_t *gm = extkey_module_by_buildid(key);
-                    uint64_t rh = 1469598103934665603ULL;
-                    for (size_t b = 0; b < len; b++) {
-                        rh ^= (unsigned char)t.buf[b];
-                        rh *= 1099511628211ULL;
-                    }
-                    // the signature's object id disambiguates overloads sharing a line;
-                    // for a type it is content-derived, so it joins across sessions
-                    // index *within the contributor's group*, not absolute: absolute
-                    // positions interleave by session load order, the citation index and
-                    // the digest do not
-                    ios_printf(&dio, "%s.%s:%d/%016" PRIx64 "|%s[%zu] %016" PRIx64,
-                               jl_symbol_name(m->module->name), jl_symbol_name(m->name),
-                               m->line, (uint64_t)jl_object_id((jl_value_t*)m->sig),
-                               gm ? jl_symbol_name(gm->name) : "?", grp[g].count, rh);
-                    const char *only = getenv("JULIA_EKRB_DUMP_METHOD");
-                    if (only && strcmp(only, jl_symbol_name(m->name)) == 0) {
-                        ios_putc(' ', &dio);
-                        for (size_t b = 0; b < len; b++)
-                            ios_printf(&dio, "%02x", (unsigned char)t.buf[b]);
-                    }
-                    ios_putc('\n', &dio);
-                    ios_close(&dio);
-                }
-            }
             uint64_t h = grp[g].h;
             for (size_t b = 0; b < len; b++) {
                 h ^= (unsigned char)t.buf[b];
@@ -2278,17 +2204,17 @@ static int extkey_write(ios_t *k, jl_value_t *v, int depth) JL_NOTSAFEPOINT
         jl_method_instance_t *mi = jl_get_ci_mi(ci);
         ios_puts("C:", k);
         if (!extkey_write(k, (jl_value_t*)mi, depth + 1))
-            return extkey_ci_fail[EK_CI_MI]++, 0;
+            return 0;
         ios_putc('/', k);
         // the owner distinguishes foreign-interpreter caches sharing one MethodInstance
         if (ci->owner == jl_nothing)
             ios_putc('-', k);
         else if (!extkey_write(k, ci->owner, depth + 1))
-            return extkey_ci_fail[EK_CI_OWNER]++, 0;
+            return 0;
         // and the ABI/rettype distinguishes co-existing entries for one owner
         ios_putc('/', k);
         if (!extkey_type_toplevel(k, ci->rettype))
-            return extkey_ci_fail[EK_CI_RETTYPE]++, 0;
+            return 0;
         // Entries in one method instance's cache chain can agree on all of the above and
         // differ only in their edges, so the edge set has to take part in the identity.
         // The edge digest is identity data even inside a locator: it is a hash, so it can
@@ -2302,7 +2228,7 @@ static int extkey_write(ios_t *k, jl_value_t *v, int depth) JL_NOTSAFEPOINT
         int edges_ok = extkey_edges_hash(ci, &ehash);
         extkey_import_index = saved_refs;
         if (!edges_ok)
-            return extkey_ci_fail[EK_CI_EDGES]++, 0;
+            return 0;
         ios_printf(k, "/E%016" PRIx64, ehash);
         // The remaining inference results a caller can have specialized against. Omitting
         // any of them merges code instances that are not interchangeable: a caller that
@@ -2310,7 +2236,7 @@ static int extkey_write(ios_t *k, jl_value_t *v, int depth) JL_NOTSAFEPOINT
         // `rettype_const`, is not correct against the other.
         ios_putc('/', k);
         if (!extkey_type_toplevel(k, ci->exctype))
-            return extkey_ci_fail[EK_CI_EXCTYPE]++, 0;
+            return 0;
         ios_putc('/', k);
         size_t rtcpos = (size_t)ios_pos(k);
         if (ci->rettype_const == NULL)
@@ -2329,7 +2255,7 @@ static int extkey_write(ios_t *k, jl_value_t *v, int depth) JL_NOTSAFEPOINT
             // unkeyed method blocks repointing any dependency whose roots the image
             // cites -- these 135 unkeyed methods were the whole remaining blocker.
             if (!extkey_rendering_roots || !extkey_root_value(k, ci->rettype_const, depth + 1))
-                return extkey_ci_fail[EK_CI_RETCONST]++, 0;
+                return 0;
         }
         ios_printf(k, "/P%08" PRIx32, jl_atomic_load_relaxed(&ci->ipo_purity_bits));
         // The world range is deliberately NOT part of the identity, not even collapsed to
@@ -2907,9 +2833,6 @@ static void jl_write_export_index(jl_serializer_state *s, ios_t *f, size_t sysim
         }
         else {
             dropped += j - i;
-            if (getenv("JULIA_EXPORT_SKIP_DUMP"))
-                jl_safe_printf("EXPORT_SKIP collide digest=%016llx n=%zu\n",
-                               (unsigned long long)hi_, j - i);
         }
         i = j;
     }
@@ -2917,12 +2840,6 @@ static void jl_write_export_index(jl_serializer_state *s, ios_t *f, size_t sysim
     ios_write(f, pairs, out * 16);
     free(pairs);
     htable_free(&groups);
-    if (getenv("JULIA_IMPORT_KEYS"))
-        jl_safe_printf("EXPORT_INDEX entries=%zu dropped_collisions=%zu bytes=%zu "
-                       "candidates=%zu rej_nonindexable=%zu rej_dupcontent=%zu "
-                       "rej_nolayout=%zu rej_nodigest=%zu\n",
-                       out, dropped, out * 16 + 4,
-                       c_cand, c_nonidx, c_dup, c_nolayout, c_nodigest);
 }
 
 static void jl_write_import_table(jl_serializer_state *s, ios_t *f) JL_NOTSAFEPOINT
@@ -4260,8 +4177,7 @@ static int relink_stats(void) JL_NOTSAFEPOINT
 {
     static int on = -1;
     if (on == -1)
-        on = getenv("JULIA_PKGIMAGE_RELINK_STATS") != NULL ||
-             getenv("JULIA_PKGIMAGE_RELINK_VERBOSE") != NULL;
+        on = getenv("JULIA_PKGIMAGE_RELINK_STATS") != NULL;
     return on;
 }
 
@@ -4282,10 +4198,7 @@ static int jl_relink_probe(jl_serializer_state *s, jl_import_table_t *tbl, jl_ar
     // checks it passed before. `JULIA_PKGIMAGE_RELINK_PROBE_ALL` restores exhaustive
     // resolution, which is what the coverage measurements (RELINK_DEPS, RELINK_PROBE, the
     // sweep, the borrow probe, and the ground-truth self-check on unmoved edges) need.
-    int probe_all = getenv("JULIA_PKGIMAGE_RELINK_PROBE_ALL") != NULL ||
-                    getenv("JULIA_RELINK_SWEEP") != NULL ||
-                    getenv("JULIA_RELINK_OWNER_PROBE") != NULL ||
-                    getenv("JULIA_RELINK_BORROW_PROBE") != NULL;
+    int probe_all = getenv("JULIA_PKGIMAGE_RELINK_PROBE_ALL") != NULL;
     size_t keyed = 0, resolved = 0, accepted = 0, unresolved = 0, digest_bad = 0, extfn_bad = 0, fabricated = 0;
     // Method entries whose root contributions could not be verified -- refused, or
     // unkeyed so there was nothing to verify against. Compressed IR can cite any imported
