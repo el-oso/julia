@@ -1194,38 +1194,6 @@ static const char *const extkey_ci_reason[EK_CI_NREASON] = {
 static size_t extkey_ci_fail[EK_CI_NREASON];
 
 // ...and, for the one field that turns out to account for nearly all of them, which kind
-// of constant it is.
-#define EK_RC_MAX 16
-static const char *extkey_rc_name[EK_RC_MAX];
-static size_t extkey_rc_count[EK_RC_MAX];
-static int extkey_rc_n;
-static void extkey_note_retconst(jl_value_t *c) JL_NOTSAFEPOINT
-{
-    const char *nm = jl_typeof_str(c);
-    int q;
-    for (q = 0; q < extkey_rc_n; q++)
-        if (strcmp(extkey_rc_name[q], nm) == 0)
-            break;
-    if (q == extkey_rc_n && extkey_rc_n < EK_RC_MAX) {
-        extkey_rc_name[extkey_rc_n] = nm;
-        extkey_rc_count[extkey_rc_n] = 0;
-        extkey_rc_n++;
-    }
-    if (q < extkey_rc_n)
-        extkey_rc_count[q]++;
-    // the type is what says whether the value is unkeyable in itself or only because its
-    // own type is; print a few
-    static int nshown = 0;
-    if (getenv("JULIA_IMPORT_KEYS") && nshown < 4) {
-        nshown++;
-        ios_t t;
-        ios_mem(&t, 128);
-        int ok = extkey_write(&t, (jl_value_t*)jl_typeof(c), 0);
-        ios_putc('\0', &t);
-        jl_safe_printf("IMPORTKEYS_RETCONST_EX %s type=%s\n", nm, ok ? t.buf : "(unkeyable)");
-        ios_close(&t);
-    }
-}
 
 // Reverse index from an object to a module binding that holds it, so objects with no
 // content identity can still be named by where they live. Built once per serialization.
@@ -2361,7 +2329,7 @@ static int extkey_write(ios_t *k, jl_value_t *v, int depth) JL_NOTSAFEPOINT
             // unkeyed method blocks repointing any dependency whose roots the image
             // cites -- these 135 unkeyed methods were the whole remaining blocker.
             if (!extkey_rendering_roots || !extkey_root_value(k, ci->rettype_const, depth + 1))
-                return extkey_ci_fail[EK_CI_RETCONST]++, extkey_note_retconst(ci->rettype_const), 0;
+                return extkey_ci_fail[EK_CI_RETCONST]++, 0;
         }
         ios_printf(k, "/P%08" PRIx32, jl_atomic_load_relaxed(&ci->ipo_purity_bits));
         // The world range is deliberately NOT part of the identity, not even collapsed to
@@ -2601,45 +2569,6 @@ static int extkey_hash(jl_value_t *v, uint64_t *out) JL_NOTSAFEPOINT
     return ok;
 }
 
-// Does a key name both of these? A key identifies an *equivalence class*, not an
-// allocation: distinct allocations that Julia itself treats as one identity are what the
-// loader is free to merge. Type uniquing merges equal types on load, `jl_egal` is Julia's
-// own definition of "the same value" (covering separately allocated but equal simple
-// vectors, strings and debug info), and sibling entries in one method instance's cache
-// chain are interchangeable. Used both to excuse key collisions and to judge whether a
-// shadow-resolved object is the object we started from.
-static int extkey_equiv(jl_value_t *oa, jl_value_t *ob) JL_NOTSAFEPOINT
-{
-    if (oa == ob)
-        return 1;
-    if (oa == NULL || ob == NULL)
-        return 0;
-    if (jl_egal(oa, ob))
-        return 1;
-    if (jl_is_type(oa) && jl_is_type(ob) && jl_types_equal(oa, ob))
-        return 1;
-    if (jl_is_typevar(oa) && jl_is_typevar(ob)) {
-        // Two structurally identical types are often separate allocations, and each binds
-        // its own variable objects. Those are the same variable: a type variable's name is
-        // a gensym as often as not and carries no identity, so compare what does -- the
-        // bounds. Without this, keying variables by their binder reports one collision per
-        // duplicated binder.
-        jl_tvar_t *ta = (jl_tvar_t*)oa, *tb = (jl_tvar_t*)ob;
-        if (jl_types_equal(ta->lb, tb->lb) && jl_types_equal(ta->ub, tb->ub))
-            return 1;
-    }
-    if (jl_is_code_instance(oa) && jl_is_code_instance(ob)) {
-        jl_code_instance_t *ca = (jl_code_instance_t*)oa;
-        jl_code_instance_t *cb = (jl_code_instance_t*)ob;
-        if (jl_get_ci_mi(ca) == jl_get_ci_mi(cb) && ca->owner == cb->owner &&
-            ca->rettype == cb->rettype && ca->exctype == cb->exctype &&
-            ca->rettype_const == cb->rettype_const &&
-            jl_atomic_load_relaxed(&ca->min_world) == jl_atomic_load_relaxed(&cb->min_world) &&
-            jl_atomic_load_relaxed(&ca->max_world) == jl_atomic_load_relaxed(&cb->max_world))
-            return 1;
-    }
-    return 0;
-}
 
 // Drop the type-variable table so the next build starts from its own object set. The
 // table is scoped to one image's imports -- the writer's at save, one loaded table's at
@@ -2674,151 +2603,9 @@ static void extkey_build_tvars(jl_serializer_state *s) JL_NOTSAFEPOINT
     }
 }
 
-// Serialize the import table: for each distinct object this image references in another
-// image, the owning image's deps-index and the object's content key, with a zero key
-// marking an object that has no stable identity. Nothing reads this back yet beyond
-// checking that it round-trips; resolving through it is what would let a rebuilt
-// dependency be re-linked instead of invalidating every image above it.
-// REVIEW instrumentation for the identity-hash hazard, which is a precondition for any
-// re-linking scheme rather than a property of the keys. `jl_object_id` of a mutable object
-// is not derived from its content: the serializer bakes the id the object had in the
-// writing process into the header ahead of it (`object_id_expected`, below), and
-// `jl_object_id__cold` reads that back for anything tagged `GC_IN_IMAGE`
-// (src/builtins.c:377,490). A rebuilt dependency therefore hands out *different* ids for
-// content-identical objects.
-//
-// So any table this image serialized whose slot layout was computed from such an id -- an
-// `IdDict`, or a `Dict`/`Set` whose key type falls back to the generic `objectid` hash --
-// would silently mis-look-up after being re-linked against a rebuilt dependency, and there
-// is no rehash pass on the restore path to repair it (only the type cache rehashes,
-// `cache_rehash_set`). Lookups miss and entries duplicate: no crash, no error.
-//
-// This measures the exposure. `containers` is the population a conservative "refuse to
-// re-link an image that serializes one" rule would have to consider; `tainted` is the
-// subset that actually reaches a mutable owned by another image, which is the only part at
-// risk. If `tainted` is near zero across real packages, refusal is free and the hazard
-// costs nothing to close.
-// A mutable type whose `objectid` is nonetheless derived from content, and so survives a
-// rebuild. `jl_object_id__cold` (src/builtins.c) special-cases exactly these, and the
-// serializer's `object_id_expected` predicate excludes exactly the same set from having an
-// id baked ahead of it -- the two lists are the same fact seen from either side.
-static int idhash_content_hashed(jl_value_t *t) JL_NOTSAFEPOINT
-{
-    return t == (jl_value_t*)jl_string_type || t == (jl_value_t*)jl_symbol_type ||
-           t == (jl_value_t*)jl_simplevector_type || t == (jl_value_t*)jl_datatype_type ||
-           t == (jl_value_t*)jl_module_type || t == (jl_value_t*)jl_typename_type;
-}
 
-static int idhash_hit(jl_value_t *el) JL_NOTSAFEPOINT
-{
-    if (el == NULL)
-        return 0;
-    size_t blob = external_blob_index(el);
-    if (blob >= n_linkage_blobs())
-        return 0;
-    jl_value_t *t = jl_typeof(el);
-    return jl_is_datatype(t) && jl_is_mutable(t) && !idhash_content_hashed(t);
-}
 
-static size_t idhash_scan(jl_value_t *v, int depth) JL_NOTSAFEPOINT
-{
-    if (v == NULL || depth > 3)
-        return 0;
-    if (idhash_hit(v))
-        return 1;   // an external mutable: stop here, its contents are not ours
-    if (external_blob_index(v) < n_linkage_blobs())
-        return 0;
-    size_t hits = 0;
-    if (jl_is_genericmemory(v)) {
-        jl_genericmemory_t *m = (jl_genericmemory_t*)v;
-        const jl_datatype_layout_t *lo = ((jl_datatype_t*)jl_typeof(m))->layout;
-        if (lo != NULL && lo->flags.arrayelem_isboxed) {
-            jl_value_t **el = jl_genericmemory_ptr_data(m);
-            for (size_t i = 0; i < (size_t)m->length; i++)
-                hits += idhash_scan(el[i], depth + 1);
-        }
-        return hits;
-    }
-    jl_datatype_t *dt = (jl_datatype_t*)jl_typeof(v);
-    if (!jl_is_datatype(dt) || dt->layout == NULL)
-        return 0;
-    for (size_t f = 0; f < jl_datatype_nfields(dt); f++) {
-        if (!jl_field_isptr(dt, f))
-            continue;
-        jl_value_t *fv = *(jl_value_t**)((char*)v + jl_field_offset(dt, f));
-        hits += idhash_scan(fv, depth + 1);
-    }
-    return hits;
-}
 
-static void jl_report_idhash_taint(jl_serializer_state *s) JL_NOTSAFEPOINT
-{
-    (void)s;
-    size_t n_id = 0, n_hash = 0, n_id_tainted = 0, n_hash_tainted = 0, n_hits = 0;
-    // histogram by concrete container type: whether a rehash-on-relink pass is bounded
-    // work or open-ended depends on whether the tainted population is a handful of Base
-    // container types or an open set of user types.
-    enum { TTY_MAX = 128 };
-    void *tty[TTY_MAX]; size_t tcnt[TTY_MAX], ntty = 0, tdropped = 0;
-    for (size_t i = 0; i < serialization_queue.len; i++) {
-        jl_value_t *v = (jl_value_t*)serialization_queue.items[i];
-        if (v == NULL || v == (jl_value_t*)(uintptr_t)-1 || v == (jl_value_t*)(uintptr_t)-2)
-            continue;
-        jl_value_t *t = jl_typeof(v);
-        if (!jl_is_datatype(t))
-            continue;
-        const char *tn = jl_symbol_name(((jl_datatype_t*)t)->name->name);
-        // `IdDict`/`IdSet` hash by `objectid` unconditionally. `Dict`/`Set` hash by
-        // `hash(key)`, which falls back to `objectid` for any mutable key type with no
-        // method of its own -- undecidable here, so they are counted separately rather
-        // than merged into one alarming number.
-        int identity = !strcmp(tn, "IdDict") || !strcmp(tn, "IdSet") || !strcmp(tn, "WeakKeyIdDict");
-        int hashed = !identity && (!strcmp(tn, "Dict") || !strcmp(tn, "Set") || !strcmp(tn, "WeakKeyDict"));
-        if (!identity && !hashed)
-            continue;
-        // Only the *key* type decides the hazard. `Dict{Symbol,Any}` is not exposed however
-        // many external mutables sit on its value side: a Symbol is interned and hashes by
-        // its name. A key type that is abstract, or concrete and mutable, is the case where
-        // `hash` falls back to `objectid` and the slot layout depends on an address from
-        // the writing process.
-        jl_svec_t *par = ((jl_datatype_t*)t)->parameters;
-        jl_value_t *K = jl_svec_len(par) > 0 ? jl_svecref(par, 0) : NULL;
-        int keyed_by_id = identity ||
-            (K != NULL && (!jl_is_datatype(K) || !jl_is_concrete_type(K) ||
-                           (jl_is_mutable(K) && !idhash_content_hashed(K))));
-        if (!keyed_by_id)
-            continue;
-        size_t hits = idhash_scan(v, 0);
-        if (identity) {
-            n_id++;
-            if (hits) n_id_tainted++;
-        }
-        else {
-            n_hash++;
-            if (hits) n_hash_tainted++;
-        }
-        n_hits += hits;
-        if (hits) {
-            size_t q;
-            for (q = 0; q < ntty; q++)
-                if (tty[q] == (void*)t) break;
-            if (q == ntty) {
-                if (q == TTY_MAX) { tdropped++; continue; }
-                tty[q] = (void*)t; tcnt[q] = 0; ntty++;
-            }
-            tcnt[q]++;
-        }
-    }
-    for (size_t q = 0; q < ntty; q++) {
-        jl_safe_printf("IDHASH_TAINT %6zu ", tcnt[q]);
-        jl_static_show(JL_STDERR, (jl_value_t*)tty[q]);
-        jl_safe_printf("\n");
-    }
-    if (tdropped)
-        jl_safe_printf("IDHASH_TAINT <overflow> %zu\n", tdropped);
-    jl_safe_printf("IDHASH containers_id=%zu tainted_id=%zu containers_hash=%zu tainted_hash=%zu external_mutable_refs=%zu\n",
-                   n_id, n_id_tainted, n_hash, n_hash_tainted, n_hits);
-}
 
 // Emit the export index: (digest, offset-from-image-base) for every uninterned object
 // this image owns, sorted by digest. The offset formula mirrors the reader's section
@@ -3150,14 +2937,6 @@ static void jl_write_import_table(jl_serializer_state *s, ios_t *f) JL_NOTSAFEPO
     // population, not the failing one, the ceiling on whole-edge acceptance. Only the
     // writer can name these: at load the recorded offset is meaningless against a
     // rebuilt blob.
-#define UK_MAX 24
-#define UK_NEX 2
-    const char *uk_name[UK_MAX];
-    size_t uk_count[UK_MAX];
-    jl_value_t *uk_ex[UK_MAX][UK_NEX];
-    size_t uk_nex[UK_MAX];
-    int nuk = 0;
-    size_t uk_wrap[4] = {0, 0, 0, 0};   // wrapper body / neither / bare typevar / own-wrapper vars
     for (size_t i = 0; i < n; i++) {
         jl_value_t *v = (jl_value_t*)s->import_objs.items[i];
         uint64_t h = 0;
@@ -3229,362 +3008,10 @@ static void jl_write_import_table(jl_serializer_state *s, ios_t *f) JL_NOTSAFEPO
             ios_write(f, k.buf, len);
             keybytes += len;
         }
-        else {
-            const char *ukind = jl_typeof_str(v);
-            int q;
-            for (q = 0; q < nuk; q++)
-                if (strcmp(uk_name[q], ukind) == 0)
-                    break;
-            if (q == nuk && nuk < UK_MAX) {
-                uk_name[nuk] = ukind;
-                uk_count[nuk] = 0;
-                uk_nex[nuk] = 0;
-                nuk++;
-            }
-            if (q < nuk) {
-                uk_count[q]++;
-                if (uk_nex[q] < UK_NEX)
-                    uk_ex[q][uk_nex[q]++] = v;
-            }
-            // A free-variable type or type variable may still be anchorable without any
-            // owner in this table: if it is the wrapper of its own type name, unwrapped
-            // some number of times, then the type name plus that depth names it. Count how
-            // many are reachable that way before building anything that depends on it.
-            if (jl_is_datatype(v)) {
-                jl_datatype_t *dv = (jl_datatype_t*)v;
-                jl_value_t *w = dv->name->wrapper;
-                int hit = (w == v);
-                while (!hit && w != NULL && jl_is_unionall(w)) {
-                    w = ((jl_unionall_t*)w)->body;
-                    hit = (w == v);
-                }
-                if (hit) {
-                    uk_wrap[0]++;
-                }
-                else {
-                    // Not the wrapper itself, but its free variables may still be the
-                    // wrapper's own variables -- `Array{T,1}` with `Array`'s own `T`. If
-                    // so, the type name plus each variable's binding depth names them and
-                    // no owner in this table is needed.
-                    int all_own = 1;
-                    size_t np = jl_nparams(dv);
-                    for (size_t pi = 0; pi < np && all_own; pi++) {
-                        jl_value_t *p = jl_tparam(dv, pi);
-                        if (!jl_is_typevar(p))
-                            continue;
-                        int found = 0;
-                        jl_value_t *ww = dv->name->wrapper;
-                        while (ww != NULL && jl_is_unionall(ww)) {
-                            if ((jl_value_t*)((jl_unionall_t*)ww)->var == p) { found = 1; break; }
-                            ww = ((jl_unionall_t*)ww)->body;
-                        }
-                        all_own = found;
-                    }
-                    uk_wrap[all_own ? 3 : 1]++;
-                }
-            }
-            else if (jl_is_typevar(v)) {
-                uk_wrap[2]++;
-            }
-        }
     }
     ios_close(&k);
-    if (getenv("JULIA_IMPORT_KEYS")) {
-        jl_safe_printf("IMPORTKEYS_WRITE entries=%zu keybytes=%zu\n", n, keybytes);
-        for (int r = 0; r < EK_CI_NREASON; r++)
-            if (extkey_ci_fail[r])
-                jl_safe_printf("IMPORTKEYS_CIFAIL %-16s %zu\n", extkey_ci_reason[r], extkey_ci_fail[r]);
-        for (int q = 0; q < extkey_rc_n; q++)
-            jl_safe_printf("IMPORTKEYS_RETCONST %-16s %zu\n", extkey_rc_name[q], extkey_rc_count[q]);
-        jl_safe_printf("IMPORTKEYS_WRAPBODY body=%zu ownvars=%zu neither=%zu baretypevar=%zu\n",
-                       uk_wrap[0], uk_wrap[3], uk_wrap[1], uk_wrap[2]);
-        for (int q = 0; q < nuk; q++) {
-            jl_safe_printf("IMPORTKEYS_UNKEYED %-20s %zu\n", uk_name[q], uk_count[q]);
-            for (size_t x = 0; x < uk_nex[q]; x++) {
-                // just the name: `jl_static_show` recurses without a depth limit and
-                // overflows the stack on the cyclic objects that land here
-                jl_value_t *e = uk_ex[q][x];
-                jl_datatype_t *dt = jl_is_datatype(e) ? (jl_datatype_t*)e : NULL;
-                if (jl_is_code_instance(e))
-                    dt = (jl_datatype_t*)jl_typeof(e);
-                jl_method_instance_t *emi = NULL;
-                if (jl_is_code_instance(e))
-                    emi = jl_get_ci_mi((jl_code_instance_t*)e);
-                else if (jl_is_method_instance(e))
-                    emi = (jl_method_instance_t*)e;
-                if (emi && jl_is_method(emi->def.method))
-                    jl_safe_printf("IMPORTKEYS_UNKEYED_EX %-16s %s.%s\n", uk_name[q],
-                                   jl_symbol_name(emi->def.method->module->name),
-                                   jl_symbol_name(emi->def.method->name));
-                else if (dt && jl_is_datatype(e))
-                    jl_safe_printf("IMPORTKEYS_UNKEYED_EX %-16s %s.%s\n", uk_name[q],
-                                   jl_symbol_name(dt->name->module->name),
-                                   jl_symbol_name(dt->name->name));
-                else
-                    jl_safe_printf("IMPORTKEYS_UNKEYED_EX %-16s (unnamed)\n", uk_name[q]);
-            }
-        }
-    }
-#undef UK_MAX
-#undef UK_NEX
 }
 
-// Compute keys for every imported object and report coverage plus injectivity: two
-// distinct objects in the same owning image must never produce the same key.
-static void jl_report_import_keys(jl_serializer_state *s) JL_NOTSAFEPOINT
-{
-    size_t n = s->import_objs.len;
-    ios_t keybuf;
-    ios_mem(&keybuf, n ? n * 48 : 64);
-    size_t *koff = (size_t*)malloc_s((n + 1) * sizeof(size_t));
-    size_t *kbeg = (size_t*)malloc_s((n ? n : 1) * sizeof(size_t));
-    size_t *kdep = (size_t*)malloc_s((n ? n : 1) * sizeof(size_t));
-    size_t nkeyed = 0;
-    for (size_t i = 0; i < n; i++) {
-        koff[i] = (size_t)ios_pos(&keybuf);
-        kdep[i] = (size_t)(uintptr_t)s->import_deps.items[i];
-        // prefix with the owning image so keys only need to be unique within it
-        ios_printf(&keybuf, "%zu\x1f", kdep[i]);
-        kbeg[i] = (size_t)ios_pos(&keybuf);
-        if (extkey_write(&keybuf, (jl_value_t*)s->import_objs.items[i], 0))
-            nkeyed++;
-        else
-            ios_seek(&keybuf, koff[i]);   // unkeyed: leave a zero-length entry
-        ios_putc('\0', &keybuf);
-    }
-    koff[n] = (size_t)ios_pos(&keybuf);
-
-    // Dump the keys so two builds can be compared: a key that is not identical across
-    // rebuilds of its owning image is useless, however unique it is within one build.
-    // The owning-image index is deliberately omitted -- it is a per-build numbering.
-    const char *dumppath = getenv("JULIA_IMPORT_KEYS_DUMP");
-    if (dumppath) {
-        ios_t d;
-        if (ios_file(&d, dumppath, 0, 1, 1, 1) != NULL) {
-            for (size_t i = 0; i < n; i++) {
-                if (koff[i + 1] - koff[i] > 1) {
-                    ios_puts(keybuf.buf + kbeg[i], &d);
-                }
-                else {
-                    // unkeyed: record the type name so the unkeyed population can be
-                    // compared across builds too
-                    jl_value_t *o = (jl_value_t*)s->import_objs.items[i];
-                    ios_printf(&d, "?%s", jl_typeof_str(o));
-                }
-                ios_putc('\n', &d);
-            }
-            ios_close(&d);
-        }
-    }
-
-    // injectivity: collisions between *distinct* objects would make keys unusable
-    size_t ncollide = 0, ndup = 0;
-    htable_t seen;
-    htable_new(&seen, 0);
-    for (size_t i = 0; i < n; i++) {
-        char *ki = keybuf.buf + koff[i];
-        if (koff[i + 1] - koff[i] <= 1)
-            continue;   // unkeyed
-        // linear probe over a pointer table keyed by the string's hash
-        uintptr_t h = 5381;
-        for (char *c = ki; *c; c++)
-            h = h * 33 + (unsigned char)*c;
-        void **bp = ptrhash_bp(&seen, (void*)(h | 1));
-        if (*bp != HT_NOTFOUND) {
-            size_t j = (size_t)(uintptr_t)*bp - 1;
-            if (strcmp(keybuf.buf + koff[j], ki) == 0 &&
-                s->import_objs.items[i] != s->import_objs.items[j]) {
-                // Distinct allocations that Julia itself treats as one identity are not
-                // key failures: type uniquing merges equal types on load, and sibling
-                // entries in a method instance's cache chain are interchangeable. Only
-                // count a collision when the two are genuinely different things.
-                jl_value_t *oa = (jl_value_t*)s->import_objs.items[i];
-                jl_value_t *ob = (jl_value_t*)s->import_objs.items[j];
-                if (extkey_equiv(oa, ob)) {
-                    ndup++;
-                    continue;
-                }
-                if (ncollide < 5) {
-                    jl_value_t *a = (jl_value_t*)s->import_objs.items[i];
-                    jl_value_t *b = (jl_value_t*)s->import_objs.items[j];
-                    jl_safe_printf("IMPORTKEYS_COLLISION [%s vs %s] %s\n",
-                                   jl_typeof_str(a), jl_typeof_str(b), keybuf.buf + kbeg[i]);
-                    if (jl_is_datatype(a) && jl_is_datatype(b)) {
-                        jl_datatype_t *da = (jl_datatype_t*)a, *db = (jl_datatype_t*)b;
-                        jl_safe_printf("    types_equal=%d same_typename=%d hash_same=%d nparams a=%zu b=%zu concrete a=%d b=%d\n",
-                            jl_types_equal(a, b), da->name == db->name, da->hash == db->hash,
-                            jl_svec_len(da->parameters), jl_svec_len(db->parameters),
-                            (int)da->isconcretetype, (int)db->isconcretetype);
-                    }
-                    if (jl_is_code_instance(a) && jl_is_code_instance(b)) {
-                        jl_code_instance_t *ca = (jl_code_instance_t*)a;
-                        jl_code_instance_t *cb = (jl_code_instance_t*)b;
-                        jl_safe_printf("    worlds  [%zu,%zu] vs [%zu,%zu]\n",
-                            jl_atomic_load_relaxed(&ca->min_world), jl_atomic_load_relaxed(&ca->max_world),
-                            jl_atomic_load_relaxed(&cb->min_world), jl_atomic_load_relaxed(&cb->max_world));
-                        jl_safe_printf("    exctype_same=%d rettype_const_same=%d purity_same=%d def_same=%d def_is_abioverride=%d\n",
-                            ca->exctype == cb->exctype,
-                            ca->rettype_const == cb->rettype_const,
-                            jl_atomic_load_relaxed(&ca->ipo_purity_bits) == jl_atomic_load_relaxed(&cb->ipo_purity_bits),
-                            ca->def == cb->def,
-                            !jl_is_method_instance(ca->def));
-                        jl_svec_t *ea = jl_atomic_load_relaxed(&ca->edges);
-                        jl_svec_t *eb = jl_atomic_load_relaxed(&cb->edges);
-                        int elen_same = ea && eb && jl_svec_len(ea) == jl_svec_len(eb);
-                        int eelem_same = elen_same;
-                        if (elen_same)
-                            for (size_t q = 0; q < jl_svec_len(ea); q++) {
-                                jl_value_t *sa = jl_svecref(ea, q), *sb = jl_svecref(eb, q);
-                                if (sa != sb) {
-                                    if (eelem_same)   // report only the first difference
-                                        jl_safe_printf("    first differing edge slot %zu: %s vs %s%s\n",
-                                            q, jl_typeof_str(sa), jl_typeof_str(sb),
-                                            (jl_is_code_instance(sa) && jl_is_code_instance(sb) &&
-                                             jl_get_ci_mi((jl_code_instance_t*)sa) == jl_get_ci_mi((jl_code_instance_t*)sb))
-                                                ? "  [same MethodInstance -- sibling cache entries]" : "");
-                                    eelem_same = 0;
-                                }
-                            }
-                        jl_safe_printf("    edges_len_same=%d edges_elems_identical=%d (len a=%zu b=%zu)\n",
-                            elen_same, eelem_same,
-                            ea ? jl_svec_len(ea) : (size_t)0, eb ? jl_svec_len(eb) : (size_t)0);
-                        jl_safe_printf("    edges_same=%d inferred_same=%d a{inferred=%d,invoke=%d} b{inferred=%d,invoke=%d} chained=%d\n",
-                            jl_atomic_load_relaxed(&ca->edges) == jl_atomic_load_relaxed(&cb->edges),
-                            jl_atomic_load_relaxed(&ca->inferred) == jl_atomic_load_relaxed(&cb->inferred),
-                            jl_atomic_load_relaxed(&ca->inferred) != NULL,
-                            jl_atomic_load_relaxed(&ca->invoke) != NULL,
-                            jl_atomic_load_relaxed(&cb->inferred) != NULL,
-                            jl_atomic_load_relaxed(&cb->invoke) != NULL,
-                            jl_atomic_load_relaxed(&ca->next) == cb || jl_atomic_load_relaxed(&cb->next) == ca);
-                    }
-                }
-                ncollide++;
-            }
-        }
-        else {
-            *bp = (void*)(uintptr_t)(i + 1);
-        }
-    }
-    htable_free(&seen);
-
-    // How many imports point into a rebuildable pkgimage rather than the sysimage
-    // (blob 0)? Only the former exercise cross-rebuild key stability.
-    size_t n_pkg = 0, n_pkg_keyed = 0;
-    for (size_t i = 0; i < n; i++) {
-        if (kdep[i] != 0) {
-            n_pkg++;
-            if (koff[i + 1] - koff[i] > 1)
-                n_pkg_keyed++;
-        }
-    }
-    // what is still unkeyed, by concrete type
-    {
-        // A fixed 24 slots silently dropped kinds once full, which hid CodeInstance
-        // entirely on a large image and made the counts here untrustworthy. Report any
-        // overflow rather than swallowing it.
-        enum { UTY_MAX = 512 };
-        void *uty[UTY_MAX]; size_t ucnt[UTY_MAX], unty = 0, udropped = 0;
-        for (size_t i = 0; i < n; i++) {
-            if (koff[i + 1] - koff[i] > 1)
-                continue;
-            void *ty = (void*)jl_typeof((jl_value_t*)s->import_objs.items[i]);
-            size_t q;
-            for (q = 0; q < unty; q++)
-                if (uty[q] == ty) break;
-            if (q == unty) {
-                if (q == UTY_MAX) { udropped++; continue; }
-                uty[q] = ty; ucnt[q] = 0; unty++;
-            }
-            ucnt[q]++;
-        }
-        for (size_t q = 0; q < unty; q++)
-            jl_safe_printf("IMPORTKEYS_UNKEYED %-24s %zu\n",
-                           jl_symbol_name(((jl_datatype_t*)uty[q])->name->name), ucnt[q]);
-        if (udropped)
-            jl_safe_printf("IMPORTKEYS_UNKEYED <overflow>              %zu\n", udropped);
-    }
-    // REVIEW instrumentation: per owning pkgimage, total vs unkeyed distinct imports.
-    // Re-resolution is all-or-nothing per (dependent, dependency) pair, so what matters
-    // is how many dependency images have at least one unkeyed import.
-    {
-        size_t maxdep = 0;
-        for (size_t i = 0; i < n; i++)
-            if (kdep[i] > maxdep) maxdep = kdep[i];
-        size_t *dtot = (size_t*)calloc(maxdep + 1, sizeof(size_t));
-        size_t *dunk = (size_t*)calloc(maxdep + 1, sizeof(size_t));
-        for (size_t i = 0; i < n; i++) {
-            dtot[kdep[i]]++;
-            if (koff[i + 1] - koff[i] <= 1)
-                dunk[kdep[i]]++;
-        }
-        // Attribute each blob to a package by naming the top-level module of the first
-        // import that carries one, so the report is readable as dependency names rather
-        // than blob indices.
-        const char **dname = (const char**)calloc(maxdep + 1, sizeof(char*));
-        for (size_t i = 0; i < n; i++) {
-            if (dname[kdep[i]])
-                continue;
-            jl_value_t *o = (jl_value_t*)s->import_objs.items[i];
-            jl_module_t *om = NULL;
-            if (jl_is_datatype(o)) om = ((jl_datatype_t*)o)->name->module;
-            else if (jl_is_typename(o)) om = ((jl_typename_t*)o)->module;
-            else if (jl_is_method(o)) om = ((jl_method_t*)o)->module;
-            else if (jl_is_module(o)) om = (jl_module_t*)o;
-            if (om) {
-                while (om->parent && om->parent != om)
-                    om = om->parent;
-                dname[kdep[i]] = jl_symbol_name(om->name);
-            }
-        }
-        size_t ndeps = 0, ndeps_unk = 0;
-        for (size_t d = 1; d <= maxdep; d++) {
-            if (dtot[d]) {
-                ndeps++;
-                if (dunk[d]) ndeps_unk++;
-                jl_safe_printf("IMPORTKEYS_DEP dep=%zu name=%s total=%zu unkeyed=%zu %s\n",
-                               d, dname[d] ? dname[d] : "?", dtot[d], dunk[d],
-                               dunk[d] ? "blocked" : "RELINKABLE");
-                if (dunk[d]) {
-                    // Name the kinds actually blocking *this* dependency. That is what has
-                    // to be keyed next, and it is not the same as the global histogram: a
-                    // kind with a huge global count may block nothing, while a single
-                    // object of a rare kind can block an entire dependency.
-                    void *bty[12]; size_t bcnt[12], bnty = 0;
-                    for (size_t i = 0; i < n; i++) {
-                        if (kdep[i] != d || koff[i + 1] - koff[i] > 1)
-                            continue;
-                        void *ty = (void*)jl_typeof((jl_value_t*)s->import_objs.items[i]);
-                        size_t q;
-                        for (q = 0; q < bnty; q++)
-                            if (bty[q] == ty) break;
-                        if (q == bnty) {
-                            if (q == 12)
-                                continue;
-                            bty[q] = ty; bcnt[q] = 0; bnty++;
-                        }
-                        bcnt[q]++;
-                    }
-                    for (size_t q = 0; q < bnty; q++)
-                        jl_safe_printf("IMPORTKEYS_BLOCKER %s %s %zu\n",
-                                       dname[d] ? dname[d] : "?",
-                                       jl_symbol_name(((jl_datatype_t*)bty[q])->name->name),
-                                       bcnt[q]);
-                }
-            }
-        }
-        free(dname);
-        jl_safe_printf("IMPORTKEYS_DEPS pkgimages=%zu with_unkeyed=%zu\n", ndeps, ndeps_unk);
-        free(dtot);
-        free(dunk);
-    }
-    jl_safe_printf("IMPORTKEYS distinct=%zu keyed=%zu unkeyed=%zu collisions=%zu keybytes=%zu "
-                   "frompkgimage=%zu frompkgimage_keyed=%zu equivdupes=%zu\n",
-                   n, nkeyed, n - nkeyed, ncollide, (size_t)ios_pos(&keybuf), n_pkg, n_pkg_keyed, ndup);
-    free(koff);
-    free(kbeg);
-    free(kdep);
-    ios_close(&keybuf);
-}
 
 // --- Shadow resolution ------------------------------------------------------------
 //
@@ -4642,103 +4069,6 @@ static jl_value_t *kp_value(keyparse_t *kp, int depth) JL_GC_DISABLED
     return kp_type(kp, depth, 0);
 }
 
-// For every import that has a key, parse the key and compare what comes back against the
-// object the key was written for. This is the invertibility claim the whole scheme rests
-// on, measured rather than asserted.
-static void jl_check_key_parse(jl_serializer_state *s, jl_array_t *mod_array) JL_GC_DISABLED
-{
-    size_t n = s->import_objs.len;
-    size_t keyed = 0, attempted = 0, same = 0, differs = 0, unparsed = 0, trailing = 0;
-    size_t unsupported = 0, idbytes = 0, locbytes = 0, digest_mismatch = 0;
-    ios_t k;
-    ios_mem(&k, 512);
-    jl_value_t **memo = (jl_value_t**)calloc(n ? n : 1, sizeof(jl_value_t*));
-    char *memo_state = (char*)calloc(n ? n : 1, 1);
-    for (size_t i = 0; i < n; i++) {
-        jl_value_t *v = (jl_value_t*)s->import_objs.items[i];
-        // size of the identity rendering, for comparison against the locator
-        ios_seek(&k, 0);
-        ios_trunc(&k, 0);
-        if (extkey_write(&k, v, 0))
-            idbytes += (size_t)ios_pos(&k);
-        // what a load-time relink actually reads: the locator
-        ios_seek(&k, 0);
-        ios_trunc(&k, 0);
-        extkey_import_index = &s->import_index;
-        int ok = extkey_write(&k, v, 0);
-        extkey_import_index = NULL;
-        if (!ok)
-            continue;
-        locbytes += (size_t)ios_pos(&k);
-        keyed++;
-        size_t len = (size_t)ios_pos(&k);
-        ios_putc('\0', &k);   // the key is not NUL-terminated in the stream; printing needs it
-        // only the kinds this parser covers so far; the rest are counted, not guessed at
-        if (len < 2 || strchr("MNBSTObvFICVsGRP#UAX@", k.buf[0]) == NULL) {
-            unsupported++;
-            continue;
-        }
-        attempted++;
-        keyparse_t kp;
-        kp.p = k.buf;
-        kp.end = k.buf + len;
-        kp.mod_array = mod_array;
-        kp.st = s;
-        kp.tbl = NULL;
-        kp.dep2blob = NULL;
-        kp.ndep2blob = 0;
-        kp.memo = memo;
-        kp.memo_state = memo_state;
-        kp.nmemo = n;
-        kp.nbind = 0;
-        jl_value_t *got = kp_value(&kp, 0);
-        if (got == NULL) {
-            if (unparsed < 6)
-                jl_safe_printf("KEYPARSE_FAIL [%s] at+%zu %s\n", jl_typeof_str(v),
-                               (size_t)(kp.p - k.buf), k.buf);
-            unparsed++;
-        }
-        else if (kp.p != kp.end && strncmp(kp.p, "|R", 2) != 0) {
-            // a top-level method locator legitimately trails its root-contribution
-            // record, which the parser does not consume (see extkey_method_roots)
-            trailing++;
-        }
-        else if (got == v || extkey_equiv(got, v)) {
-            // The loader has no `v` to compare against -- that is the whole point of a
-            // relink -- so the acceptance test it will actually run is: recompute the
-            // identity of what was resolved, and require it to reproduce the digest the
-            // image recorded. Check that here too, against the object comparison, so the
-            // two cannot silently disagree.
-            uint64_t want = 0, gotdigest = 0;
-            extkey_hash(v, &want);
-            if (!extkey_hash(got, &gotdigest) || want != gotdigest)
-                digest_mismatch++;
-            same++;
-        }
-        else {
-            // the only outcome that would be a miscompile rather than a missed reuse
-            if (differs < 6) {
-                jl_safe_printf("KEYPARSE_DIFF want[%s] got[%s] key=%s\n",
-                               jl_typeof_str(v), jl_typeof_str(got), k.buf);
-                jl_safe_printf("    want="); jl_static_show(JL_STDERR, v);
-                jl_safe_printf("\n    got ="); jl_static_show(JL_STDERR, got);
-                jl_safe_printf("\n");
-            }
-            differs++;
-        }
-    }
-    ios_close(&k);
-    free(memo);
-    free(memo_state);
-    jl_safe_printf("KEYPARSE keyed=%zu covered=%zu same=%zu differs=%zu unparsed=%zu trailing=%zu out_of_scope=%zu digest_mismatch=%zu\n",
-                   keyed, attempted, same, differs, unparsed, trailing, unsupported, digest_mismatch);
-    for (int r = 0; r < KP_CI_NREASON; r++)
-        if (kp_ci_miss[r])
-            jl_safe_printf("KEYPARSE_CI %-14s %zu\n", kp_ci_reason[r], kp_ci_miss[r]);
-    memset(kp_ci_miss, 0, sizeof(kp_ci_miss));
-    jl_safe_printf("KEYSIZE identity=%zu locator=%zu ratio=%.1fx\n",
-                   idbytes, locbytes, locbytes ? (double)idbytes / (double)locbytes : 0.0);
-}
 
 // The leading tag of a locator names the kind of object it locates; used only for
 // reporting, so an unknown first byte is a category of its own rather than an error.
@@ -4918,33 +4248,6 @@ static int relink_unmoved_blob_is_method(jl_serializer_state *s, uint32_t d, uin
 enum { RSW_OK = 0, RSW_UNKEYED, RSW_UNRES, RSW_FAB, RSW_MIS, RSW_EXTFN, RSW_GT };
 
 
-// ---- The owner probe: JULIA_RELINK_OWNER_PROBE; measurement only ----
-//
-// The refused population is dominated by SimpleVectors that are somebody's `.parameters`.
-// An earlier walk went looking for their owners in the *dependent's* serialization order
-// and found none -- but `Gray{Float32}` belongs to ColorTypes, not to Makie, and an
-// instantiated type lives in its TypeName's cache, which nothing in the dependent's image
-// reaches. Finding no parent in the wrong image proves nothing, so this walks the
-// dependency side: every loaded module, its bindings, and every TypeName's instantiation
-// caches, recording for each object the (owner, field) pairs that point at it.
-//
-// It then asks, of every refused entry whose ground truth is still addressable, the three
-// questions an owner-anchored locator has to answer yes to: does an owner exist, is the
-// (owner, path) pair unique, and does rendering that owner, parsing it back and walking
-// the one field hand back *the very object the reference names*. Where the owner lives is
-// reported and not required: the blob-identity gate applies to what the locator resolves
-// to, and a type instantiated on the heap can perfectly well hold a dependency's svec --
-// which, measured, is what 469 of them do.
-enum {
-    OP_PARAMS, OP_TYPES, OP_NAMES, OP_WRAPPER, OP_SUPER, OP_INSTANCE, OP_TOFW,
-    OP_TNCACHE, OP_SIG, OP_SPECTYPES, OP_SVECELEM, OP_UAVAR, OP_UABODY,
-    OP_TVLB, OP_TVUB, OP_UNA, OP_UNB, OP_VAT, OP_VAN, OP_BINDING, OP_NPATH
-};
-static const char *const op_path_name[OP_NPATH] = {
-    "parameters", "types", "names", "wrapper", "super", "instance", "Typeofwrapper",
-    "tn.cache", "sig", "specTypes", "svec[i]", "var", "body",
-    "lb", "ub", "union.a", "union.b", "vararg.T", "vararg.N", "binding"
-};
 typedef struct { jl_value_t *owner; uint8_t path; uint32_t n; } owner_rec_t;
 
 
@@ -7864,12 +7167,6 @@ static void jl_save_system_image_to_stream(ios_t *f, jl_array_t *mod_array,
         jl_write_export_index(&s, f, sysimg_size);
     }
 
-    if (getenv("JULIA_IMPORT_KEYS"))
-        jl_report_import_keys(&s);
-    if (getenv("JULIA_IDHASH_TAINT"))
-        jl_report_idhash_taint(&s);
-    if (getenv("JULIA_KEY_PARSE"))
-        jl_check_key_parse(&s, mod_array);
 
     assert(object_worklist.len == 0);
     arraylist_free(&object_worklist);
@@ -8514,7 +7811,6 @@ static int jl_restore_system_image_from_stream_(ios_t *f, jl_image_t *image,
     int relink_ok = 0;
     {   // import table, written by jl_write_import_table
         size_t nimports = read_uint32(f);
-        size_t nkeyed = 0, keybytes = 0;
         jl_import_table_t *itbl = NULL;
         int want_relink = getenv("JULIA_PKGIMAGE_RELINK") != NULL;
         if (want_relink && nimports) {
@@ -8525,8 +7821,6 @@ static int jl_restore_system_image_from_stream_(ios_t *f, jl_image_t *image,
         for (size_t i = 0; i < nimports; i++) {
             uint32_t depsidx = read_uint32(f);
             uint64_t digest = read_uint64(f);
-            if (digest)
-                nkeyed++;
             uint64_t off = read_uint64(f);
             size_t len = read_uint32(f);   // the locator, for re-deriving the object
             if (itbl) {
@@ -8538,14 +7832,11 @@ static int jl_restore_system_image_from_stream_(ios_t *f, jl_image_t *image,
                     itbl->e[i].loc = (char*)malloc_s(len + 1);
                     ios_read(f, itbl->e[i].loc, len);
                     itbl->e[i].loc[len] = '\0';
-                    keybytes += len;
                     continue;
                 }
             }
-            if (len) {
-                keybytes += len;
-                ios_skip(f, len);
-            }
+            if (len)
+                ios_skip(f, len);   // not retained: this image is not being repointed
         }
         {   // export index, written by jl_write_export_index: digest -> image offset for
             // this image's own uninterned objects. The pairs stay resident in the mapped
@@ -8630,9 +7921,6 @@ static int jl_restore_system_image_from_stream_(ios_t *f, jl_image_t *image,
             }
             relink_tbl = itbl;
         }
-        if (getenv("JULIA_IMPORT_KEYS"))
-            jl_safe_printf("IMPORTKEYS_READ entries=%zu keyed=%zu keybytes=%zu\n",
-                           nimports, nkeyed, keybytes);
     }
     if (s.incremental && relink_probe_buildid_mismatch && !relink_ok) {
         // A dependency was rebuilt with a different build_id, and at least one object this
